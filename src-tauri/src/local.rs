@@ -5,7 +5,7 @@ use crate::session::{Session, SessionManager};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -223,8 +223,14 @@ impl LocalSession {
                     let mut buf = [0u8; 8192];
                     loop {
                         match reader.read(&mut buf) {
-                            Ok(0) | Err(_) => break,
+                            Ok(0) => break, // EOF
                             Ok(n) => sink.data(&buf[..n]),
+                            // Retry a signal-interrupted read; drain buffered output first.
+                            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                            // On a Unix PTY the master read returns EIO once the child has
+                            // exited — that is the normal end of stream, after all buffered
+                            // bytes have been delivered by earlier Ok(n) reads.
+                            Err(_) => break,
                         }
                     }
                     // Give the waiter a moment to report the real exit code first.
@@ -320,14 +326,25 @@ mod tests {
         assert_eq!(sess.program, expected);
         assert!(Path::new(&sess.program).is_absolute());
 
+        // The reader and waiter threads race, so the exit notice can arrive before
+        // the buffered output. Wait for the exit event, then keep draining until a
+        // short quiet gap so trailing output is collected. (Don't wait for the
+        // channel to fully disconnect: the reader can stay blocked in read() until
+        // the master is dropped, which outlives this session.)
+        use std::sync::mpsc::RecvTimeoutError;
         let mut out = Vec::new();
         let mut reason = None;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        while reason.is_none() && std::time::Instant::now() < deadline {
-            match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
+            match rx.recv_timeout(std::time::Duration::from_millis(500)) {
                 Ok(Ok(b)) => out.extend(b),
                 Ok(Err(r)) => reason = Some(r),
-                Err(_) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout) => {
+                    if reason.is_some() {
+                        break; // exited and 500 ms with no more output → drained
+                    }
+                }
             }
         }
         let text = String::from_utf8_lossy(&out);
