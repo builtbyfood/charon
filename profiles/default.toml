@@ -1,0 +1,47 @@
+# Charon profile. Profiles are appearance + behaviour; connections live in charon.db
+# (exportable to TOML for git sync). Copy this file to make a work/home/customer profile.
+
+name = "default"
+
+[appearance]
+font = "JetBrains Mono"
+font_size = 13                  # Ctrl+= / Ctrl+- write back here
+theme = "charon-dark"
+scrollback = 50000
+renderer = "webgl"              # "dom" if the WebGL renderer glitches on your GPU
+
+[terminal]
+copy_on_select = false          # Linux folks may want true
+ctrl_c_copies_when_selected = true
+middle_click_paste = true
+right_click = "moba"            # "moba": copy selection / paste, Shift+right-click for the menu; "menu": always the menu
+bracketed_paste = true
+paste_guard_lines = 2           # warn when pasting >= this many lines
+
+[clipboard]
+strip_zero_width = true
+nbsp_to_space = true
+smart_quotes_to_ascii = true
+trim_trailing_whitespace = true
+crlf_to_lf = true
+
+[files]
+auto_open = true                # file pane opens with every SSH / local tab (Ctrl+Shift+E toggles)
+
+[commands]                      # OSC 133 driven
+mark_gutter = true
+tint_failed_commands = true
+jump_keys = ["Ctrl+Up", "Ctrl+Down"]
+
+[ui]
+sidebar_width = 260             # dragged splitter writes back here
+
+[docs]
+tldr_offline = true
+remote_man = true
+tip_of_the_day = true
+
+[mcp]
+enabled = false                 # phase 3
+port = 0                         # 0 = random free port; token is per-launch (Settings → MCP)
+default_tier = "read"

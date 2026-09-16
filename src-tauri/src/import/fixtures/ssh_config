@@ -1,0 +1,32 @@
+# Sample ~/.ssh/config used by the importer tests.
+Include ~/.ssh/config.d/*
+
+Host web web-alt
+    HostName 10.0.0.5
+    User ops
+    Port 2222
+    IdentityFile ~/.ssh/id_ed25519
+    ProxyJump ops@bastion.example.com   # trailing comment
+
+Host bastion
+  HostName bastion.example.com
+  User ops
+
+Host *.internal
+    User nobody
+
+Host db
+    HostName=db.example.com
+    Port=22
+    User "db admin"
+    IdentityFile /keys/first
+    IdentityFile /keys/second
+
+Match host something
+    User nobody
+
+Host plain
+
+Host *
+    ServerAliveInterval 30
+    User nobody

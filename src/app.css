@@ -1,0 +1,28 @@
+/* Charon — a workbench, not a website. Dark, dense, one accent that means
+   "which machine am I on" and is set per connection, never globally. */
+:root {
+  --bg: #16181d;
+  --bg-raised: #1e2128;
+  --bg-sunken: #101215;
+  --line: #2b2f37;
+  --fg: #d7dae0;
+  --fg-dim: #8b909a;
+  --accent: #6aa2ff;          /* overridden per session by connection colour */
+  --danger: #ff6b6b;
+  --font-ui: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Code", "Fira Code", Consolas, monospace;
+}
+* { box-sizing: border-box; }
+html, body, #app { height: 100%; margin: 0; }
+body {
+  background: var(--bg); color: var(--fg);
+  font: 13px/1.4 var(--font-ui);
+  -webkit-font-smoothing: antialiased;
+}
+button, input, select {
+  font: inherit; color: inherit; background: var(--bg-sunken);
+  border: 1px solid var(--line); border-radius: 3px; padding: 4px 8px;
+}
+button { cursor: pointer; }
+button:hover { border-color: var(--fg-dim); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }

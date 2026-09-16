@@ -1,0 +1,72 @@
+[package]
+name = "charon"
+version = "0.1.0"
+description = "Connection manager, terminal, editor and MCP bridge for engineers"
+authors = ["Travis DeLuca"]
+license = "Apache-2.0"
+edition = "2021"
+
+[lib]
+name = "charon_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-clipboard-manager = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+thiserror = "1"
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dirs = "5"
+async-trait = "0.1"
+
+# sessions
+russh = "0.45"
+russh-keys = "0.45"
+russh-sftp = "2"
+portable-pty = "0.8"
+serialport = "4"
+
+# store / secrets
+rusqlite = { version = "0.32", features = ["bundled"] }
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+age = "0.11"
+
+# PuTTY .ppk private keys (ppk.rs): AES-256-CBC, SHA-1/HMAC (v2), Argon2 (v3).
+# Versions match what russh/age already pull in.
+aes = "0.8"
+cbc = "0.1"
+hmac = "0.12"
+sha1 = "0.10"
+sha2 = "0.10"
+argon2 = "0.5"
+data-encoding = "2"
+
+# docs: in-app tldr bundle update (download + unzip + gzip)
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "http2"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+flate2 = "1"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true
+
+[dev-dependencies]
+tempfile = "3"

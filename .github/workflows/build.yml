@@ -1,0 +1,104 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write # tauri-action / gh release need this to draft releases on tags
+
+jobs:
+  bundle:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            args: "--bundles nsis"
+            label: windows
+          - os: ubuntu-22.04
+            args: "--bundles deb,rpm,appimage"
+            label: linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm } # 22.18+ runs the node:test TypeScript suites
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with: { workspaces: src-tauri }
+
+      - name: Linux deps
+        if: matrix.label == 'linux'
+        run: |
+          sudo apt-get update
+          # libudev-dev: serialport; libwebkit2gtk-4.1: the webview; patchelf/rpm: AppImage/rpm bundlers.
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libudev-dev libayatana-appindicator3-dev librsvg2-dev patchelf rpm
+
+      - run: npm ci
+
+      - name: Frontend check
+        run: npm run check
+
+      - name: Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Frontend tests
+        run: npm test
+
+      - uses: tauri-apps/tauri-action@v0
+        id: tauri
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: ${{ matrix.args }}
+          tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+          releaseName: ${{ startsWith(github.ref, 'refs/tags/') && format('Charon {0}', github.ref_name) || '' }}
+          releaseDraft: true
+
+      # Portable builds: bare binary + portable.flag, no installer.
+      - name: Portable (Windows)
+        if: matrix.label == 'windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory portable | Out-Null
+          Copy-Item src-tauri/target/release/charon.exe portable/
+          New-Item portable/portable.flag -ItemType File | Out-Null
+          Compress-Archive portable/* charon-windows-portable.zip
+
+      - name: Portable (Linux)
+        if: matrix.label == 'linux'
+        run: |
+          mkdir -p portable/charon
+          cp src-tauri/target/release/charon portable/charon/
+          touch portable/charon/portable.flag
+          tar -C portable -czf charon-linux-portable.tar.gz charon
+
+      # Attach the portable artefacts to the draft release when building a tag.
+      - name: Attach portable to release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for f in charon-windows-portable.zip charon-linux-portable.tar.gz; do
+            [ -f "$f" ] && gh release upload "${{ github.ref_name }}" "$f" --clobber
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: charon-${{ matrix.label }}
+          path: |
+            src-tauri/target/release/bundle/**/*.deb
+            src-tauri/target/release/bundle/**/*.rpm
+            src-tauri/target/release/bundle/**/*.AppImage
+            src-tauri/target/release/bundle/**/*.exe
+            charon-windows-portable.zip
+            charon-linux-portable.tar.gz
+          if-no-files-found: ignore

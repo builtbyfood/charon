@@ -1,0 +1,9 @@
+Present=1
+HostName=web.example.com
+LogFileName=putty.log
+Protocol=ssh
+PortNumber=2200
+CloseOnExit=1
+UserName=ops
+PublicKeyFile=
+TerminalType=xterm

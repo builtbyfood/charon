@@ -1,0 +1,5 @@
+Present=1
+HostName=
+Protocol=serial
+SerialLine=COM3
+SerialSpeed=9600
