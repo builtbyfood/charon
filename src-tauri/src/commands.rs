@@ -270,7 +270,7 @@ pub async fn session_open_local(state: State<'_, AppState>, req: OpenLocal) -> C
     };
     let params = LocalParams { shell: Some(program), args, cwd: req.cwd.or(eff.cwd), cols: req.cols, rows: req.rows };
     let sess = LocalSession::spawn(state.sessions.app().clone(), id.clone(), params).map_err(err)?;
-    let title = if req.admin { format!("{} (admin)", basename(&shell)) } else { sess.program.clone() };
+    let title = if req.admin { format!("{} (admin)", basename(&shell)) } else { basename(&sess.program) };
     let mut info = SessionInfo::new(id, title, "local");
     info.node_id = req.node_id.clone();
     // Local shells get shell-integration too (only injected when a known shell is

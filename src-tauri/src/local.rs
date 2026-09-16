@@ -45,10 +45,12 @@ pub fn default_shell() -> String {
         v.extend(["/bin/bash".into(), "/bin/sh".into()]);
         v
     };
+    // Always return an absolute path: a bare name (e.g. an odd $SHELL, or no
+    // $SHELL at all) would otherwise break spawning on hosts without it on PATH.
     candidates
         .iter()
-        .find(|c| find_on_path(c).is_some())
-        .cloned()
+        .find_map(|c| find_on_path(c))
+        .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| candidates.last().cloned().unwrap_or_default())
 }
 
@@ -178,7 +180,10 @@ impl LocalSession {
     }
 
     pub fn spawn_with(sink: impl Sink, id: &str, p: LocalParams) -> Result<Arc<Self>> {
-        let program = p.shell.filter(|s| !s.trim().is_empty()).unwrap_or_else(default_shell);
+        let requested = p.shell.filter(|s| !s.trim().is_empty()).unwrap_or_else(default_shell);
+        // Resolve to an absolute path (a bare program name from a node config or a
+        // bare $SHELL should still launch); `program` is what we run and report.
+        let program = find_on_path(&requested).map(|p| p.to_string_lossy().into_owned()).unwrap_or(requested);
         let pty = native_pty_system();
         let pair = pty
             .openpty(PtySize { rows: p.rows, cols: p.cols, pixel_width: 0, pixel_height: 0 })
@@ -245,10 +250,7 @@ impl LocalSession {
                 .context("spawn pty wait thread")?;
         }
 
-        let program = Path::new(&program)
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or(program);
+        // `program` is the absolute path; the UI basenames it for the tab title.
         Ok(Arc::new(Self {
             master: Mutex::new(pair.master),
             writer: Mutex::new(writer),
@@ -312,7 +314,11 @@ mod tests {
         let (shell, args) = ("/bin/sh", vec!["-c".to_string(), "echo charon-pty-ok".to_string()]);
         let p = LocalParams { shell: Some(shell.into()), args, cwd: None, cols: 80, rows: 24 };
         let sess = LocalSession::spawn_with(ChanSink(Mutex::new(tx)), "test-session", p).unwrap();
-        assert_eq!(sess.program, shell);
+        // The resolver turns the shell into an absolute path (even a bare name),
+        // so the session reports that resolved path.
+        let expected = find_on_path(shell).unwrap().to_string_lossy().into_owned();
+        assert_eq!(sess.program, expected);
+        assert!(Path::new(&sess.program).is_absolute());
 
         let mut out = Vec::new();
         let mut reason = None;
