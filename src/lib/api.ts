@@ -42,6 +42,7 @@ export interface Profile {
   files?: { auto_open?: boolean; [k: string]: unknown };
   clipboard: { strip_zero_width: boolean; nbsp_to_space: boolean; smart_quotes_to_ascii: boolean; trim_trailing_whitespace: boolean; crlf_to_lf: boolean; [k: string]: unknown };
   commands: { mark_gutter: boolean; tint_failed_commands: boolean; jump_keys: string[]; [k: string]: unknown };
+  ssh: { keepalive_seconds: number; [k: string]: unknown };
   mcp: { enabled: boolean; port: number; default_tier: "read" | "exec-approve" | "trusted" | string; [k: string]: unknown };
   ui: { sidebar_width: number; [k: string]: unknown };
   [k: string]: unknown;

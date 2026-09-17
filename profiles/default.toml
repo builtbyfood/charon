@@ -28,6 +28,9 @@ crlf_to_lf = true
 [files]
 auto_open = true                # file pane opens with every SSH / local tab (Ctrl+Shift+E toggles)
 
+[ssh]
+keepalive_seconds = 30          # server-alive interval; 0 = off. No idle-disconnect timeout.
+
 [commands]                      # OSC 133 driven
 mark_gutter = true
 tint_failed_commands = true

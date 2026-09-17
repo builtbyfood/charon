@@ -219,7 +219,11 @@ pub async fn session_open_ssh(state: State<'_, AppState>, req: OpenSsh) -> Resul
     }
 
     let id = req.id.filter(|s| !s.is_empty()).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let params = SshParams { host: host.clone(), port, user: user.clone(), auth, jumps, cols: req.cols, rows: req.rows };
+    let keepalive = {
+        let secs = state.profile.read().unwrap().ssh.keepalive_seconds;
+        (secs > 0).then(|| std::time::Duration::from_secs(secs))
+    };
+    let params = SshParams { host: host.clone(), port, user: user.clone(), auth, jumps, cols: req.cols, rows: req.rows, keepalive };
 
     let sess = SshSession::connect(state.sessions.clone(), state.hostkeys.clone(), id.clone(), params)
         .await

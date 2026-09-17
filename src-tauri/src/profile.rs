@@ -61,6 +61,12 @@ section!(Ui {
     sidebar_width: u32 = 260,
 });
 
+section!(Ssh {
+    /// Server-alive interval in seconds; 0 disables keepalive. Idle sessions are
+    /// no longer dropped by an inactivity timeout.
+    keepalive_seconds: u64 = 30,
+});
+
 section!(Mcp {
     enabled: bool = false,
     /// TCP port for the HTTP transport; 0 = pick a free one.
@@ -79,6 +85,8 @@ pub struct Profile {
     pub commands: Commands,
     pub ui: Ui,
     #[serde(default)]
+    pub ssh: Ssh,
+    #[serde(default)]
     pub mcp: Mcp,
     /// Sections this build does not model yet (docs, …) pass through untouched.
     #[serde(flatten)]
@@ -94,6 +102,7 @@ impl Default for Profile {
             clipboard: Default::default(),
             commands: Default::default(),
             ui: Default::default(),
+            ssh: Default::default(),
             mcp: Default::default(),
             extra: toml::Table::new(),
         }
@@ -159,9 +168,10 @@ mod tests {
         assert_eq!(p.appearance.scrollback, 50_000);
         assert!(!p.terminal.copy_on_select);
         assert_eq!(p.commands.jump_keys, vec!["Ctrl+Up", "Ctrl+Down"]);
-        // mcp is modelled now; its section parses.
+        // mcp / ssh are modelled now; their sections parse.
         assert!(!p.mcp.enabled);
         assert_eq!(p.mcp.default_tier, "read");
+        assert_eq!(p.ssh.keepalive_seconds, 30);
         // Sections not modelled here still ride along.
         assert!(p.extra.contains_key("docs"));
     }

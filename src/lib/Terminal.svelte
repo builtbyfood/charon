@@ -239,6 +239,17 @@
   });
 
   /** Connect using the node's vault credential (or `pw` typed inline). */
+  /** Re-open the session reusing the same node/host and credentials. */
+  async function reconnect() {
+    if (sessionId) sessionClose(sessionId);
+    sessionId = null;
+    error = ""; reason = ""; cwd = undefined;
+    osc133 = false; markCount = 0; shell = undefined;
+    injectDone = false; injectDeadline = 0; reinjects = 0; lastReported = null;
+    term.write("\r\n\x1b[2m[reconnecting…]\x1b[0m\r\n" + HIDE_CURSOR);
+    await connect(lastPw);
+  }
+
   async function connect(pw?: string) {
     status = "connecting";
     changed = null;
@@ -706,6 +717,9 @@
   {/if}
   <div class="status" class:up={status === "up"} class:closed={status === "closed"}>
     <span class="dot"></span>{status}{error ? ` — ${error}` : ""}
+    {#if status === "closed"}
+      <button type="button" class="chip reconnect" onclick={reconnect} title="Reconnect reusing this connection's host and credentials">reconnect</button>
+    {/if}
     {#if hasFiles && status === "up"}
       <button type="button" class="chip files-btn" class:on={filesOpen} onclick={toggleFiles} title="File pane (Ctrl+Shift+E)">files</button>
     {/if}
@@ -755,6 +769,7 @@
   .cwd { margin-left: auto; color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40%; }
   .cwd + .chip { margin-left: 0; }
   .chip { margin-left: auto; font: inherit; font-family: var(--font-mono); color: inherit; background: transparent; padding: 0 6px; border: 1px solid var(--line); border-radius: 8px; cursor: pointer; }
+  .reconnect { margin-left: 6px; border-color: var(--accent); color: var(--fg); }
   .chip:hover { border-color: var(--fg-dim); color: var(--fg); }
   .up .dot { background: #5fd38a; } .closed .dot { background: var(--danger); }
 </style>

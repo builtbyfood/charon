@@ -27,6 +27,9 @@ pub struct SshParams {
     pub jumps: Vec<Hop>,
     pub cols: u16,
     pub rows: u16,
+    /// Server-alive interval; `None` (profile 0) disables keepalive. Applies to
+    /// the whole connection — the shell, SFTP, and sudo channels share it.
+    pub keepalive: Option<std::time::Duration>,
 }
 
 /// One bastion on the way to the target.
@@ -240,8 +243,13 @@ async fn authenticate(handle: &mut Handle<Handler>, user: &str, host: &str, auth
 
 impl SshSession {
     pub async fn connect(mgr: SessionManager, keys: Arc<HostKeys>, id: String, p: SshParams) -> Result<Arc<Self>> {
+        // No inactivity timeout (it dropped idle sessions); keep the link alive and
+        // detect dead ones with server-alive requests instead. keepalive_max=3 means
+        // ~3 missed replies (≈ 3× interval) before russh gives up.
         let config = Arc::new(client::Config {
-            inactivity_timeout: Some(std::time::Duration::from_secs(600)),
+            inactivity_timeout: None,
+            keepalive_interval: p.keepalive,
+            keepalive_max: 3,
             ..Default::default()
         });
 
