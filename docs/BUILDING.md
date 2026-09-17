@@ -1,4 +1,4 @@
-# Building Charon — Windows first, then Linux
+# Building Charon — Windows first, then Linux (macOS via CI)
 
 Workflow: develop and test on Windows, push/copy the tree to a Linux box, build
 deb/rpm/AppImage there. Never copy `node_modules/` or `src-tauri/target/` between
@@ -182,6 +182,11 @@ tar czf charon-linux-portable.tar.gz portable
 - **WebGL**: on a software/headless GL stack the terminal probes for a WebGL2
   context and falls back to the DOM renderer automatically; force it with
   `renderer = "dom"` under `[appearance]` in `data/profiles/default.toml`.
+- **Window has no min/close buttons on a VM** (they render *behind* the content):
+  WebKitGTK's DMABUF renderer mis-composites on VMs and software GPUs. Charon sets
+  `WEBKIT_DISABLE_DMABUF_RENDERER=1` on Linux by default to avoid it; if a VM still
+  glitches, also try `WEBKIT_DISABLE_COMPOSITING_MODE=1 charon`. Set either to `0`
+  in the environment to opt back into the default renderer.
 - `npm test` needs Node ≥ 22.18 (native TypeScript for the `node:test` suites);
   the CI pins Node 22.
 
@@ -214,15 +219,41 @@ Keep `package-lock.json` in the copy so both sides resolve identical JS deps;
 test`, `npm test`, then `tauri-action` bundles NSIS (Windows) and deb/rpm/AppImage
 (Linux). Artefacts upload on every run; **pushing a `v*` tag** additionally drafts
 a GitHub release with the installers, both bundles, and the portable zip/tarball
-attached. Cut a release from a green `main`:
+attached. The separate `macos` job runs **on tags only** (bundles are heavier and
+unsigned): one runner per architecture — `macos-14` for Apple Silicon (arm64),
+`macos-13` for Intel (x86_64) — each producing a host-arch `.dmg` attached to the
+same draft release. Cut a release from a green `main`:
 
 ```bash
 git tag v0.2.0 && git push origin v0.2.0
 # → draft release "Charon v0.2.0" with nsis .exe, .deb, .rpm, .AppImage,
-#   charon-windows-portable.zip, charon-linux-portable.tar.gz — review and publish.
+#   an arm64 and an Intel .dmg, charon-windows-portable.zip,
+#   charon-linux-portable.tar.gz — review and publish.
 ```
 
 The workflow needs no secrets beyond the automatic `GITHUB_TOKEN`.
+
+### macOS Gatekeeper (unsigned builds)
+
+The `.dmg`s are **not code-signed or notarized** (no Apple Developer cert in CI),
+so Gatekeeper quarantines them. After copying `Charon.app` to `/Applications`,
+first launch it one of these ways:
+
+- **Right-click → Open** (or Control-click → Open), then **Open** in the dialog —
+  this records an exception, and normal double-click works afterwards; or
+- **System Settings → Privacy & Security → Open Anyway** after the first blocked
+  launch; or
+- strip the quarantine flag from a terminal:
+
+  ```bash
+  xattr -dr com.apple.quarantine /Applications/Charon.app
+  ```
+
+`"Charon.app" is damaged and can't be opened` is the same quarantine block on
+newer macOS — the `xattr` command clears it. To ship without this friction,
+sign + notarize by setting `APPLE_CERTIFICATE`, `APPLE_SIGNING_IDENTITY`,
+`APPLE_ID`, and `APPLE_PASSWORD` for `tauri-action` (see the Tauri code-signing
+docs); the workflow needs no other change.
 
 ---
 

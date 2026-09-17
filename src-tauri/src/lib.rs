@@ -43,6 +43,15 @@ pub fn run() {
         )
         .init();
 
+    // WebKitGTK's DMABUF renderer mis-composites on many VMs and software GPUs
+    // (blank areas, and the window's client-side decorations — min/close buttons —
+    // ending up painted behind the webview). Disable it unless the user set a
+    // preference; must happen before the webview initialises. Harmless elsewhere.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+
     // Data dir first: the WebView2 profile location must be decided before any
     // window exists (see `paths::webview_data_dir`).
     let paths = match paths::AppPaths::detect() {
