@@ -34,9 +34,20 @@ test("explicit values survive a round trip", () => {
   };
   const r = settingsFromForm(formFromSettings(s), "ssh");
   assert.ok(r.ok);
-  assert.deepEqual(r.settings, { ...s, shell: undefined, cwd: undefined, serial: undefined });
+  assert.deepEqual(r.settings, { ...s, shell: undefined, cwd: undefined, serial: undefined, mcp_sudo: undefined });
   const on = settingsFromForm(formFromSettings({ shell_integration: true }), "folder");
   assert.ok(on.ok); assert.equal(on.settings.shell_integration, true);
+});
+
+test("mcp_sudo round-trips and defaults off", () => {
+  // Unset → false in the form → undefined back out (inherit).
+  assert.equal(formFromSettings({}).mcpSudo, false);
+  const off = settingsFromForm(formFromSettings({}), "ssh");
+  assert.ok(off.ok); assert.equal(off.settings.mcp_sudo, undefined);
+  // Explicit true survives.
+  assert.equal(formFromSettings({ mcp_sudo: true }).mcpSudo, true);
+  const on = settingsFromForm(formFromSettings({ mcp_tier: "trusted", mcp_sudo: true }), "ssh");
+  assert.ok(on.ok); assert.equal(on.settings.mcp_sudo, true);
 });
 
 test("validation", () => {

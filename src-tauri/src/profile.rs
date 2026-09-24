@@ -41,6 +41,10 @@ section!(TerminalPrefs {
     middle_click_paste: bool = true,
     bracketed_paste: bool = true,
     paste_guard_lines: u32 = 2,
+    /// When the remote has bracketed paste on and the text ends in a newline:
+    /// "auto" runs it (newline sent after the 201~ end marker), "wait" leaves it
+    /// highlighted for the user to press Enter.
+    paste_run: String = "auto".into(),
 });
 
 section!(Clipboard {
@@ -75,6 +79,19 @@ section!(Mcp {
     default_tier: String = "read".into(),
 });
 
+section!(Files {
+    /// The file pane opens with every SSH / local tab (Ctrl+Shift+E toggles).
+    auto_open: bool = true,
+    /// Max files transferring at once during a recursive/multi-item transfer.
+    parallel_transfers: u16 = 4,
+});
+
+section!(Sudo {
+    /// Send the session's stored password automatically (after a 300 ms debounce)
+    /// when a sudo/su prompt is detected; false = show a button / wait for Ctrl+Shift+P.
+    auto_send: bool = false,
+});
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Profile {
@@ -88,6 +105,10 @@ pub struct Profile {
     pub ssh: Ssh,
     #[serde(default)]
     pub mcp: Mcp,
+    #[serde(default)]
+    pub files: Files,
+    #[serde(default)]
+    pub sudo: Sudo,
     /// Sections this build does not model yet (docs, …) pass through untouched.
     #[serde(flatten)]
     pub extra: toml::Table,
@@ -104,6 +125,8 @@ impl Default for Profile {
             ui: Default::default(),
             ssh: Default::default(),
             mcp: Default::default(),
+            files: Default::default(),
+            sudo: Default::default(),
             extra: toml::Table::new(),
         }
     }

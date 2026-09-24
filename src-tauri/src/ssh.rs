@@ -212,7 +212,8 @@ enum Cmd {
     Resize(u16, u16),
     Close,
     /// Type `line`, capture between sentinels, hide the whole exchange from the UI.
-    Capture { line: Vec<u8>, reply: oneshot::Sender<Result<(Vec<u8>, i32)>> },
+    /// `allow_sudo` lets the capture auto-answer the login user's sudo prompt.
+    Capture { line: Vec<u8>, allow_sudo: bool, reply: oneshot::Sender<Result<(Vec<u8>, i32)>> },
 }
 
 pub struct SshSession {
@@ -297,48 +298,81 @@ impl SshSession {
         channel.request_shell(true).await?;
 
         let (tx, mut rx) = mpsc::channel::<Cmd>(256);
+        // Password (password-auth only) used to auto-answer the login user's own
+        // sudo prompt during a hidden command (MCP run_command, tier-gated per call).
+        // Never logged.
+        let auth_pw = match &p.auth {
+            Auth::Password(pw) => Some(pw.clone()),
+            _ => None,
+        };
+        let login_user = p.user.clone();
 
         // One task owns the channel: pumps output to the UI and applies queued commands.
         // While a hidden command runs, output goes through `Capture` first.
         tokio::spawn(async move {
+            // Coalesce output into ≤ 1 UI event per 16 ms (see session::Coalescer).
+            let mut out = crate::session::Coalescer::new(app.clone(), id.clone());
             let mut capture: Option<(crate::hidden::Capture, oneshot::Sender<Result<(Vec<u8>, i32)>>)> = None;
+            // User keystrokes / pastes that arrive while a hidden command is capturing
+            // are held here and flushed once it finishes, so they never interleave with
+            // (or get dropped by) the capture window.
+            let mut pending_writes: Vec<u8> = Vec::new();
             let finish = |c: Option<(crate::hidden::Capture, oneshot::Sender<Result<(Vec<u8>, i32)>>)>, r: Result<(), String>| {
                 if let Some((cap, reply)) = c {
                     let _ = reply.send(r.map(|_| cap.into_result()).map_err(|e| anyhow!(e)));
                 }
             };
             loop {
+                let flush_due = out.due_in();
                 tokio::select! {
                     msg = channel.wait() => match msg {
                         Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
                             match capture.as_mut() {
                                 Some((cap, _)) => {
                                     let show = cap.feed(&data);
-                                    if !show.is_empty() { SessionManager::emit_data(&app, &id, &show); }
+                                    // Keep ordering: drain any coalesced normal output first.
+                                    if !show.is_empty() { out.flush(); SessionManager::emit_data(&app, &id, &show); }
+                                    // Auto-answer a sudo/su prompt so hidden commands don't hang.
+                                    let pw_send = cap.take_password_send();
                                     if cap.done() { finish(capture.take(), Ok(())); }
+                                    if let Some(bytes) = pw_send {
+                                        tracing::info!(session = %id, "sudo: prompt detected, sent=true");
+                                        let _ = channel.data(&bytes[..]).await;
+                                    }
                                 }
-                                None => SessionManager::emit_data(&app, &id, &data),
+                                None => out.push(&data),
                             }
                         }
                         Some(ChannelMsg::ExitStatus { exit_status }) => {
+                            out.flush();
                             SessionManager::emit_closed(&app, &id, &format!("exit {exit_status}"));
                         }
                         Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
+                            out.flush();
                             SessionManager::emit_closed(&app, &id, "closed");
                             break;
                         }
                         _ => {}
                     },
                     cmd = rx.recv() => match cmd {
-                        Some(Cmd::Write(b)) => { let _ = channel.data(&b[..]).await; }
+                        // Queue input while a hidden command captures; flush after (below).
+                        Some(Cmd::Write(b)) => {
+                            if capture.is_some() { pending_writes.extend_from_slice(&b); }
+                            else { let _ = channel.data(&b[..]).await; }
+                        }
                         Some(Cmd::Resize(c, r)) => { let _ = channel.window_change(c as u32, r as u32, 0, 0).await; }
-                        Some(Cmd::Capture { line, reply }) => {
+                        Some(Cmd::Capture { line, allow_sudo, reply }) => {
+                            out.flush(); // don't let buffered output land inside the capture window
                             if capture.is_some() {
                                 let _ = reply.send(Err(anyhow!("another hidden command is still running")));
                             } else if channel.data(&line[..]).await.is_err() {
                                 let _ = reply.send(Err(anyhow!("channel gone")));
                             } else {
-                                capture = Some((crate::hidden::Capture::new(), reply));
+                                let mut cap = crate::hidden::Capture::new();
+                                if allow_sudo {
+                                    if let Some(pw) = &auth_pw { cap.set_sudo_password(pw.clone(), login_user.clone()); }
+                                }
+                                capture = Some((cap, reply));
                             }
                         }
                         Some(Cmd::Close) | None => {
@@ -354,6 +388,15 @@ impl SshSession {
                             finish(capture.take(), r);
                         }
                     }
+                    // Flush coalesced output once its window elapses.
+                    _ = tokio::time::sleep(flush_due.unwrap_or(std::time::Duration::from_millis(16))), if flush_due.is_some() => {
+                        out.flush();
+                    }
+                }
+                // A hidden command just finished: flush any input queued during it.
+                if capture.is_none() && !pending_writes.is_empty() {
+                    let out = std::mem::take(&mut pending_writes);
+                    let _ = channel.data(&out[..]).await;
                 }
             }
         });
@@ -377,9 +420,13 @@ impl Session for SshSession {
     }
 
     async fn exec_hidden(&self, cmd: &str) -> Result<(Vec<u8>, i32)> {
+        self.exec_hidden_sudo(cmd, false).await
+    }
+
+    async fn exec_hidden_sudo(&self, cmd: &str, allow_sudo: bool) -> Result<(Vec<u8>, i32)> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(Cmd::Capture { line: crate::hidden::wrap(cmd).into_bytes(), reply })
+            .send(Cmd::Capture { line: crate::hidden::wrap(cmd).into_bytes(), allow_sudo, reply })
             .await
             .map_err(|_| anyhow!("channel gone"))?;
         rx.await.map_err(|_| anyhow!("session closed"))?

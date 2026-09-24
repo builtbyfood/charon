@@ -17,6 +17,7 @@ middle_click_paste = true
 right_click = "moba"            # "moba": copy selection / paste, Shift+right-click for the menu; "menu": always the menu
 bracketed_paste = true
 paste_guard_lines = 2           # warn when pasting >= this many lines
+paste_run = "auto"              # "auto": pasted text ending in a newline runs; "wait": bash highlights it, press Enter
 
 [clipboard]
 strip_zero_width = true
@@ -27,9 +28,13 @@ crlf_to_lf = true
 
 [files]
 auto_open = true                # file pane opens with every SSH / local tab (Ctrl+Shift+E toggles)
+parallel_transfers = 4          # max files transferring at once during a recursive / multi-item transfer
 
 [ssh]
 keepalive_seconds = 30          # server-alive interval; 0 = off. No idle-disconnect timeout.
+
+[sudo]
+auto_send = false               # true: auto-send the saved password at a sudo/su prompt (300 ms debounce); else button / Ctrl+Shift+P
 
 [commands]                      # OSC 133 driven
 mark_gutter = true

@@ -16,10 +16,16 @@ export interface Prefs {
   rightClick: "moba" | "menu";
   /** Warn when pasting at least this many lines. */
   pasteGuardLines: number;
+  /** Bracketed paste ending in a newline: "auto" runs it, "wait" leaves it highlighted. */
+  pasteRun: "auto" | "wait";
   smartQuotesToAscii: boolean;
   trimTrailingWhitespace: boolean;
   /** Open the file pane on every SSH/local connect (MobaXterm habit). */
   filesAutoOpen: boolean;
+  /** Auto-send the saved password at a sudo/su prompt (debounced). */
+  sudoAutoSend: boolean;
+  /** Max files transferring at once during a recursive / multi-item transfer. */
+  filesParallel: number;
 }
 
 // xterm needs a literal font list; it cannot resolve CSS variables. The
@@ -36,9 +42,12 @@ export const DEFAULTS: Prefs = {
   middleClickPaste: true,
   rightClick: "moba",
   pasteGuardLines: 2,
+  pasteRun: "auto",
   smartQuotesToAscii: true,
   trimTrailingWhitespace: true,
   filesAutoOpen: true,
+  filesParallel: 4,
+  sudoAutoSend: false,
 };
 
 export function prefsFromProfile(p: Profile): Prefs {
@@ -53,9 +62,12 @@ export function prefsFromProfile(p: Profile): Prefs {
     middleClickPaste: p.terminal.middle_click_paste !== false,
     rightClick: p.terminal.right_click === "menu" ? "menu" : "moba",
     pasteGuardLines: clamp(p.terminal.paste_guard_lines, 1, 1000, DEFAULTS.pasteGuardLines),
+    pasteRun: p.terminal.paste_run === "wait" ? "wait" : "auto",
     smartQuotesToAscii: p.clipboard.smart_quotes_to_ascii !== false,
     trimTrailingWhitespace: p.clipboard.trim_trailing_whitespace !== false,
     filesAutoOpen: p.files?.auto_open !== false,
+    filesParallel: clamp(p.files?.parallel_transfers ?? 4, 1, 64, DEFAULTS.filesParallel),
+    sudoAutoSend: p.sudo?.auto_send === true,
   };
 }
 

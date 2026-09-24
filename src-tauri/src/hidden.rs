@@ -92,6 +92,15 @@ pub struct Capture {
     code: i32,
     started: Instant,
     last_byte: Instant,
+    /// Password to answer a `[sudo] password for <login-user>:` prompt with, so an
+    /// agent's `sudo …` (MCP run_command) doesn't hang. Never logged. Auto-answer
+    /// is deliberately restricted to the login user's own sudo prompt — never a
+    /// bare `Password:` (su), which stays manual.
+    sudo_pw: Option<String>,
+    sudo_user: String,
+    sudo_sent: bool,
+    /// Rolling tail of recent output, for prompt sniffing across chunk boundaries.
+    sniff: Vec<u8>,
 }
 
 impl Default for Capture {
@@ -103,7 +112,31 @@ impl Default for Capture {
 impl Capture {
     pub fn new() -> Self {
         let now = Instant::now();
-        Self { phase: Phase::Echo, buf: Vec::new(), payload: Vec::new(), code: 0, started: now, last_byte: now }
+        Self { phase: Phase::Echo, buf: Vec::new(), payload: Vec::new(), code: 0, started: now, last_byte: now, sudo_pw: None, sudo_user: String::new(), sudo_sent: false, sniff: Vec::new() }
+    }
+
+    /// Arm auto-answering of the login user's own `[sudo] password for <user>:`
+    /// prompt seen during capture. A bare `Password:` (su) is never auto-answered.
+    pub fn set_sudo_password(&mut self, pw: String, login_user: String) {
+        self.sudo_pw = Some(pw);
+        self.sudo_user = login_user;
+    }
+
+    /// If the login user's sudo prompt is waiting and a password is armed, return
+    /// the bytes to send (password + newline) — once. The caller writes them to the
+    /// channel and must never log them.
+    pub fn take_password_send(&mut self) -> Option<Vec<u8>> {
+        if self.sudo_sent {
+            return None;
+        }
+        let pw = self.sudo_pw.as_ref()?;
+        if sniff_sudo_prompt_for(&self.sniff, &self.sudo_user) {
+            self.sudo_sent = true;
+            let mut v = pw.clone().into_bytes();
+            v.push(b'\n');
+            return Some(v);
+        }
+        None
     }
 
     pub fn done(&self) -> bool {
@@ -113,6 +146,11 @@ impl Capture {
     /// Feed session output; returns the bytes the UI should still see.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
         self.last_byte = Instant::now();
+        // Keep a short tail of raw output for sudo-prompt sniffing.
+        if self.sudo_pw.is_some() && !self.sudo_sent {
+            self.sniff.extend_from_slice(bytes);
+            keep_tail(&mut self.sniff, 256);
+        }
         if self.phase == Phase::Done {
             return bytes.to_vec();
         }
@@ -197,6 +235,17 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
+/// True when the tail of recent output is *the login user's own* sudo prompt,
+/// `[sudo] password for <login_user>:`. Deliberately strict: a prompt for another
+/// user, or a bare `Password:` (su), is not auto-answered. `login_user` empty ⇒ never.
+pub fn sniff_sudo_prompt_for(buf: &[u8], login_user: &str) -> bool {
+    if login_user.is_empty() {
+        return false;
+    }
+    let s = strip_escapes(&String::from_utf8_lossy(buf));
+    s.trim_end().ends_with(&format!("[sudo] password for {login_user}:"))
+}
+
 fn keep_tail(buf: &mut Vec<u8>, n: usize) {
     if buf.len() > n {
         buf.drain(..buf.len() - n);
@@ -269,6 +318,50 @@ mod tests {
         assert_eq!(strip_escapes("a\x1b[0mb\x1b[1;32mc"), "abc");
         assert_eq!(strip_escapes("x\x1b]0;title\x1b\\y"), "xy"); // OSC with ST terminator
         assert_eq!(strip_escapes("plain"), "plain");
+    }
+
+    #[test]
+    fn sniffs_only_the_login_users_sudo_prompt() {
+        assert!(sniff_sudo_prompt_for(b"[sudo] password for admin: ", "admin"));
+        assert!(sniff_sudo_prompt_for(b"noise\r\n[sudo] password for admin:", "admin"));
+        // A different user, a bare su prompt, or an unknown login user: never.
+        assert!(!sniff_sudo_prompt_for(b"[sudo] password for root:", "admin"));
+        assert!(!sniff_sudo_prompt_for(b"foo\r\nPassword:", "admin"));
+        assert!(!sniff_sudo_prompt_for(b"[sudo] password for admin:", ""));
+        assert!(!sniff_sudo_prompt_for(b"admin@host:~$ ", "admin"));
+    }
+
+    #[test]
+    fn capture_answers_the_login_users_sudo_prompt_once() {
+        let mut c = Capture::new();
+        c.set_sudo_password("hunter2".into(), "admin".into());
+        // Prompt for the login user arrives inside the window: password offered once.
+        c.feed(b"\x1b]7771;s\x07[sudo] password for admin: ");
+        let send = c.take_password_send().expect("password to send");
+        assert_eq!(send, b"hunter2\n");
+        assert!(c.take_password_send().is_none()); // never twice
+    }
+
+    #[test]
+    fn capture_ignores_su_and_other_user_prompts() {
+        // Bare su `Password:` — never auto-answered (manual button only).
+        let mut c = Capture::new();
+        c.set_sudo_password("hunter2".into(), "admin".into());
+        c.feed(b"\x1b]7771;s\x07Password: ");
+        assert!(c.take_password_send().is_none());
+        // sudo for a different user — never.
+        let mut c2 = Capture::new();
+        c2.set_sudo_password("hunter2".into(), "admin".into());
+        c2.feed(b"\x1b]7771;s\x07[sudo] password for postgres: ");
+        assert!(c2.take_password_send().is_none());
+    }
+
+    #[test]
+    fn capture_without_prompt_sends_nothing() {
+        let mut c = Capture::new();
+        c.set_sudo_password("hunter2".into(), "admin".into());
+        c.feed(b"\x1b]7771;s\x07regular output\r\n");
+        assert!(c.take_password_send().is_none());
     }
 
     #[test]

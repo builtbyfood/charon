@@ -82,6 +82,67 @@ export function mergeFlags(...sources: Flag[][]): Flag[] {
   return [...new Set(byName.values())].sort((a, b) => shortest(a).localeCompare(shortest(b)));
 }
 
+export interface FlagAccept {
+  /** Characters to APPEND to what's already typed. Never deletes; may be "". */
+  insert: string;
+  /** True when Enter should run the line instead of completing (exact / no match). */
+  passthrough: boolean;
+}
+
+/**
+ * Decide what pressing Enter on the highlighted flag does, given the live typed
+ * `prefix` (the `-token` under the cursor) and that flag's `names`:
+ *   - prefix exactly equals a spelling  → passthrough (the user wants to run it);
+ *   - a spelling extends the prefix      → insert only the missing suffix
+ *     (`--al` + `--all` ⇒ "l");
+ *   - nothing matches (stale highlight)  → passthrough, never a corrupting edit.
+ * The caller only ever appends `insert` and never sends a newline itself; on
+ * passthrough it lets the Enter reach the shell.
+ */
+export function flagAccept(prefix: string, names: string[]): FlagAccept {
+  if (names.includes(prefix)) return { insert: "", passthrough: true };
+  const name = names.find((n) => n.startsWith(prefix));
+  if (!name) return { insert: "", passthrough: true };
+  return { insert: name.slice(prefix.length), passthrough: false };
+}
+
+export interface FlagAcceptHooks {
+  /** Append these characters to the shell line (only ever the flag suffix). */
+  send: (chars: string) => void;
+  /** Return focus to the terminal. */
+  focus: () => void;
+  /** Dismiss the popup. */
+  close: () => void;
+}
+
+/**
+ * Perform an accept — whether triggered by Enter or a mouse click — on the flag
+ * at `index`, given the live typed `prefix`. Sends ONLY the missing suffix
+ * (never the name list, description, or any row text), then always closes the
+ * popup and refocuses the terminal. Returns whether it inserted (the caller
+ * swallows the Enter) vs passed through (let the Enter run the line). Both the
+ * keyboard and mouse paths go through here, so their `sent` value is identical.
+ */
+export function runFlagAccept(
+  prefix: string,
+  flags: Flag[],
+  index: number,
+  h: FlagAcceptHooks,
+): { consumed: boolean; insert: string; selected: string } {
+  const flag = flags[index];
+  if (!flag) {
+    h.close();
+    h.focus();
+    return { consumed: false, insert: "", selected: "" };
+  }
+  const { insert, passthrough } = flagAccept(prefix, flag.names);
+  const selected = flag.names.find((n) => n.startsWith(prefix)) ?? flag.names[0];
+  if (insert && !passthrough) h.send(insert);
+  h.close();
+  h.focus();
+  return { consumed: !!insert && !passthrough, insert, selected };
+}
+
 /** Flags whose first name starts with `prefix` (what the user has typed). */
 export function matchFlags(flags: Flag[], prefix: string): Flag[] {
   if (prefix === "-" || prefix === "--") {

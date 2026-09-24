@@ -78,6 +78,8 @@
   let docsSession = $state<string | null>(null);
   // MCP approval prompt (exec-approve tier) and the "always for this session" cache is backend-side.
   let approve = $state<McpApprove | null>(null);
+  // Separate opt-in: let this run_command auto-answer the login user's sudo prompt.
+  let allowSudo = $state(false);
 
   onMount(async () => {
     info = await appInfo();
@@ -87,7 +89,7 @@
     vault = await vaultStatus();
     askMaster = vault.locked; // file vault in portable mode: ask once at startup
     // MCP: exec-approval prompts, and open-in-editor requests from an agent.
-    await onMcpApprove((p) => { approve = p; });
+    await onMcpApprove((p) => { approve = p; allowSudo = false; });
     await onMcpOpenEditor(async (p) => {
       try {
         if (p.path) await openInEditor(p.path, null, null, "sftp");
@@ -166,7 +168,7 @@
           {#if t.editor}
             <EditorPane bind:this={editorPane} onsend={sendToSession} ondirty={(d) => (editorDirty = d)} />
           {:else if t.open}
-            <Terminal bind:this={terms[t.id]} open={t.open} color={t.color} {prefs} onfontsize={setFontSize} onclosed={() => {}} onabort={() => closeTab(t.id)}
+            <Terminal bind:this={terms[t.id]} open={t.open} color={t.color} {prefs} active={active === t.id} onfontsize={setFontSize} onclosed={() => {}} onabort={() => closeTab(t.id)}
               onopenfile={openInEditor} onfiles={(o) => (filesOpen[t.id] = o)}
               oncommand={(cmd, sess) => { if (active === t.id) { docsCommand = cmd; docsSession = sess; } }} />
           {/if}
@@ -194,10 +196,15 @@
       <h3>MCP wants to run a command</h3>
       <p class="who">tool <span class="mono">{approve.tool}</span> · session <span class="mono">{approve.session.slice(0, 8)}</span></p>
       <pre class="cmd">{approve.command}</pre>
+      {#if approve.tool === "run_command"}
+        <label class="sudo-opt" title="Let this command auto-answer a '[sudo] password for {'<you>'}:' prompt with the saved password. The password is never shown or logged.">
+          <input type="checkbox" bind:checked={allowSudo} /> allow sudo password
+        </label>
+      {/if}
       <div class="row">
         <button type="button" onclick={() => { mcpAnswer(approve!.req_id, { decision: "deny" }); approve = null; }}>Deny</button>
-        <button type="button" onclick={() => { mcpAnswer(approve!.req_id, { decision: "always" }); approve = null; }}>Always for this session</button>
-        <button type="button" class="primary" onclick={() => { mcpAnswer(approve!.req_id, { decision: "approve" }); approve = null; }}>Approve</button>
+        <button type="button" onclick={() => { mcpAnswer(approve!.req_id, { decision: "always", allow_sudo: allowSudo }); approve = null; }}>Always for this session</button>
+        <button type="button" class="primary" onclick={() => { mcpAnswer(approve!.req_id, { decision: "approve", allow_sudo: allowSudo }); approve = null; }}>Approve</button>
       </div>
     </div>
   </div>
@@ -235,6 +242,7 @@
   .approve .who { margin: 0; color: var(--fg-dim); font-size: 12px; }
   .approve .cmd { margin: 0; background: var(--bg-sunken); border: 1px solid var(--line); border-radius: 4px; padding: 8px; font-family: var(--font-mono); font-size: 12px; white-space: pre-wrap; word-break: break-all; max-height: 160px; overflow: auto; }
   .approve .row { display: flex; justify-content: flex-end; gap: 6px; }
+  .approve .sudo-opt { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #ffb454; }
   .approve .mono { font-family: var(--font-mono); }
   .approve .primary { border-color: var(--accent); }
 </style>

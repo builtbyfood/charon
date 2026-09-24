@@ -215,6 +215,40 @@ impl LocalSession {
         let sink = Arc::new(sink);
         let closed = Arc::new(AtomicBool::new(false));
         let short = &id[..8.min(id.len())];
+        // Emitter thread coalesces reads into ≤ 1 sink.data call per 16 ms, so a
+        // flood (yes | head -c 5M) becomes a handful of events, not thousands.
+        let (dtx, drx) = std::sync::mpsc::channel::<Vec<u8>>();
+        {
+            let sink = sink.clone();
+            std::thread::Builder::new()
+                .name(format!("pty-emit-{short}"))
+                .spawn(move || {
+                    use std::sync::mpsc::RecvTimeoutError;
+                    let window = std::time::Duration::from_millis(16);
+                    let mut acc: Vec<u8> = Vec::new();
+                    let mut last = std::time::Instant::now() - window;
+                    loop {
+                        match drx.recv_timeout(window) {
+                            Ok(chunk) => {
+                                acc.extend_from_slice(&chunk);
+                                if last.elapsed() >= window || acc.len() >= 64 * 1024 {
+                                    sink.data(&acc);
+                                    acc.clear();
+                                    last = std::time::Instant::now();
+                                }
+                            }
+                            Err(RecvTimeoutError::Timeout) => {
+                                if !acc.is_empty() { sink.data(&acc); acc.clear(); last = std::time::Instant::now(); }
+                            }
+                            Err(RecvTimeoutError::Disconnected) => {
+                                if !acc.is_empty() { sink.data(&acc); }
+                                break;
+                            }
+                        }
+                    }
+                })
+                .context("spawn pty emitter thread")?;
+        }
         {
             let (sink, closed) = (sink.clone(), closed.clone());
             std::thread::Builder::new()
@@ -224,7 +258,7 @@ impl LocalSession {
                     loop {
                         match reader.read(&mut buf) {
                             Ok(0) => break, // EOF
-                            Ok(n) => sink.data(&buf[..n]),
+                            Ok(n) => { let _ = dtx.send(buf[..n].to_vec()); }
                             // Retry a signal-interrupted read; drain buffered output first.
                             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                             // On a Unix PTY the master read returns EIO once the child has
@@ -233,6 +267,7 @@ impl LocalSession {
                             Err(_) => break,
                         }
                     }
+                    drop(dtx); // let the emitter flush its remainder and exit
                     // Give the waiter a moment to report the real exit code first.
                     std::thread::sleep(std::time::Duration::from_millis(200));
                     if !closed.swap(true, Ordering::SeqCst) {

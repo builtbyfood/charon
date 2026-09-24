@@ -7,7 +7,7 @@ import type { Kind, Settings, SerialSettings } from "./api";
 export interface NodeForm {
   host: string; port: string; user: string; credential: string; jump: string;
   color: string; tags: string; startup: string;
-  shellInt: "" | "true" | "false"; mcp: string;
+  shellInt: "" | "true" | "false"; mcp: string; mcpSudo: boolean;
   shell: string; cwd: string;
   serialPort: string; baud: string; dataBits: string; parity: string; stopBits: string;
 }
@@ -25,6 +25,7 @@ export function formFromSettings(s: Settings): NodeForm {
     // == null: the store serialises unset as null, not undefined.
     shellInt: s.shell_integration == null ? "" : s.shell_integration ? "true" : "false",
     mcp: s.mcp_tier ?? "",
+    mcpSudo: s.mcp_sudo === true,
     shell: s.shell ?? "",
     cwd: s.cwd ?? "",
     serialPort: s.serial?.port ?? "",
@@ -73,6 +74,8 @@ export function settingsFromForm(f: NodeForm, kind: Kind): FormResult {
     startup: startupList.length ? startupList : undefined,
     shell_integration: f.shellInt === "" ? undefined : f.shellInt === "true",
     mcp_tier: (f.mcp || undefined) as Settings["mcp_tier"],
+    // Only meaningful at the trusted tier; store true, else inherit/unset.
+    mcp_sudo: f.mcpSudo ? true : undefined,
   };
   return { ok: true, settings };
 }

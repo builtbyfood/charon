@@ -279,7 +279,7 @@ export class CommandTracker {
 // ---------------------------------------------------------------- shell detection + injection
 
 // Pure prompt helpers live in prompt.ts so they can be unit-tested without the ?raw imports.
-export { detectShell, looksLikeShellPrompt, parseOsc7, promptUserOf, type Shell } from "./prompt";
+export { detectShell, looksLikeShellPrompt, looksLikeSudoPrompt, sudoUserOf, sudoAutoEligible, parseOsc7, promptUserOf, type Shell } from "./prompt";
 import type { Shell } from "./prompt";
 
 import bashHook from "../../shell-integration/bash.sh?raw";

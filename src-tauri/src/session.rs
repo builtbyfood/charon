@@ -25,6 +25,12 @@ pub trait Session: Send + Sync {
     async fn exec_hidden(&self, _cmd: &str) -> Result<(Vec<u8>, i32)> {
         Err(anyhow!("this session cannot run hidden commands"))
     }
+    /// Like `exec_hidden`, but `allow_sudo` permits auto-answering a
+    /// `[sudo] password for <login-user>:` prompt with the session's password
+    /// (MCP run_command, tier-gated). Default ignores the flag.
+    async fn exec_hidden_sudo(&self, cmd: &str, _allow_sudo: bool) -> Result<(Vec<u8>, i32)> {
+        self.exec_hidden(cmd).await
+    }
     /// Open a root SFTP channel via `sudo -S <server>` (P6). SSH only.
     async fn sudo_fs(&self, _password: &str, _server: &str) -> Result<Arc<dyn crate::sftp::Fs>> {
         Err(anyhow!("this session has no sudo file access"))
@@ -172,5 +178,51 @@ impl SessionManager {
 
     pub fn emit_closed(app: &AppHandle, id: &str, reason: &str) {
         let _ = app.emit(&format!("term:closed:{id}"), reason.to_string());
+    }
+}
+
+/// Batches a session's output so the UI gets at most one `term:data` event per
+/// window (16 ms), instead of one per SSH packet / PTY read. The first byte of a
+/// burst is emitted immediately (low latency); subsequent bytes within the window
+/// accumulate and flush together (fewer IPC round-trips + JSON/base64 encodes).
+pub struct Coalescer {
+    app: AppHandle,
+    id: String,
+    buf: Vec<u8>,
+    last_flush: std::time::Instant,
+    window: std::time::Duration,
+}
+
+impl Coalescer {
+    pub fn new(app: AppHandle, id: String) -> Self {
+        // Start "due" so the first push flushes at once.
+        let window = std::time::Duration::from_millis(16);
+        Self { app, id, buf: Vec::new(), last_flush: std::time::Instant::now() - window, window }
+    }
+
+    /// Append output; flush now if the window has elapsed since the last flush.
+    pub fn push(&mut self, data: &[u8]) {
+        self.buf.extend_from_slice(data);
+        if self.last_flush.elapsed() >= self.window {
+            self.flush();
+        }
+    }
+
+    /// Time until a buffered flush is due, or `None` when nothing is pending.
+    pub fn due_in(&self) -> Option<std::time::Duration> {
+        if self.buf.is_empty() {
+            None
+        } else {
+            Some(self.window.saturating_sub(self.last_flush.elapsed()))
+        }
+    }
+
+    pub fn flush(&mut self) {
+        if self.buf.is_empty() {
+            return;
+        }
+        SessionManager::emit_data(&self.app, &self.id, &self.buf);
+        self.buf.clear();
+        self.last_flush = std::time::Instant::now();
     }
 }

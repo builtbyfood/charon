@@ -1,20 +1,22 @@
 <script lang="ts">
   // File pane beside a terminal: SFTP for SSH tabs, the local disk for local
   // tabs — same UI, the backend picks the filesystem from the session id.
+  // Supports multi-select and recursive (directory / multi-item) transfers.
   import { onMount, onDestroy, untrack } from "svelte";
-  import { open as pickOpen, save as pickSave } from "@tauri-apps/plugin-dialog";
+  import { open as pickOpen } from "@tauri-apps/plugin-dialog";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { writeText } from "@tauri-apps/plugin-clipboard-manager";
   import {
-    sftpHome, sftpList, sftpStat, sftpMkdir, sftpRename, sftpDelete, sftpChmod, sftpGet, sftpPut, sftpCancel, onTransferProgress,
-    type FsEntry, type FsListing, type TransferProgress,
+    sftpHome, sftpList, sftpMkdir, sftpRename, sftpDelete, sftpChmod,
+    sftpGetTree, sftpPutTree, sftpCancel, onTreeEvent,
+    type FsEntry, type FsListing, type TreeEvent, type TreeOpts, type Conflict,
   } from "./api";
   import ContextMenu, { type MenuItem } from "./ContextMenu.svelte";
   import { joinPath, crumbsOf, osc7ToLocal, humanSize, modeString } from "./paths";
   import { followTarget, pushTarget } from "./panecwd";
   import { isPermissionError, sftpSudoOpen, sftpSudoHasPassword, sftpSudoClear, type FsVia } from "./api";
 
-  let { session, cwd, color, sshUser, shellUser, isIdle, onopen, onchdir, onclose }: {
+  let { session, cwd, color, sshUser, shellUser, isIdle, parallel, onopen, onchdir, onclose }: {
     /** Session id; null = local disk. */
     session: string | null;
     /** Shell cwd from OSC 7, followed when "follow" is on. */
@@ -26,6 +28,8 @@
     shellUser?: string;
     /** The shell is at an idle prompt: safe to run hidden commands / cd. */
     isIdle?: () => boolean;
+    /** Max files transferring at once (profile files.parallel_transfers); shown for reference. */
+    parallel?: number;
     /** Open a file in the editor with the backend the pane is using. */
     onopen?: (path: string, via: FsVia) => void;
     /** "→ term" is on: tell the shell to cd here. */
@@ -56,20 +60,45 @@
   let sudoReason = $state("");  // why the last escalation fell back to the shell backend
   let sortKey = $state<"name" | "size" | "mtime" | "mode">("name");
   let sortDir = $state<1 | -1>(1);
-  let selected = $state<string | null>(null);
+  // Multi-select: a set of entry paths, with an anchor path for Shift ranges.
+  let selected = $state<Set<string>>(new Set());
+  let anchor: string | null = null;
   let menu = $state<{ x: number; y: number; items: MenuItem[] } | null>(null);
   let dropping = $state(false);
   // Inline prompt row (window.prompt is not available in the webview).
   let ask = $state<{ kind: "rename" | "chmod" | "mkdir"; entry?: FsEntry; value: string } | null>(null);
   let askEl = $state<HTMLInputElement | null>(null);
 
-  interface Transfer { id: string; name: string; dest: string; dir: "get" | "put"; done: number; total: number; state: TransferProgress["state"]; error?: string; mode?: number; retry: () => void }
+  // Per-file progress inside one tree transfer.
+  interface FileProg { rel: string; done: number; total: number; state: "running" | "done" | "failed" | "skipped"; error?: string }
+  // One top-level item (file or directory) being transferred recursively.
+  interface Transfer {
+    id: string; name: string; dir: "get" | "put";
+    /** Destination directory: local dir for get, remote dir for put. */
+    destDir: string;
+    /** Source path (remote for get, local for put) — kept for retry. */
+    src: string;
+    opts: TreeOpts;
+    filesTotal: number; filesDone: number; bytesTotal: number; bytesDone: number;
+    state: "running" | "done" | "error" | "cancelled";
+    error?: string; cancelled: boolean;
+    failed: string[];              // rels that failed, for retry-failed-only
+    files: Record<string, FileProg>;
+    warnings: string[];
+    expanded: boolean;
+  }
   let transfers = $state<Transfer[]>([]);
-  let preserveMode = $state(false);  // apply the source file's mode after upload
+  // Transfer options (shared by every transfer started from this pane).
+  let followSymlinks = $state(true);   // follow symlinks; off = skip with a warning
+  let preserveMtime = $state(true);
+  let preserveMode = $state(false);
+  // Conflict handling: asked once per batch; "remember" reuses the choice for the session.
+  let conflictAsk = $state<null | { count: number; kind: "get" | "put"; run: (c: Conflict) => void }>(null);
+  let rememberConflict = $state(false);
+  let sessionConflict: Conflict | null = null;
   const unlisteners: Array<() => void> = [];
 
   const isLocal = $derived(session === null);
-  const shellBackend = $derived(via === "shell");
   const rootBackend = $derived(via === "shell" || via === "sudo");
   const differentUser = $derived(!!shellUser && !!sshUser && shellUser !== sshUser);
   /** Windows has no mode bits; drop the column rather than show blanks. */
@@ -89,9 +118,10 @@
       return c * sortDir || a.name.localeCompare(b.name);
     });
   });
+  const selectedEntries = $derived(rows.filter((e) => selected.has(e.path)));
 
   onMount(async () => {
-    unlisteners.push(await onTransferProgress(onProgress));
+    unlisteners.push(await onTreeEvent(onTree));
     // OS drag-drop lands on the webview; take it if it was dropped over this pane.
     unlisteners.push(await getCurrentWebview().onDragDropEvent((e) => {
       const p = e.payload;
@@ -99,7 +129,7 @@
       const inside = el ? overThisPane(p.position.x, p.position.y) : false;
       if (p.type === "over" || p.type === "enter") { dropping = inside; return; }
       dropping = false;
-      if (p.type === "drop" && inside) for (const path of p.paths) upload(path);
+      if (p.type === "drop" && inside && p.paths.length) startUpload(p.paths);
     }));
     try { await go(await sftpHome(session, via)); } catch (e) { error = String(e); }
   });
@@ -114,7 +144,7 @@
   }
 
   async function go(path: string) {
-    loading = true; error = ""; selected = null; ask = null;
+    loading = true; error = ""; selected = new Set(); anchor = null; ask = null;
     try {
       try { listing = await sftpList(session, path, via); }
       catch (e) {
@@ -169,8 +199,33 @@
     });
   });
 
+  // ---- selection
+  const isDirEntry = (e: FsEntry) => e.kind === "dir" || (e.kind === "symlink" && e.target_kind === "dir");
+  function onRowClick(ev: MouseEvent, e: FsEntry) {
+    if (ev.shiftKey && anchor) {
+      const paths = rows.map((r) => r.path);
+      const a = paths.indexOf(anchor), b = paths.indexOf(e.path);
+      if (a >= 0 && b >= 0) {
+        const [lo, hi] = a < b ? [a, b] : [b, a];
+        const next = ev.ctrlKey || ev.metaKey ? new Set(selected) : new Set<string>();
+        for (let i = lo; i <= hi; i++) next.add(paths[i]);
+        selected = next;
+      }
+    } else if (ev.ctrlKey || ev.metaKey) {
+      const next = new Set(selected);
+      next.has(e.path) ? next.delete(e.path) : next.add(e.path);
+      selected = next; anchor = e.path;
+    } else {
+      selected = new Set([e.path]); anchor = e.path;
+    }
+  }
+  function selectAll() { selected = new Set(rows.map((r) => r.path)); anchor = rows[0]?.path ?? null; }
+  function onListKey(k: KeyboardEvent) {
+    if ((k.ctrlKey || k.metaKey) && k.key.toLowerCase() === "a") { k.preventDefault(); selectAll(); }
+  }
+
   function activate(e: FsEntry) {
-    if (e.kind === "dir" || (e.kind === "symlink" && e.target_kind === "dir")) go(e.path);
+    if (isDirEntry(e)) go(e.path);
     else if (onopen) onopen(e.path, via);
     else error = "No editor yet: use Download… from the right-click menu.";
   }
@@ -225,47 +280,93 @@
   const homeFor = () => sftpHome(session, via);
 
   // ---- transfers
-  function onProgress(p: TransferProgress) {
-    const t = transfers.find((x) => x.id === p.id);
+  function optsFor(conflict: Conflict): TreeOpts {
+    return { follow_symlinks: followSymlinks, preserve_mode: preserveMode, preserve_mtime: preserveMtime, conflict };
+  }
+  function onTree(ev: TreeEvent) {
+    const t = transfers.find((x) => x.id === ev.transfer);
     if (!t) return;
-    if (p.state === "running") { t.done = p.done; t.total = p.total; }
-    t.state = p.state; t.error = p.error ?? undefined;
-  }
-  function track(name: string, dest: string, dir: Transfer["dir"], run: (id: string) => Promise<void>, after?: (t: Transfer) => Promise<void>) {
-    const id = crypto.randomUUID();
-    const t: Transfer = { id, name, dest, dir, done: 0, total: 0, state: "running", retry: () => track(name, dest, dir, run, after) };
-    transfers = [t, ...transfers].slice(0, 50);
-    run(id)
-      .then(async () => { if (after) await after(t); if (dir === "put") refresh(); })
-      .catch((e) => { t.state = t.state === "cancelled" ? "cancelled" : "error"; t.error = String(e); });
-  }
-  async function download(e: FsEntry) {
-    const local = await pickSave({ defaultPath: e.name, title: `Download ${e.name}` });
-    if (typeof local !== "string") return;
-    track(e.name, local, "get", (id) => sftpGet(session, id, e.path, local, via));
-  }
-  async function upload(localPath: string) {
-    if (!listing) return;
-    const name = localPath.split(/[\\/]/).pop() || localPath;
-    const dest = joinPath(listing.path, name);
-    // Same-destination guard: don't let two uploads race onto one path.
-    if (transfers.some((t) => t.dir === "put" && t.dest === dest && t.state === "running")) {
-      if (!confirm(`An upload to ${name} is already in progress. Start another to the same path?`)) return;
+    if (ev.event === "plan") {
+      t.filesTotal = ev.files.length; t.bytesTotal = ev.bytes_total;
+      if (ev.dest) t.name = ev.dest;
+    } else if (ev.event === "file") {
+      const f = t.files[ev.rel] ?? (t.files[ev.rel] = { rel: ev.rel, done: 0, total: ev.total, state: ev.state });
+      f.done = ev.done; f.total = ev.total || f.total; f.state = ev.state; f.error = ev.error ?? undefined;
+      recompute(t);
+    } else if (ev.event === "warn") {
+      t.warnings = [...t.warnings, ev.message].slice(-200);
+    } else if (ev.event === "done") {
+      t.filesDone = ev.files_done; t.filesTotal = ev.files_total;
+      t.bytesDone = ev.bytes_done; t.bytesTotal = ev.bytes_total;
+      t.failed = ev.failed; t.cancelled = ev.cancelled;
+      t.state = ev.cancelled ? "cancelled" : ev.failed.length ? "error" : "done";
     }
-    // Preserve mode: read the source file's mode now (Unix only; Windows has none).
-    let mode: number | undefined;
-    if (preserveMode) { try { mode = (await sftpStat(null, localPath)).mode || undefined; } catch { mode = undefined; } }
-    const after = mode
-      ? async (t: Transfer) => { try { await sftpChmod(session, dest, mode!, via); t.mode = mode; } catch { /* best effort */ } }
-      : undefined;
-    track(name, dest, "put", (id) => sftpPut(session, id, localPath, dest, via), after);
   }
-  async function pickUpload() {
-    const picked = await pickOpen({ multiple: true, title: "Upload" });
+  function recompute(t: Transfer) {
+    const vals = Object.values(t.files);
+    t.bytesDone = vals.reduce((s, f) => s + (f.state === "done" ? f.total : f.done), 0);
+    t.filesDone = vals.filter((f) => f.state === "done").length;
+  }
+  function trackTree(dir: "get" | "put", src: string, name: string, destDir: string, conflict: Conflict) {
+    const id = crypto.randomUUID();
+    const opts = optsFor(conflict);
+    const t: Transfer = {
+      id, name, dir, destDir, src, opts,
+      filesTotal: 0, filesDone: 0, bytesTotal: 0, bytesDone: 0,
+      state: "running", cancelled: false, failed: [], files: {}, warnings: [], expanded: false,
+    };
+    transfers = [t, ...transfers].slice(0, 50);
+    const call = dir === "get"
+      ? sftpGetTree(session, id, src, destDir, opts, via)
+      : sftpPutTree(session, id, src, destDir, opts, via);
+    call
+      .then(() => { if (dir === "put") refresh(); })
+      .catch((e) => { if (t.state === "running") { t.state = "error"; t.error = String(e); } });
+  }
+  function retryTree(t: Transfer) {
+    const only = [...t.failed];
+    if (!only.length) return;
+    t.state = "running"; t.error = undefined; t.cancelled = false; t.failed = [];
+    for (const rel of only) { const f = t.files[rel]; if (f) { f.state = "running"; f.done = 0; f.error = undefined; } }
+    const opts = { ...t.opts, conflict: "overwrite" as Conflict };
+    const call = t.dir === "get"
+      ? sftpGetTree(session, t.id, t.src, t.destDir, opts, via, only)
+      : sftpPutTree(session, t.id, t.src, t.destDir, opts, via, only);
+    call
+      .then(() => { if (t.dir === "put") refresh(); })
+      .catch((e) => { if (t.state === "running") { t.state = "error"; t.error = String(e); } });
+  }
+  // Ask the conflict policy once, then run the batch; remember for the session if asked.
+  function withConflict(kind: "get" | "put", count: number, run: (c: Conflict) => void) {
+    if (sessionConflict) { run(sessionConflict); return; }
+    conflictAsk = { kind, count, run: (c) => { if (rememberConflict) sessionConflict = c; conflictAsk = null; run(c); } };
+  }
+
+  async function downloadSelection() {
+    const items = selectedEntries;
+    if (!items.length) return;
+    const destDir = await pickOpen({ directory: true, title: `Download ${items.length} item(s) to…` });
+    if (typeof destDir !== "string") return;
+    withConflict("get", items.length, (c) => { for (const e of items) trackTree("get", e.path, e.name, destDir, c); });
+  }
+  function startUpload(paths: string[]) {
+    if (!listing || !paths.length) return;
+    const dest = listing.path;
+    withConflict("put", paths.length, (c) => {
+      for (const p of paths) { const name = p.split(/[\\/]/).pop() || p; trackTree("put", p, name, dest, c); }
+    });
+  }
+  async function pickUploadFiles() {
+    const picked = await pickOpen({ multiple: true, title: "Upload files" });
     const paths = Array.isArray(picked) ? picked : picked ? [picked] : [];
-    for (const p of paths) upload(p);
+    startUpload(paths);
+  }
+  async function pickUploadFolder() {
+    const picked = await pickOpen({ directory: true, title: "Upload folder" });
+    if (typeof picked === "string") startUpload([picked]);
   }
   const clearDone = () => (transfers = transfers.filter((t) => t.state === "running"));
+  const pct = (t: Transfer) => (t.bytesTotal ? Math.floor((t.bytesDone / t.bytesTotal) * 100) + "%" : t.state === "done" ? "100%" : humanSize(t.bytesDone));
 
   // ---- inline prompts
   function startAsk(kind: NonNullable<typeof ask>["kind"], entry?: FsEntry) {
@@ -289,33 +390,43 @@
       await refresh();
     } catch (err) { error = String(err); }
   }
-  async function remove(e: FsEntry) {
-    const isDir = e.kind === "dir";
-    if (!confirm(`Delete ${isDir ? "directory" : "file"} ${e.name}?${isDir ? " (must be empty)" : ""}`)) return;
-    try { await sftpDelete(session, e.path, isDir, via); await refresh(); } catch (err) { error = String(err); }
+  async function removeSelection() {
+    const items = selectedEntries;
+    if (!items.length) return;
+    const label = items.length === 1 ? items[0].name : `${items.length} items`;
+    if (!confirm(`Delete ${label}? (directories must be empty)`)) return;
+    try {
+      for (const e of items) await sftpDelete(session, e.path, isDirEntry(e), via);
+      await refresh();
+    } catch (err) { error = String(err); }
   }
 
   function onRowMenu(ev: MouseEvent, e: FsEntry) {
     ev.preventDefault(); ev.stopPropagation();
-    selected = e.path;
-    const isDir = e.kind === "dir" || (e.kind === "symlink" && e.target_kind === "dir");
+    // Right-click on an unselected row selects just it; on a selected row keeps the set.
+    if (!selected.has(e.path)) { selected = new Set([e.path]); anchor = e.path; }
+    const many = selected.size > 1;
+    const only = selectedEntries.length === 1 ? selectedEntries[0] : null;
+    const isDir = only ? isDirEntry(only) : false;
     menu = { x: ev.clientX, y: ev.clientY, items: [
-      { label: isDir ? "Open" : "Open in editor", action: () => activate(e), disabled: !isDir && !onopen },
-      { label: "Download…", action: () => download(e), disabled: isDir },
+      { label: isDir ? "Open" : "Open in editor", action: () => only && activate(only), disabled: many || (!isDir && !onopen) },
+      { label: many ? `Download ${selected.size} items…` : "Download…", action: downloadSelection },
       { separator: true, label: "" },
-      { label: "Rename…", action: () => startAsk("rename", e) },
-      { label: "Delete…", action: () => remove(e) },
-      { label: "Copy path", action: () => writeText(e.path) },
-      { label: "chmod…", action: () => startAsk("chmod", e), disabled: isLocal && e.mode === 0 },
+      { label: "Rename…", action: () => only && startAsk("rename", only), disabled: many || !only },
+      { label: many ? `Delete ${selected.size}…` : "Delete…", action: removeSelection },
+      { label: "Copy path", action: () => writeText(selectedEntries.map((x) => x.path).join("\n")) },
+      { label: "chmod…", action: () => only && startAsk("chmod", only), disabled: many || !only || (isLocal && only.mode === 0) },
     ] };
   }
   function onPaneMenu(ev: MouseEvent) {
     ev.preventDefault(); ev.stopPropagation();
     menu = { x: ev.clientX, y: ev.clientY, items: [
       { label: "New folder…", action: () => startAsk("mkdir") },
-      { label: "Upload…", action: pickUpload },
+      { label: "Upload files…", action: pickUploadFiles },
+      { label: "Upload folder…", action: pickUploadFolder },
       { label: "Refresh", action: refresh },
       { separator: true, label: "" },
+      { label: "Select all", action: selectAll, disabled: !rows.length },
       { label: "Copy path", action: () => listing && writeText(listing.path) },
     ] };
   }
@@ -335,6 +446,9 @@
         {/each}
       {/if}
     </div>
+    <button type="button" title="Download the selection" onclick={downloadSelection} disabled={!selected.size}>↓</button>
+    <button type="button" title="Upload files here" onclick={pickUploadFiles} disabled={!listing}>↑file</button>
+    <button type="button" title="Upload a folder here" onclick={pickUploadFolder} disabled={!listing}>↑dir</button>
     <button type="button" title="Toggle hidden files" class:on={showHidden} onclick={() => (showHidden = !showHidden)}>.*</button>
     <button type="button" title="Follow the shell's directory (OSC 7)" class:on={follow} onclick={() => (follow = !follow)}>→ cwd</button>
     {#if !isLocal}
@@ -366,6 +480,16 @@
       <button type="button" onclick={() => { askSudo = false; via = "shell"; refresh(); }} title="Skip sudo, browse via the terminal">use shell</button>
     </form>
   {/if}
+  {#if conflictAsk}
+    <div class="ask conflict">
+      <span>If {conflictAsk.count > 1 ? "an item" : "it"} already exists at the destination:</span>
+      <button type="button" onclick={() => conflictAsk!.run("overwrite")}>Overwrite</button>
+      <button type="button" onclick={() => conflictAsk!.run("skip")}>Skip</button>
+      <button type="button" onclick={() => conflictAsk!.run("rename")}>Keep both</button>
+      <label class="pm" title="Use this choice for the rest of the session"><input type="checkbox" bind:checked={rememberConflict} /> remember</label>
+      <button type="button" onclick={() => (conflictAsk = null)}>Cancel</button>
+    </div>
+  {/if}
   {#if ask}
     <form class="ask" onsubmit={submitAsk}>
       <span>{ask.kind === "mkdir" ? "New folder" : ask.kind === "rename" ? "Rename to" : "chmod (octal)"}</span>
@@ -375,18 +499,19 @@
     </form>
   {/if}
   {#if error}<div class="err">{error}</div>{/if}
-  <div class="list" class:loading class:nomode={!hasModes}>
+  <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+  <div class="list" class:loading class:nomode={!hasModes} tabindex="0" onkeydown={onListKey}>
     <div class="head">
-      <button type="button" onclick={() => sortBy("name")}>Name{sortKey === "name" ? (sortDir > 0 ? " ▲" : " ▼") : ""}</button>
+      <button type="button" onclick={() => sortBy("name")}>{selected.size ? `${selected.size} selected` : "Name"}{sortKey === "name" ? (sortDir > 0 ? " ▲" : " ▼") : ""}</button>
       <button type="button" onclick={() => sortBy("size")}>Size{sortKey === "size" ? (sortDir > 0 ? " ▲" : " ▼") : ""}</button>
       <button type="button" onclick={() => sortBy("mtime")}>Modified{sortKey === "mtime" ? (sortDir > 0 ? " ▲" : " ▼") : ""}</button>
       {#if hasModes}<button type="button" onclick={() => sortBy("mode")}>Perm{sortKey === "mode" ? (sortDir > 0 ? " ▲" : " ▼") : ""}</button>{/if}
     </div>
     {#each rows as e (e.path)}
-      {@const isDir = e.kind === "dir" || (e.kind === "symlink" && e.target_kind === "dir")}
-      <div class="row" class:sel={selected === e.path} class:dir={isDir} role="row" tabindex="0"
-        onclick={() => (selected = e.path)} ondblclick={() => activate(e)}
-        onkeydown={(k) => { if (k.key === "Enter") activate(k.currentTarget && e); }}
+      {@const isDir = isDirEntry(e)}
+      <div class="row" class:sel={selected.has(e.path)} class:dir={isDir} role="row" tabindex="0"
+        onclick={(ev) => onRowClick(ev, e)} ondblclick={() => activate(e)}
+        onkeydown={(k) => { if (k.key === "Enter") activate(e); }}
         oncontextmenu={(ev) => onRowMenu(ev, e)}>
         <span class="name" title={e.path}>{isDir ? "▸ " : ""}{e.name}{e.kind === "symlink" ? " →" : ""}</span>
         <span class="size">{isDir ? "" : humanSize(e.size)}</span>
@@ -400,21 +525,37 @@
     <div class="transfers">
       <div class="thead">
         <span>Transfers</span>
-        <label class="pm" title="Apply the source file's permission bits to the uploaded file (Unix)"><input type="checkbox" bind:checked={preserveMode} /> preserve mode</label>
+        <label class="pm" title="Follow symlinks (off: skip them with a warning)"><input type="checkbox" bind:checked={followSymlinks} /> follow links</label>
+        <label class="pm" title="Preserve the source modification time"><input type="checkbox" bind:checked={preserveMtime} /> mtime</label>
+        <label class="pm" title="Preserve the source permission bits (Unix)"><input type="checkbox" bind:checked={preserveMode} /> mode</label>
+        {#if parallel}<span class="dim" title="Max files transferring at once (files.parallel_transfers)">×{parallel}</span>{/if}
         <button type="button" onclick={clearDone}>clear finished</button>
       </div>
       {#each transfers as t (t.id)}
         <div class="tr" class:err={t.state === "error"}>
-          <span class="tname" title={`${t.dest}${t.mode ? ` · mode ${t.mode.toString(8).padStart(3, "0")}` : ""}${t.error ? ` · ${t.error}` : ""}`}>{t.dir === "get" ? "↓" : "↑"} {t.name}</span>
+          <button type="button" class="disc" title="Show per-file progress" onclick={() => (t.expanded = !t.expanded)}>{t.expanded ? "▾" : "▸"}</button>
+          <span class="tname" title={`${t.destDir}${t.error ? ` · ${t.error}` : ""}`}>{t.dir === "get" ? "↓" : "↑"} {t.name}</span>
+          <progress max={t.bytesTotal || 1} value={t.bytesDone}></progress>
+          <span class="tpct">{pct(t)}</span>
+          <span class="tcount" title="files done / total">{t.filesDone}/{t.filesTotal || "?"}{t.failed.length ? ` · ${t.failed.length} failed` : ""}</span>
           {#if t.state === "running"}
-            <progress max={t.total || 1} value={t.done}></progress>
-            <span class="tpct">{t.total ? Math.floor((t.done / t.total) * 100) + "%" : humanSize(t.done)}</span>
             <button type="button" onclick={() => sftpCancel(t.id)}>cancel</button>
           {:else}
-            <span class="tstate">{t.state}{t.error ? ` — ${t.error}` : ""}</span>
-            {#if t.state !== "done"}<button type="button" onclick={t.retry}>retry</button>{/if}
+            <span class="tstate">{t.state}</span>
+            {#if t.failed.length}<button type="button" title="Retry only the failed files" onclick={() => retryTree(t)}>retry</button>{/if}
           {/if}
         </div>
+        {#if t.expanded}
+          <div class="files">
+            {#each Object.values(t.files) as f (f.rel)}
+              <div class="fr" class:ffail={f.state === "failed"}>
+                <span class="frel" title={f.error ?? f.rel}>{f.rel}</span>
+                <span class="fst">{f.state === "running" && f.total ? Math.floor((f.done / f.total) * 100) + "%" : f.state}</span>
+              </div>
+            {/each}
+            {#each t.warnings as w}<div class="warn" title={w}>⚠ {w}</div>{/each}
+          </div>
+        {/if}
       {/each}
     </div>
   {/if}
@@ -439,8 +580,12 @@
   .crumbs .sep { color: var(--fg-dim); }
   .ask { display: flex; gap: 4px; align-items: center; padding: 4px; border-bottom: 1px solid var(--line); }
   .ask input { flex: 1; min-width: 0; }
+  .ask.conflict { flex-wrap: wrap; }
+  .ask.conflict span { flex: 1 1 100%; color: var(--fg-dim); }
+  .ask.conflict button { flex: 0 0 auto; }
+  .ask.conflict .pm { flex: 0 0 auto; }
   .err { color: var(--danger); padding: 4px 8px; border-bottom: 1px solid var(--line); }
-  .list { flex: 1; overflow: auto; min-height: 0; }
+  .list { flex: 1; overflow: auto; min-height: 0; outline: none; }
   .list.loading { opacity: .6; }
   .head, .row { display: grid; grid-template-columns: minmax(0, 1fr) 64px 118px 84px; gap: 6px; padding: 2px 8px; align-items: center; }
   .nomode .head, .nomode .row { grid-template-columns: minmax(0, 1fr) 64px 118px; }
@@ -455,16 +600,25 @@
   .mtime, .mode { color: var(--fg-dim); white-space: nowrap; }
   .mono { font-family: var(--font-mono); }
   .empty { color: var(--fg-dim); padding: 12px; text-align: center; }
-  .transfers { border-top: 1px solid var(--line); max-height: 160px; overflow: auto; padding: 4px 8px; }
-  .thead { display: flex; align-items: center; gap: 8px; color: var(--fg-dim); margin-bottom: 2px; }
+  .transfers { border-top: 1px solid var(--line); max-height: 200px; overflow: auto; padding: 4px 8px; }
+  .thead { display: flex; align-items: center; gap: 8px; color: var(--fg-dim); margin-bottom: 2px; flex-wrap: wrap; }
   .thead span:first-child { margin-right: auto; }
   .thead .pm { display: flex; align-items: center; gap: 3px; }
+  .thead .dim { color: var(--fg-dim); }
   .thead button { border: 0; background: transparent; color: var(--fg-dim); padding: 0; }
-  .tr { display: grid; grid-template-columns: minmax(0, 1fr) 90px 48px auto; gap: 6px; align-items: center; padding: 1px 0; }
+  .tr { display: grid; grid-template-columns: 16px minmax(0, 1fr) 80px 44px auto auto; gap: 6px; align-items: center; padding: 1px 0; }
   .tr.err { color: var(--danger); }
+  .disc { border: 0; background: transparent; color: var(--fg-dim); padding: 0; cursor: pointer; }
   .tname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .tstate { grid-column: 2 / 4; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .tr button { padding: 0 6px; }
-  progress { width: 90px; height: 8px; accent-color: var(--session-color); }
+  .tcount { color: var(--fg-dim); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .tstate { color: var(--fg-dim); }
+  .tr button:not(.disc) { padding: 0 6px; }
+  progress { width: 80px; height: 8px; accent-color: var(--session-color); }
+  .files { padding: 2px 0 4px 22px; color: var(--fg-dim); }
+  .fr { display: grid; grid-template-columns: minmax(0, 1fr) 60px; gap: 6px; }
+  .fr.ffail { color: var(--danger); }
+  .frel { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .fst { text-align: right; }
+  .warn { color: #ffb454; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .drop { position: absolute; inset: 0; display: grid; place-content: center; background: #0008; color: var(--fg); pointer-events: none; }
 </style>

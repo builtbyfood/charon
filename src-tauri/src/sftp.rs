@@ -63,6 +63,15 @@ pub trait Fs: Send + Sync {
     async fn upload(&self, local: &Path, path: &str, t: &Transfer) -> Result<()>;
     /// Join a directory and a child name the way this filesystem spells paths.
     fn join(&self, dir: &str, name: &str) -> String;
+    /// Set a file/dir mtime (seconds since epoch); default no-op where unsupported.
+    async fn set_times(&self, _path: &str, _mtime: u64) -> Result<()> {
+        Ok(())
+    }
+    /// Whole-directory download as a tar stream, for backends where per-file is too
+    /// slow (ShellFs). `None` = fall back to the generic recursive walk.
+    async fn download_dir_tar(&self, _remote: &str, _limit: u64) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
 }
 
 // ---------------------------------------------------------------- transfers
@@ -338,6 +347,14 @@ impl Fs for SftpFs {
         r.map(|_| ())
     }
 
+    async fn set_times(&self, path: &str, mtime: u64) -> Result<()> {
+        let mut a = FileAttributes::empty();
+        a.mtime = Some(mtime as u32);
+        a.atime = Some(mtime as u32);
+        self.sftp.set_metadata(path, a).await?;
+        Ok(())
+    }
+
     fn join(&self, dir: &str, name: &str) -> String {
         posix_join(dir, name)
     }
@@ -479,6 +496,15 @@ impl Fs for LocalFs {
 
     async fn upload(&self, local: &Path, path: &str, t: &Transfer) -> Result<()> {
         self.download(&local.to_string_lossy(), Path::new(path), t).await
+    }
+
+    async fn set_times(&self, path: &str, mtime: u64) -> Result<()> {
+        let p = path.to_string();
+        tokio::task::spawn_blocking(move || {
+            filetime::set_file_mtime(&p, filetime::FileTime::from_unix_time(mtime as i64, 0))
+        })
+        .await??;
+        Ok(())
     }
 
     fn join(&self, dir: &str, name: &str) -> String {
@@ -678,6 +704,30 @@ impl Fs for ShellFs {
         t.check()?;
         t.report(bytes.len() as u64, bytes.len() as u64, "running", None);
         Ok(())
+    }
+
+    async fn set_times(&self, path: &str, mtime: u64) -> Result<()> {
+        self.run(&format!("touch -d @{mtime} -- {}", sq(path))).await.map(|_| ())
+    }
+
+    async fn download_dir_tar(&self, remote: &str, limit: u64) -> Result<Option<Vec<u8>>> {
+        use base64::Engine;
+        let parent = posix_parent(remote).unwrap_or_else(|| ".".into());
+        let name = remote.rsplit('/').next().unwrap_or(remote).to_string();
+        let size: u64 = self
+            .run(&format!("du -sb -- {} 2>/dev/null | cut -f1", sq(remote)))
+            .await
+            .ok()
+            .and_then(|o| o.trim().parse().ok())
+            .unwrap_or(0);
+        if size > limit {
+            return Ok(None); // too big to buffer as base64 — fall back to per-file
+        }
+        let b64 = self
+            .run(&format!("cd -- {} && tar -cf - -- {} | base64 | tr -d '
+'", sq(&parent), sq(&name)))
+            .await?;
+        Ok(Some(base64::engine::general_purpose::STANDARD.decode(b64.trim())?))
     }
 
     fn join(&self, dir: &str, name: &str) -> String {

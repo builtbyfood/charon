@@ -590,6 +590,23 @@ pub async fn sftp_sudo_clear(state: State<'_, AppState>, session: String) -> Cmd
     Ok(())
 }
 
+/// Answer a sudo/su password prompt in the terminal with the session's stored
+/// password (password auth). The password is written straight to the session and
+/// never crosses to the UI or a log. Returns whether anything was sent.
+#[tauri::command]
+pub async fn sudo_send_password(state: State<'_, AppState>, session: String) -> CmdResult<bool> {
+    let sess = state.sessions.get(&session).await.map_err(err)?;
+    let Some(pw) = sess.ssh_password().await else {
+        tracing::info!(session = %session, "sudo: send requested but no stored password");
+        return Ok(false);
+    };
+    let mut line = pw.into_bytes();
+    line.push(b'\n');
+    sess.write(&line).await.map_err(err)?;
+    tracing::info!(session = %session, "sudo: password sent to prompt");
+    Ok(true)
+}
+
 #[tauri::command]
 pub async fn sftp_home(state: State<'_, AppState>, session: Option<String>, via: Option<String>) -> CmdResult<String> {
     fs_for(&state, session.as_deref(), via.as_deref()).await?.home().await.map_err(err)
@@ -674,6 +691,85 @@ pub async fn sftp_put(state: State<'_, AppState>, session: Option<String>, via: 
 #[tauri::command]
 pub fn sftp_cancel(state: State<'_, AppState>, transfer: String) -> bool {
     state.transfers.cancel(&transfer)
+}
+
+/// Options for a recursive/multi-item transfer, minus `parallel` which comes from
+/// the profile (`files.parallel_transfers`).
+#[derive(serde::Deserialize)]
+pub struct TreeArgs {
+    pub follow_symlinks: bool,
+    pub preserve_mode: bool,
+    pub preserve_mtime: bool,
+    pub conflict: crate::transfer::Conflict,
+}
+
+/// A tree-transfer progress event tagged with its transfer id, emitted as `sftp:tree`.
+#[derive(Clone, serde::Serialize)]
+struct TreeMsg {
+    transfer: String,
+    #[serde(flatten)]
+    event: crate::transfer::TreeEvent,
+}
+
+/// Build the shared bits for a tree transfer: the cancel flag, resolved options,
+/// and a reporter that emits `sftp:tree` events.
+fn tree_setup(state: &AppState, transfer: &str, args: TreeArgs) -> (std::sync::Arc<std::sync::atomic::AtomicBool>, crate::transfer::TreeOpts, crate::transfer::Reporter) {
+    let flag = state.transfers.start(transfer);
+    let parallel = state.profile.read().unwrap().files.parallel_transfers.max(1) as usize;
+    let opts = crate::transfer::TreeOpts {
+        parallel,
+        follow_symlinks: args.follow_symlinks,
+        preserve_mode: args.preserve_mode,
+        preserve_mtime: args.preserve_mtime,
+        conflict: args.conflict,
+    };
+    let app = state.sessions.app().clone();
+    let tid = transfer.to_string();
+    let report: crate::transfer::Reporter = std::sync::Arc::new(move |event| {
+        let _ = tauri::Emitter::emit(&app, "sftp:tree", TreeMsg { transfer: tid.clone(), event });
+    });
+    (flag, opts, report)
+}
+
+/// Recursively download `remote` (file or directory) into local `dest_dir`.
+/// `only` (retry) restricts to those `rel` paths.
+#[tauri::command]
+pub async fn sftp_get_tree(
+    state: State<'_, AppState>,
+    session: Option<String>,
+    via: Option<String>,
+    transfer: String,
+    remote: String,
+    dest_dir: String,
+    opts: TreeArgs,
+    only: Option<Vec<String>>,
+) -> CmdResult<()> {
+    let fs = fs_for(&state, session.as_deref(), via.as_deref()).await?;
+    let (flag, topts, report) = tree_setup(&state, &transfer, opts);
+    let only = only.map(|v| v.into_iter().collect::<std::collections::HashSet<_>>());
+    let r = crate::transfer::download_tree(fs, &remote, std::path::Path::new(&dest_dir), &topts, flag, report, only.as_ref()).await;
+    state.transfers.finish(&transfer);
+    r.map_err(err)
+}
+
+/// Recursively upload local `local` (file or directory) into remote `dest_dir`.
+#[tauri::command]
+pub async fn sftp_put_tree(
+    state: State<'_, AppState>,
+    session: Option<String>,
+    via: Option<String>,
+    transfer: String,
+    local: String,
+    dest_dir: String,
+    opts: TreeArgs,
+    only: Option<Vec<String>>,
+) -> CmdResult<()> {
+    let fs = fs_for(&state, session.as_deref(), via.as_deref()).await?;
+    let (flag, topts, report) = tree_setup(&state, &transfer, opts);
+    let only = only.map(|v| v.into_iter().collect::<std::collections::HashSet<_>>());
+    let r = crate::transfer::upload_tree(fs, std::path::Path::new(&local), &dest_dir, &topts, flag, report, only.as_ref()).await;
+    state.transfers.finish(&transfer);
+    r.map_err(err)
 }
 
 // ---------------------------------------------------------------- editor

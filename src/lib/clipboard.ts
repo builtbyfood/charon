@@ -17,11 +17,14 @@ export function cleanForCopy(text: string, o: CleanOptions = {}): string {
 }
 
 /** What the paste guard warns about before sending to the shell. */
-export function pasteWarnings(text: string): string[] {
+export function pasteWarnings(text: string, minLines = 2): string[] {
   const w: string[] = [];
-  if (text.includes("\n")) w.push(`${text.split("\n").length} lines`);
+  // Count content lines, ignoring a single trailing newline (that just means
+  // "run it"): a one-liner copied with a trailing \n is still one line, not two.
+  const lines = text.replace(/\r\n/g, "\n").replace(/\n$/, "").split("\n").length;
+  if (lines >= minLines) w.push(`${lines} lines`);
   if (ZERO_WIDTH.test(text)) w.push("hidden zero-width characters (will be removed)");
-  if (/^\s*\$ /m.test(text)) w.push("lines start with '$ ' (doc snippet?)");
   ZERO_WIDTH.lastIndex = 0;
+  if (/^\s*\$ /m.test(text)) w.push("lines start with '$ ' (doc snippet?)");
   return w;
 }

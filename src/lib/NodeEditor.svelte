@@ -178,6 +178,11 @@
           <option value="trusted">trusted</option>
         </select>
       </label>
+      {#if (f.mcp || inherited.mcp_tier) === "trusted"}
+        <label class="check" title="Let a trusted MCP run_command auto-answer this host's '[sudo] password for <login user>:' prompt with the saved password. Never a bare 'Password:'. The password is never shown or logged.">
+          <input type="checkbox" bind:checked={f.mcpSudo} /> allow MCP sudo password
+        </label>
+      {/if}
     </div>
 
     {#if error}<p class="err">{error}</p>{/if}
@@ -194,6 +199,8 @@
   h2 { margin: 0 0 4px; font-size: 15px; font-weight: 600; }
   label, .field { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--fg-dim); }
   label input, label select, label textarea { color: var(--fg); }
+  label.check { flex-direction: row; align-items: center; gap: 6px; color: #ffb454; }
+  label.check input { width: auto; }
   textarea { font: inherit; background: var(--bg-sunken); border: 1px solid var(--line); border-radius: 3px; padding: 4px 8px; resize: vertical; }
   .mono { font-family: var(--font-mono); }
   .two { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }

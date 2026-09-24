@@ -1,6 +1,6 @@
 [package]
 name = "charon"
-version = "0.1.0"
+version = "0.2.0"
 description = "Connection manager, terminal, editor and MCP bridge for engineers"
 authors = ["Travis DeLuca"]
 license = "Apache-2.0"
@@ -57,6 +57,11 @@ data-encoding = "2"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "http2"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 flate2 = "1"
+
+# recursive transfers
+filetime = "0.2"     # preserve mtime on downloaded files
+tar = "0.4"          # ShellFs whole-tree download (tar -cf - | base64)
+futures = "0.3"      # bounded-concurrency transfer pool
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"

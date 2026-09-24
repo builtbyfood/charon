@@ -74,10 +74,12 @@ async fn ask_frontend(state: &AppState, mcp: &McpShared, event: &str, mut payloa
     }
 }
 
-/// Pop an approval dialog for an exec tool; true = allowed.
-async fn approved(state: &AppState, mcp: &McpShared, tool: &str, session: &str, command: &str) -> bool {
+/// Pop an approval dialog for an exec tool. Returns `(allowed, allow_sudo)` where
+/// `allow_sudo` is the dialog's separate "allow sudo password" opt-in (exec-approve
+/// only; a remembered "always" never carries sudo).
+async fn approved(state: &AppState, mcp: &McpShared, tool: &str, session: &str, command: &str) -> (bool, bool) {
     if mcp.always_allows(session).await {
-        return true;
+        return (true, false);
     }
     let id = uuid::Uuid::new_v4().to_string();
     let rx = mcp.expect(&id).await;
@@ -85,17 +87,39 @@ async fn approved(state: &AppState, mcp: &McpShared, tool: &str, session: &str, 
         "mcp:approve",
         json!({ "req_id": id, "tool": tool, "session": session, "command": command }),
     );
-    let decision = match tokio::time::timeout(APPROVAL_TIMEOUT, rx).await {
-        Ok(Ok(v)) => v.get("decision").and_then(|d| d.as_str()).unwrap_or("deny").to_string(),
+    let reply = match tokio::time::timeout(APPROVAL_TIMEOUT, rx).await {
+        Ok(Ok(v)) => v,
         _ => {
             mcp.cancel(&id).await;
-            "deny".to_string()
+            json!({ "decision": "deny" })
         }
     };
+    let decision = reply.get("decision").and_then(|d| d.as_str()).unwrap_or("deny");
+    let allow_sudo = reply.get("allow_sudo").and_then(|b| b.as_bool()).unwrap_or(false);
     if decision == "always" {
         mcp.remember_always(session).await;
     }
-    decision == "approve" || decision == "always"
+    let ok = decision == "approve" || decision == "always";
+    (ok, ok && allow_sudo)
+}
+
+/// Whether MCP run_command may auto-answer the login user's sudo prompt:
+/// never at read, the dialog's opt-in at exec-approve, and the node's
+/// `Settings.mcp_sudo` at trusted.
+pub fn sudo_allowed(tier: Tier, approval_sudo: bool, node_mcp_sudo: bool) -> bool {
+    match tier {
+        Tier::Read => false,
+        Tier::ExecApprove => approval_sudo,
+        Tier::Trusted => node_mcp_sudo,
+    }
+}
+
+/// The session node's effective `mcp_sudo` opt-in (trusted tier), else false.
+async fn node_mcp_sudo(state: &AppState, session: Option<&str>) -> bool {
+    let Some(id) = session else { return false };
+    let Some(info) = state.sessions.info(id).await else { return false };
+    let Some(node) = info.node_id else { return false };
+    state.store.lock().await.effective(&node).ok().and_then(|s| s.mcp_sudo).unwrap_or(false)
 }
 
 /// Run one tool call. Returns the MCP tool result value (never a transport error;
@@ -108,6 +132,8 @@ pub async fn call(state: &AppState, mcp: &McpShared, name: &str, args: Value) ->
     let started = std::time::Instant::now();
     // Gate. Approval (if any) happens BEFORE run(), so a denied/timed-out command
     // is never sent to the shell.
+    let mut approval_sudo = false;
+    let mut node_sudo = false;
     match gate(kind, tier) {
         Decision::Deny => {
             log_call(state, name, session.as_deref(), tier, "deny", false, None, started.elapsed().as_millis()).await;
@@ -117,16 +143,23 @@ pub async fn call(state: &AppState, mcp: &McpShared, name: &str, args: Value) ->
             // The command text is shown in the approval dialog but never logged.
             let cmd = args.get("command").or_else(|| args.get("local")).and_then(|v| v.as_str()).unwrap_or(name);
             let sess = session.clone().unwrap_or_default();
-            if !approved(state, mcp, name, &sess, cmd).await {
+            let (ok, sudo) = approved(state, mcp, name, &sess, cmd).await;
+            if !ok {
                 log_call(state, name, session.as_deref(), tier, "denied", false, None, started.elapsed().as_millis()).await;
                 return tool_error("denied by the user (or approval timed out — the command was not run)");
             }
+            approval_sudo = sudo;
         }
-        Decision::Allow => {}
+        Decision::Allow => {
+            if tier == Tier::Trusted {
+                node_sudo = node_mcp_sudo(state, session.as_deref()).await;
+            }
+        }
     }
+    let allow_sudo = sudo_allowed(tier, approval_sudo, node_sudo);
 
     let decision = if gate(kind, tier) == Decision::NeedApproval { "approved" } else { "allow" };
-    let result = run(state, mcp, name, &args, session.as_deref()).await;
+    let result = run(state, mcp, name, &args, session.as_deref(), allow_sudo).await;
     let (ok, exit) = match &result {
         Ok(v) => (true, v.get("exit_code").and_then(|c| c.as_i64()).map(|c| c as i32)),
         Err(_) => (false, None),
@@ -138,7 +171,7 @@ pub async fn call(state: &AppState, mcp: &McpShared, name: &str, args: Value) ->
     }
 }
 
-async fn run(state: &AppState, mcp: &McpShared, name: &str, args: &Value, session: Option<&str>) -> Result<Value, String> {
+async fn run(state: &AppState, mcp: &McpShared, name: &str, args: &Value, session: Option<&str>, allow_sudo: bool) -> Result<Value, String> {
     match name {
         "list_sessions" => {
             let mut out = Vec::new();
@@ -189,7 +222,9 @@ async fn run(state: &AppState, mcp: &McpShared, name: &str, args: &Value, sessio
             }
             let sess = state.sessions.get(session).await.map_err(|e| e.to_string())?;
             let timeout = args.get("timeout_s").and_then(|v| v.as_u64()).unwrap_or(30).clamp(1, 600);
-            let fut = sess.exec_hidden(command);
+            // Tier-gated (see sudo_allowed): only then may the capture auto-answer
+            // the login user's `[sudo] password for <user>:` prompt.
+            let fut = sess.exec_hidden_sudo(command, allow_sudo);
             match tokio::time::timeout(std::time::Duration::from_secs(timeout), fut).await {
                 Ok(Ok((out, code))) => Ok(json!({
                     "output": crate::hidden::strip_escapes(&String::from_utf8_lossy(&out)),
@@ -226,5 +261,22 @@ async fn run(state: &AppState, mcp: &McpShared, name: &str, args: &Value, sessio
             ask_frontend(state, mcp, "mcp:open_editor", payload).await
         }
         other => Err(format!("unknown tool {other:?}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sudo_is_tier_gated() {
+        // read: never, whatever the inputs.
+        assert!(!sudo_allowed(Tier::Read, true, true));
+        // exec-approve: only the approval dialog's opt-in decides.
+        assert!(sudo_allowed(Tier::ExecApprove, true, false));
+        assert!(!sudo_allowed(Tier::ExecApprove, false, true));
+        // trusted: only the node's Settings.mcp_sudo decides.
+        assert!(sudo_allowed(Tier::Trusted, false, true));
+        assert!(!sudo_allowed(Tier::Trusted, true, false));
     }
 }

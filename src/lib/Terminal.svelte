@@ -9,7 +9,7 @@
 </script>
 
 <script lang="ts">
-  import { onMount, onDestroy } from "svelte";
+  import { onMount, onDestroy, untrack } from "svelte";
   import { Terminal } from "@xterm/xterm";
   import { FitAddon } from "@xterm/addon-fit";
   import { WebglAddon } from "@xterm/addon-webgl";
@@ -30,13 +30,17 @@
   import { helpFetch, onMcpScrollback, mcpAnswer } from "./api";
   import { cmdContext, currentCommand } from "./cmdline";
   import { tldrPage, preloadTldr } from "./tldr";
-  import { flagsFromHelp, flagsFromTldr, mergeFlags, matchFlags, type Flag } from "./flags";
-  import { CommandTracker, InjectionSwallower, detectShell, injectionFor, hookTextFor, looksLikeShellPrompt, parseOsc7, promptUserOf, type Shell } from "./osc133";
+  import { flagsFromHelp, flagsFromTldr, mergeFlags, matchFlags, runFlagAccept, type Flag } from "./flags";
+  import { CommandTracker, InjectionSwallower, detectShell, injectionFor, hookTextFor, looksLikeShellPrompt, looksLikeSudoPrompt, sudoUserOf, sudoAutoEligible, parseOsc7, promptUserOf, type Shell } from "./osc133";
+  import { sudoHasPassword, sudoSendPassword } from "./api";
 
-  let { open, color, prefs, onfontsize, onclosed, onabort, oncwd, onopenfile, onfiles, oncommand }: {
+  let { open, color, prefs, active = true, onfontsize, onclosed, onabort, oncwd, onopenfile, onfiles, oncommand }: {
     open: OpenTarget;
     color?: string;
     prefs: Prefs;
+    /** This tab is the visible one. Inactive tabs buffer output and drop their
+     *  WebGL context (browsers lose contexts past ~16 live), flushing on show. */
+    active?: boolean;
     /** Ctrl+= / Ctrl+- changed the size; the owner persists it to the profile. */
     onfontsize: (size: number) => void;
     onclosed: (reason: string) => void;
@@ -58,6 +62,16 @@
   let search: SearchAddon;
   let webgl: WebglAddon | null = null;
   let tracker: CommandTracker;
+  // Hidden-tab buffering: while inactive we don't touch xterm's parser/renderer;
+  // incoming bytes queue here and flush on activation. Capped so a runaway hidden
+  // tab (`yes`) can't grow without bound — on overflow we reset + write the tail.
+  let pendingWrites: Uint8Array[] = [];
+  let pendingBytes = 0;
+  let pendingOverflow = false;
+  const HIDDEN_BUF_CAP = 8 * 1024 * 1024;
+  // Perf counters (T2): events/bytes since the last 5 s sample.
+  let evCount = 0, byteCount = 0;
+  let perfTimer: ReturnType<typeof setInterval> | undefined;
   // Shell-integration injection: after each quiet moment following connect, read
   // the last line; once it looks like a prompt, type the hook in. Gives up at the
   // deadline. Skipped if the remote already speaks OSC 133.
@@ -121,6 +135,17 @@
   // Right-click menu.
   let menu = $state<{ x: number; y: number; items: MenuItem[] } | null>(null);
 
+  // Paste guard: an inline, non-modal bar (Enter/Esc or buttons) shown when a paste
+  // trips a warning, so xterm never loses focus to a confirm() dialog.
+  let pasteGuard = $state<{ cleaned: string; warns: string[]; route: string } | null>(null);
+  // Pastes deferred while a hidden/injected command is in flight; flushed after.
+  let pendingPaste: { cleaned: string; route: string }[] = [];
+
+  // Sudo/su password prompt: detected on the live line while a command is open.
+  let sudoPrompt = $state<{ user: string | null } | null>(null);
+  let sudoHasPw = $state<boolean | null>(null);   // cached: does the session have a stored password?
+  let sudoAutoTimer: ReturnType<typeof setTimeout> | undefined;
+
   // Flag picker (P5): a popup of a command's options as the user types `<cmd> -…`.
   let flagPopup = $state<{ x: number; y: number; command: string; token: string } | null>(null);
   let flagList = $state<Flag[]>([]);
@@ -164,15 +189,7 @@
     search = new SearchAddon();
     term.loadAddon(search);
     term.open(el);
-    if (prefs.renderer === "webgl" && webglUsable()) {
-      try {
-        webgl = new WebglAddon();
-        // A lost GL context (driver reset, sleep/wake, or a flaky WebKitGTK GL stack)
-        // would leave a blank terminal; drop back to the DOM renderer instead.
-        webgl.onContextLoss(() => { webgl?.dispose(); webgl = null; });
-        term.loadAddon(webgl);
-      } catch { webgl?.dispose(); webgl = null; } // no GL here → DOM renderer
-    }
+    if (active) enableWebgl(); // inactive tabs render on demand once shown
     fit.fit();
     preloadTldr();
     term.onCursorMove(() => { clearTimeout(flagEvalTimer); flagEvalTimer = setTimeout(() => { evalFlagPicker(); reportCommand(); }, 60); });
@@ -201,17 +218,29 @@
     term.attachCustomKeyEventHandler((e) => {
       if (e.type !== "keydown") return true;
       const handled = (): false => { e.preventDefault(); return false; };
-      // Flag picker: steer the popup, but never touch Tab (remote completion must work).
+      // Paste guard is up: Enter confirms, Esc cancels; xterm keeps focus meanwhile.
+      if (pasteGuard) {
+        if (e.code === "Enter" || e.code === "NumpadEnter") { confirmPaste(); return handled(); }
+        if (e.code === "Escape") { cancelPaste(); return handled(); }
+      }
+      // Flag picker: steer the popup. Space/Tab/Esc (and any non-matching char)
+      // close it and pass through untouched — Tab must reach remote completion.
       if (flagPopup && !e.ctrlKey && !e.altKey) {
         if (e.code === "ArrowDown") { flagSel = Math.min(flagList.length - 1, flagSel + 1); return handled(); }
         if (e.code === "ArrowUp") { flagSel = Math.max(0, flagSel - 1); return handled(); }
-        if ((e.code === "Enter" || e.code === "NumpadEnter") && flagList.length) { acceptFlag(); return handled(); }
-        if (e.code === "Escape") { closeFlagPicker(); return handled(); }
+        if (e.code === "Enter" || e.code === "NumpadEnter") {
+          // Insert the missing suffix and swallow this Enter; or, on an exact/no
+          // match, close and let the Enter run the line. Never sends a newline here.
+          // (acceptFlagAt closes the popup and refocuses xterm.)
+          return acceptFlagAt(flagSel) ? handled() : true;
+        }
+        if (e.code === "Space" || e.code === "Tab" || e.code === "Escape") { closeFlagPicker(); return true; }
       }
       if (e.ctrlKey && e.shiftKey && e.code === "KeyC") { copySelection(); return handled(); }
-      if (e.ctrlKey && e.shiftKey && e.code === "KeyV") { pasteFromClipboard(); return handled(); }
+      if (e.ctrlKey && e.shiftKey && e.code === "KeyV") { pasteFromClipboard("ctrl-shift-v"); return handled(); }
       if (e.ctrlKey && e.shiftKey && e.code === "KeyF") { openSearch(); return handled(); }
       if (e.ctrlKey && e.shiftKey && e.code === "KeyE") { toggleFiles(); return handled(); }
+      if (e.ctrlKey && e.shiftKey && e.code === "KeyP" && sudoPrompt) { sendSudo(); return handled(); }
       if (e.ctrlKey && !e.shiftKey && e.code === "KeyC" && prefs.ctrlCCopiesWhenSelected && term.hasSelection()) { copySelection(); return handled(); }
       if (e.ctrlKey && (e.code === "Equal" || e.code === "NumpadAdd")) { zoom(1); return handled(); }
       if (e.ctrlKey && (e.code === "Minus" || e.code === "NumpadSubtract")) { zoom(-1); return handled(); }
@@ -226,14 +255,15 @@
     // own handler and bypass the sanitiser; capture them first and route them the same way.
     term.element!.addEventListener("paste", (e) => {
       e.preventDefault(); e.stopImmediatePropagation();
-      pasteToSession(e.clipboardData?.getData("text/plain") ?? "");
+      pasteToSession(e.clipboardData?.getData("text/plain") ?? "", "native");
     }, { capture: true });
     // Middle-click paste (X11 habit; on by default only on Linux).
-    el.addEventListener("auxclick", (e) => { if (e.button === 1 && prefs.middleClickPaste) { e.preventDefault(); pasteFromClipboard(); } });
+    el.addEventListener("auxclick", (e) => { if (e.button === 1 && prefs.middleClickPaste) { e.preventDefault(); pasteFromClipboard("middle-click"); } });
     el.addEventListener("mousedown", (e) => { if (e.button === 1 && prefs.middleClickPaste) e.preventDefault(); });
 
     term.onData((d) => { if (sessionId) sessionWrite(sessionId, d); });
     term.onResize(({ cols, rows }) => { if (sessionId) sessionResize(sessionId, cols, rows); });
+    perfTimer = setInterval(logPerf, 5000);
 
     await connect();
   });
@@ -246,6 +276,7 @@
     error = ""; reason = ""; cwd = undefined;
     osc133 = false; markCount = 0; shell = undefined;
     injectDone = false; injectDeadline = 0; reinjects = 0; lastReported = null;
+    sudoPrompt = null; sudoHasPw = null; clearTimeout(sudoAutoTimer);
     term.write("\r\n\x1b[2m[reconnecting…]\x1b[0m\r\n" + HIDE_CURSOR);
     await connect(lastPw);
   }
@@ -281,19 +312,31 @@
       if (info.shell_integration) injectDeadline = Date.now() + 8000;
       else { reason = "off in settings"; console.info("[charon] 133: detected=none injected=false reason=disabled by node/folder setting"); }
       unlisteners.push(await onSessionData(info.id, (raw) => {
+        evCount++; byteCount += raw.length;
         // While the injected hook is being echoed back, show nothing until its end sentinel.
         const b = swallower.filter(raw);
         if (!b.length) return;
+        // Hidden tab: don't run the parser/renderer; buffer and flush on activation.
+        if (!active) { bufferHidden(b); return; }
         // Leaving the alternate screen (vim, htop) can leave a stale cursor cell in
         // the WebGL atlas; redraw everything once the bytes are processed.
         const leftAlt = webgl && exitsAltScreen(b);
-        term.write(b, leftAlt ? () => { webgl?.clearTextureAtlas(); term.refresh(0, term.rows - 1); } : undefined);
+        // Run post-parse work in the write callback: term.write is async, so the
+        // buffer (and thus lastLine()) only reflects `b` once this fires. Reading
+        // it synchronously here would see the previous prompt, not a sudo one.
+        term.write(b, () => {
+          if (leftAlt) { webgl?.clearTextureAtlas(); term.refresh(0, term.rows - 1); }
+          maybeSudoPrompt(b);
+        });
+        // An injected/hidden command just stopped being swallowed: release queued pastes.
+        if (pendingPaste.length && !swallower.swallowing) flushPendingPaste();
         if (integrationEnabled) scheduleQuietCheck(info.id);
       }));
-      unlisteners.push(await onSessionClosed(info.id, (r) => { status = "closed"; term.write(`\r\n\x1b[2m[${r}]\x1b[0m\r\n${HIDE_CURSOR}`); onclosed(r); }));
+      unlisteners.push(await onSessionClosed(info.id, (r) => { status = "closed"; sudoPrompt = null; clearTimeout(sudoAutoTimer); term.write(`\r\n\x1b[2m[${r}]\x1b[0m\r\n${HIDE_CURSOR}`); onclosed(r); }));
       // MCP read_scrollback: only the Terminal that owns this session answers.
       unlisteners.push(await onMcpScrollback((p) => {
         if (p.session !== sessionId) return;
+        flushHidden(); // materialise any output buffered while this tab was hidden
         if (p.last_n_lines) {
           const b = term.buffer.active;
           const lines: string[] = [];
@@ -375,6 +418,7 @@
   onDestroy(() => {
     clearTimeout(injectTimer);
     clearTimeout(flagEvalTimer);
+    clearInterval(perfTimer);
     unlisteners.forEach((u) => u());
     if (sessionId) sessionClose(sessionId);
     tracker?.destroy();
@@ -384,7 +428,7 @@
   // ---- docs: report the command being typed
   let lastReported: string | null = null;
   function reportCommand() {
-    if (!oncommand) return;
+    if (!oncommand || !active) return;
     const input = osc133 && sessionId ? tracker.inputToCursor() : null;
     const cmd = input !== null ? currentCommand(input) : null;
     if (cmd !== lastReported) { lastReported = cmd; oncommand(cmd, sessionId); }
@@ -393,7 +437,9 @@
   // ---- flag picker (P5)
   function closeFlagPicker() { flagPopup = null; flagList = []; flagSel = 0; }
   function evalFlagPicker() {
-    if (!osc133 || !sessionId) { closeFlagPicker(); return; }
+    if (!osc133 || !sessionId || !active) { closeFlagPicker(); return; }
+    // Never complete a token mid-line: the picker can't see what's to the right.
+    if (!cursorAtLineEnd()) { closeFlagPicker(); return; }
     const input = tracker.inputToCursor();
     const ctx = input !== null ? cmdContext(input) : null;
     if (!ctx) { closeFlagPicker(); return; }
@@ -431,13 +477,41 @@
     } catch { /* no --help (or local session): tldr flags only */ }
     finally { flagLoading = false; }
   }
-  function acceptFlag() {
-    const f = flagList[flagSel];
-    if (!f || !sessionId || !flagPopup) { closeFlagPicker(); return; }
-    const name = f.names.find((n) => n.startsWith(flagPopup!.token)) ?? f.names[0];
-    const suffix = name.slice(flagPopup.token.length);
-    if (suffix) sessionWrite(sessionId, suffix);
-    closeFlagPicker();
+  /** Enter on the highlighted flag. Returns true if it inserted (swallow Enter),
+   *  false to let the Enter run the line. Only ever appends the missing suffix. */
+  /** Accept the flag at `index` (Enter uses flagSel; a click uses the clicked row).
+   *  Both paths go through runFlagAccept, so the sent suffix is identical and xterm
+   *  is refocused. Returns true if it inserted (swallow the Enter). */
+  function acceptFlagAt(index: number): boolean {
+    if (!sessionId) return false;
+    // Recompute the prefix from the live line so a stale popup token can't misfire.
+    const input = tracker.inputToCursor();
+    const ctx = input !== null ? cmdContext(input) : null;
+    const prefix = ctx?.token ?? flagPopup?.token ?? "";
+    const r = runFlagAccept(prefix, flagList, index, {
+      send: (s) => { if (sessionId) sessionWrite(sessionId, s); },
+      focus: () => term.focus(),
+      close: closeFlagPicker,
+    });
+    console.info(`[charon] flags: prefix=${JSON.stringify(prefix)} selected=${JSON.stringify(r.selected)} sent=${JSON.stringify(r.insert)}`);
+    return r.consumed;
+  }
+  /** True when the cursor is at the end of the typed line (nothing to its right).
+   *  The picker can't complete a middle token: it can't see what follows. */
+  function cursorAtLineEnd(): boolean {
+    const b = term.buffer.active;
+    const cur = b.getLine(b.baseY + b.cursorY);
+    if (!cur) return true;
+    if (cur.translateToString(true, b.cursorX) !== "") return false;
+    // Wrapped continuation rows are also "to the right".
+    let y = b.baseY + b.cursorY + 1;
+    for (let guard = 0; guard < 256; guard++) {
+      const nxt = b.getLine(y);
+      if (!nxt || !nxt.isWrapped) break;
+      if (nxt.translateToString(true) !== "") return false;
+      y++;
+    }
+    return true;
   }
   /** Pixel position of the terminal cursor, for anchoring the popup. */
   function cursorXY(): { x: number; y: number } {
@@ -583,7 +657,7 @@
   function onContextMenu(e: MouseEvent) {
     e.preventDefault();
     if (prefs.rightClick === "moba" && !e.shiftKey) {
-      if (term.hasSelection()) { copySelection(); term.clearSelection(); } else pasteFromClipboard();
+      if (term.hasSelection()) { copySelection(); term.clearSelection(); } else pasteFromClipboard("right-click");
       return;
     }
     menu = { x: e.clientX, y: e.clientY, items: menuItems() };
@@ -591,7 +665,7 @@
   function menuItems(): MenuItem[] {
     return [
       { label: "Copy", action: copySelection, disabled: !term.hasSelection() },
-      { label: "Paste", action: pasteFromClipboard, disabled: !sessionId },
+      { label: "Paste", action: () => pasteFromClipboard("menu"), disabled: !sessionId },
       { separator: true, label: "" },
       { label: "Select all", action: () => term.selectAll() },
       { label: "Clear scrollback", action: () => term.clear() },
@@ -609,17 +683,149 @@
     if (sel) await writeText(cleanForCopy(sel, { smartQuotes: prefs.smartQuotesToAscii, trimTrailing: prefs.trimTrailingWhitespace }));
   }
   /** Every paste route (Ctrl+Shift+V, menu, middle click, native paste event) ends here. */
-  function pasteToSession(text: string) {
+  function pasteToSession(text: string, route: string) {
     if (!text || !sessionId) return;
     const cleaned = cleanForCopy(text, { trimTrailing: false, smartQuotes: prefs.smartQuotesToAscii });
-    const lines = text.split("\n").length;
-    const warn = pasteWarnings(text).filter((w) => !w.endsWith(" lines") || lines >= prefs.pasteGuardLines);
-    if (warn.length && !confirm(`Paste ${warn.join(", ")}?`)) return;
-    term.paste(cleaned); // xterm handles bracketed paste mode if the app enabled it
+    // Guard only on a real warning: ≥ paste_guard_lines content lines, hidden
+    // characters, or `$ `-prefixed doc lines. An ordinary one-line paste goes
+    // straight through. Inline, non-modal bar (xterm keeps focus; Enter/Esc resolve).
+    const warns = pasteWarnings(text, prefs.pasteGuardLines);
+    if (warns.length) { pasteGuard = { cleaned, warns, route }; return; }
+    sendPaste(cleaned, route);
+  }
+  /** Send a (sanitised) paste, or queue it behind an in-flight hidden/injected command. */
+  function sendPaste(cleaned: string, route: string) {
+    if (!sessionId) return;
+    const bracketed = !!term.modes.bracketedPasteMode;
+    // A hidden command's echo is being swallowed → don't interleave; queue and flush
+    // when it ends (the backend also queues writes during its Capture window).
+    const queued = swallower.swallowing;
+    console.info(`[charon] paste: route=${route} bytes=${cleaned.length} bracketed=${bracketed} queued=${queued}`);
+    if (queued) { pendingPaste.push({ cleaned, route }); return; }
+    writePaste(cleaned, bracketed);
     term.focus();
   }
-  async function pasteFromClipboard() {
-    pasteToSession(await readText());
+  function writePaste(cleaned: string, bracketed: boolean) {
+    // Bracketed + "auto" + trailing newline: paste the body inside the 200~/201~
+    // markers, then send the newline *after* 201~ so the shell executes it instead
+    // of leaving it highlighted. Otherwise xterm's paste keeps the newline inside.
+    if (bracketed && prefs.pasteRun === "auto" && /\n$/.test(cleaned)) {
+      term.paste(cleaned.replace(/\r?\n$/, ""));
+      if (sessionId) sessionWrite(sessionId, "\r");
+    } else {
+      term.paste(cleaned);
+    }
+  }
+  function flushPendingPaste() {
+    if (!pendingPaste.length) return;
+    const items = pendingPaste; pendingPaste = [];
+    for (const it of items) {
+      const bracketed = !!term.modes.bracketedPasteMode;
+      console.info(`[charon] paste: route=${it.route} bytes=${it.cleaned.length} bracketed=${bracketed} queued=false (flushed)`);
+      writePaste(it.cleaned, bracketed);
+    }
+    term.focus();
+  }
+  function confirmPaste() {
+    if (!pasteGuard) return;
+    const g = pasteGuard; pasteGuard = null;
+    sendPaste(g.cleaned, g.route);
+  }
+  function cancelPaste() {
+    if (!pasteGuard) return;
+    console.info(`[charon] paste: route=${pasteGuard.route} bytes=${pasteGuard.cleaned.length} bracketed=${!!term.modes.bracketedPasteMode} queued=false (cancelled)`);
+    pasteGuard = null; term.focus();
+  }
+  async function pasteFromClipboard(route: string) {
+    pasteToSession(await readText(), route);
+  }
+
+  // ---- sudo password prompt (T3)
+  /** Detect a sudo/su password prompt on the live line; colon-gated so a flood is cheap. */
+  function maybeSudoPrompt(b: Uint8Array) {
+    if (!sessionId) return;
+    if (sudoPrompt) {
+      // Clear once the sudo line is gone from screen (answered, scrolled, new prompt).
+      // Not gated on OSC 133: a session without shell integration must still work.
+      if (!looksLikeSudoPrompt(lastLine())) { sudoPrompt = null; clearTimeout(sudoAutoTimer); }
+      return;
+    }
+    if (!b.includes(0x3a)) return;   // cheap gate: sudo/su prompts contain ':'
+    const line = lastLine();
+    if (looksLikeSudoPrompt(line)) onSudoPrompt(line);
+  }
+  async function onSudoPrompt(line: string) {
+    const user = sudoUserOf(line);
+    sudoPrompt = { user };
+    if (sudoHasPw === null && sessionId) sudoHasPw = await sudoHasPassword(sessionId).catch(() => false);
+    // Auto-send only for the login user's own sudo prompt; a bare `Password:` (su)
+    // or another user's prompt shows the button but never auto-sends.
+    const eligible = sudoAutoEligible(line, sshUser);
+    const auto = !!sudoHasPw && prefs.sudoAutoSend && eligible;
+    // One diagnostic line (no secret): hasPassword drives the button; eligible +
+    // autoSend drive auto-send; sshUser is the credential owner we'd send.
+    console.info(`[charon] sudo: prompt detected user=${user ?? "?"} sshUser=${sshUser ?? "?"} hasPassword=${sudoHasPw} autoSend=${prefs.sudoAutoSend} eligible=${eligible} button=${!!sudoHasPw} sent=${auto}`);
+    if (auto) sudoAutoTimer = setTimeout(() => sendSudo(), 300);
+  }
+  async function sendSudo() {
+    clearTimeout(sudoAutoTimer);
+    if (!sessionId || !sudoPrompt) return;
+    let ok = false;
+    try { ok = await sudoSendPassword(sessionId); } catch { ok = false; }
+    console.info(`[charon] sudo: password send requested sent=${ok}`);
+    sudoPrompt = null;
+  }
+
+  function enableWebgl() {
+    if (webgl || prefs.renderer !== "webgl" || !webglUsable()) return;
+    try {
+      webgl = new WebglAddon();
+      // A lost GL context (driver reset, sleep/wake, or a flaky WebKitGTK GL stack)
+      // would leave a blank terminal; drop back to the DOM renderer instead.
+      webgl.onContextLoss(() => { webgl?.dispose(); webgl = null; });
+      term.loadAddon(webgl);
+    } catch { webgl?.dispose(); webgl = null; } // no GL here → DOM renderer
+  }
+  function disableWebgl() { if (webgl) { webgl.dispose(); webgl = null; } }
+
+  /** Buffer output for a hidden tab; drop oldest whole chunks past the cap. */
+  function bufferHidden(b: Uint8Array) {
+    pendingWrites.push(b); pendingBytes += b.length;
+    while (pendingBytes > HIDDEN_BUF_CAP && pendingWrites.length > 1) {
+      pendingBytes -= pendingWrites.shift()!.length; pendingOverflow = true;
+    }
+  }
+  /** Write everything buffered while hidden; reset first if we had to drop bytes. */
+  function flushHidden() {
+    if (!pendingWrites.length && !pendingOverflow) return;
+    if (pendingOverflow) { term.reset(); pendingOverflow = false; }
+    const items = pendingWrites; pendingWrites = []; pendingBytes = 0;
+    for (const b of items) term.write(b);
+  }
+  // Show/hide: (re)create or drop the GL context and flush any buffered output.
+  $effect(() => {
+    const a = active;
+    if (!term) return;
+    untrack(() => {
+      if (a) { enableWebgl(); flushHidden(); fit?.fit(); if (integrationEnabled && sessionId) scheduleQuietCheck(sessionId); }
+      else { disableWebgl(); }
+    });
+  });
+
+  function writeQueueDepth(): number {
+    try {
+      const wb = (term as unknown as { _core: { _writeBuffer: { _writeBuffer: unknown[]; _bufferOffset: number } } })._core._writeBuffer;
+      if (wb?._writeBuffer) return wb._writeBuffer.length - (wb._bufferOffset ?? 0);
+    } catch { /* internals moved */ }
+    return pendingWrites.length;
+  }
+  function logPerf() {
+    const evs = evCount, bs = byteCount; evCount = 0; byteCount = 0;
+    // Stay quiet when the tab is idle; only interesting under load.
+    if (evs === 0 && bs === 0 && pendingBytes === 0) return;
+    const renderer = !active ? "buffered" : webgl ? "webgl" : "dom";
+    const tab = sessionId ?? open.host ?? open.kind;
+    console.info(`[charon] perf tab=${tab} events/s=${(evs / 5).toFixed(1)} bytes/s=${(bs / 5).toFixed(0)} wq=${writeQueueDepth()} pending=${pendingBytes} renderer=${renderer}`);
   }
 
   /** Probe for a usable WebGL2 context before loading the addon: WebKitGTK can
@@ -654,7 +860,7 @@
   {#if filesOpen && hasFiles && sessionId}
     <div class="vsplit" role="separator" aria-orientation="vertical" aria-label="Resize file pane" onpointerdown={startPaneDrag}></div>
     <div class="files" style:width="{filesWidth}px">
-      <SftpPane session={open.kind === "local" ? null : sessionId} {cwd} {color} {sshUser} shellUser={promptUser} isIdle={shellIdle}
+      <SftpPane session={open.kind === "local" ? null : sessionId} {cwd} {color} {sshUser} shellUser={promptUser} isIdle={shellIdle} parallel={prefs.filesParallel}
         onopen={onopenfile ? (p, via) => onopenfile?.(p, open.kind === "local" ? null : sessionId, sessionId, via) : undefined}
         onchdir={chdir} onclose={toggleFiles} />
     </div>
@@ -667,7 +873,8 @@
     <ContextMenu x={chipMenu.x} y={chipMenu.y} items={chipItems()} onclose={() => (chipMenu = null)} />
   {/if}
   {#if flagPopup}
-    <FlagPopup x={flagPopup.x} y={flagPopup.y} command={flagPopup.command} flags={flagList} selected={flagSel} loading={flagLoading} />
+    <FlagPopup x={flagPopup.x} y={flagPopup.y} command={flagPopup.command} flags={flagList} selected={flagSel} loading={flagLoading}
+      onaccept={(i) => acceptFlagAt(i)} />
   {/if}
   {#if status === "hostkey" && hostkey}
     <div class="hostkey">
@@ -701,6 +908,15 @@
       {/if}
     </div>
   {/if}
+  {#if pasteGuard}
+    <div class="pasteguard" role="alert">
+      <span class="pg-icon">⚠</span>
+      <span class="pg-msg">Paste {pasteGuard.warns.join(", ")}?</span>
+      <span class="pg-hint">Enter to paste · Esc to cancel</span>
+      <button type="button" class="primary" onclick={confirmPaste}>Paste</button>
+      <button type="button" onclick={cancelPaste}>Cancel</button>
+    </div>
+  {/if}
   {#if status === "auth"}
     <form class="auth" onsubmit={submitAuth}>
       <span class="who">{open.user ? open.user + "@" : ""}{open.host ?? "saved host"}</span>
@@ -719,6 +935,12 @@
     <span class="dot"></span>{status}{error ? ` — ${error}` : ""}
     {#if status === "closed"}
       <button type="button" class="chip reconnect" onclick={reconnect} title="Reconnect reusing this connection's host and credentials">reconnect</button>
+    {/if}
+    {#if sudoPrompt && sudoHasPw && status === "up"}
+      <button type="button" class="chip sudo" onclick={sendSudo}
+        title="Send the saved password to the {sudoPrompt.user ? `sudo prompt for ${sudoPrompt.user}` : 'password prompt'} (Ctrl+Shift+P). Not echoed.">
+        send saved password
+      </button>
     {/if}
     {#if hasFiles && status === "up"}
       <button type="button" class="chip files-btn" class:on={filesOpen} onclick={toggleFiles} title="File pane (Ctrl+Shift+E)">files</button>
@@ -744,6 +966,11 @@
   .search { position: absolute; top: 6px; right: 18px; display: flex; gap: 2px; padding: 4px; background: var(--bg-raised); border: 1px solid var(--line); border-radius: 4px; box-shadow: 0 4px 14px #0008; }
   .search input { width: 220px; font-family: var(--font-mono); }
   .search button { padding: 2px 7px; }
+  /* Prominent, obviously-modal-looking bar so a held paste can't be missed. */
+  .pasteguard { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 10px; background: #ffb45422; border-top: 2px solid #ffb454; font-size: 12px; color: var(--fg); }
+  .pasteguard .pg-icon { color: #ffb454; font-size: 14px; }
+  .pasteguard .pg-msg { font-weight: 600; }
+  .pasteguard .pg-hint { margin-right: auto; color: var(--fg-dim); }
   .auth { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 6px 8px; background: var(--bg-raised); border-top: 1px solid var(--line); }
   .auth .who { font-family: var(--font-mono); color: var(--fg-dim); }
   .auth input[type="password"] { width: 180px; font-family: var(--font-mono); }
@@ -770,6 +997,7 @@
   .cwd + .chip { margin-left: 0; }
   .chip { margin-left: auto; font: inherit; font-family: var(--font-mono); color: inherit; background: transparent; padding: 0 6px; border: 1px solid var(--line); border-radius: 8px; cursor: pointer; }
   .reconnect { margin-left: 6px; border-color: var(--accent); color: var(--fg); }
+  .sudo { margin-left: 6px; border-color: #ffb454; color: #ffb454; }
   .chip:hover { border-color: var(--fg-dim); color: var(--fg); }
   .up .dot { background: #5fd38a; } .closed .dot { background: var(--danger); }
 </style>

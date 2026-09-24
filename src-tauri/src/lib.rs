@@ -17,6 +17,7 @@ pub mod session;
 pub mod sftp;
 pub mod ssh;
 pub mod textfile;
+pub mod transfer;
 pub mod vault;
 
 use std::sync::Arc;
@@ -145,10 +146,13 @@ pub fn run() {
             commands::sftp_chmod,
             commands::sftp_get,
             commands::sftp_put,
+            commands::sftp_get_tree,
+            commands::sftp_put_tree,
             commands::sftp_cancel,
             commands::sftp_sudo_open,
             commands::sftp_sudo_has_password,
             commands::sftp_sudo_clear,
+            commands::sudo_send_password,
             commands::help_fetch,
             commands::man_fetch,
             commands::tldr_update,

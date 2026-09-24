@@ -39,6 +39,9 @@ pub struct Settings {
     pub shell_integration: Option<bool>,
     /// MCP permission tier: "read", "exec-approve", "trusted". Default "read".
     pub mcp_tier: Option<String>,
+    /// Allow MCP run_command to auto-answer this host's `[sudo] password for
+    /// <login-user>:` prompt at the "trusted" tier. Default false.
+    pub mcp_sudo: Option<bool>,
     /// Local sessions: program to run (default: platform shell) and start dir.
     pub shell: Option<String>,
     pub cwd: Option<String>,
@@ -61,6 +64,7 @@ impl Settings {
             startup: pick!(startup),
             shell_integration: pick!(shell_integration),
             mcp_tier: pick!(mcp_tier),
+            mcp_sudo: pick!(mcp_sudo),
             shell: pick!(shell),
             cwd: pick!(cwd),
             serial: pick!(serial),

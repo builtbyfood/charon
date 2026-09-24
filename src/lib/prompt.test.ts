@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { detectShell, looksLikeShellPrompt, parseOsc7 } from "./prompt.ts";
+import { detectShell, looksLikeShellPrompt, looksLikeSudoPrompt, sudoUserOf, sudoAutoEligible, parseOsc7 } from "./prompt.ts";
 
 test("detectShell recognises the four shells and nothing else", () => {
   assert.equal(detectShell("admin@super-earth:~$ "), "bash");
@@ -37,4 +37,26 @@ test("parseOsc7 strips the host and decodes percent escapes", () => {
   assert.equal(parseOsc7("file://WIN/C:/Users/travis"), "/C:/Users/travis");
   assert.equal(parseOsc7("file://h/100%"), "/100%"); // bad escape: raw
   assert.equal(parseOsc7("garbage"), undefined);
+});
+
+test("looksLikeSudoPrompt matches sudo/su prompts, not ordinary output", () => {
+  assert.equal(looksLikeSudoPrompt("[sudo] password for admin: "), true);
+  assert.equal(looksLikeSudoPrompt("[sudo] password for root:"), true);
+  assert.equal(looksLikeSudoPrompt("Password:"), true);
+  assert.equal(looksLikeSudoPrompt("Password: "), true);
+  assert.equal(looksLikeSudoPrompt("enter your password below"), false); // no trailing colon
+  assert.equal(looksLikeSudoPrompt("root@host:~# "), false);
+  assert.equal(looksLikeSudoPrompt("Note: something happened"), false);
+});
+
+test("sudoUserOf pulls the user from a sudo prompt", () => {
+  assert.equal(sudoUserOf("[sudo] password for admin: "), "admin");
+  assert.equal(sudoUserOf("Password: "), null);
+});
+
+test("sudoAutoEligible: only the login user's own sudo prompt", () => {
+  assert.equal(sudoAutoEligible("[sudo] password for admin: ", "admin"), true);
+  assert.equal(sudoAutoEligible("[sudo] password for root: ", "admin"), false); // different user
+  assert.equal(sudoAutoEligible("Password: ", "admin"), false);                 // bare su prompt
+  assert.equal(sudoAutoEligible("[sudo] password for admin: ", undefined), false); // no login user (local)
 });

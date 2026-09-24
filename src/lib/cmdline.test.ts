@@ -8,6 +8,8 @@ test("cmdContext finds the command and the option token", () => {
   assert.deepEqual(cmdContext("git log --onel"), { command: "git", token: "--onel" });
   assert.deepEqual(cmdContext("sudo systemctl --n"), { command: "systemctl", token: "--n" });
   assert.deepEqual(cmdContext("FOO=1 env BAR=2 tar -x"), { command: "tar", token: "-x" });
+  // The reported repro: sudo is skipped, the whole `--all` token is the prefix.
+  assert.deepEqual(cmdContext("sudo virsh --all"), { command: "virsh", token: "--all" });
 });
 
 test("cmdContext returns null when not on a flag", () => {

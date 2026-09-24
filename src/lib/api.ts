@@ -8,6 +8,8 @@ export interface Settings {
   host?: string; port?: number; user?: string; credential?: string;
   jump_host?: string; color?: string; tags?: string[]; startup?: string[];
   shell_integration?: boolean; mcp_tier?: "read" | "exec-approve" | "trusted";
+  /** Trusted tier: allow MCP run_command to auto-answer the login user's sudo prompt. */
+  mcp_sudo?: boolean;
   /** Local sessions only. */
   shell?: string; cwd?: string;
   /** Serial sessions only. */
@@ -38,8 +40,9 @@ export const appInfo = () => invoke<AppInfo>("app_info");
 export interface Profile {
   name: string;
   appearance: { font: string; font_size: number; theme: string; scrollback: number; renderer: "webgl" | "dom" | string; [k: string]: unknown };
-  terminal: { copy_on_select: boolean; ctrl_c_copies_when_selected: boolean; middle_click_paste: boolean; right_click?: "moba" | "menu" | string; bracketed_paste: boolean; paste_guard_lines: number; [k: string]: unknown };
-  files?: { auto_open?: boolean; [k: string]: unknown };
+  terminal: { copy_on_select: boolean; ctrl_c_copies_when_selected: boolean; middle_click_paste: boolean; right_click?: "moba" | "menu" | string; bracketed_paste: boolean; paste_guard_lines: number; paste_run?: "auto" | "wait" | string; [k: string]: unknown };
+  files?: { auto_open?: boolean; parallel_transfers?: number; [k: string]: unknown };
+  sudo?: { auto_send?: boolean; [k: string]: unknown };
   clipboard: { strip_zero_width: boolean; nbsp_to_space: boolean; smart_quotes_to_ascii: boolean; trim_trailing_whitespace: boolean; crlf_to_lf: boolean; [k: string]: unknown };
   commands: { mark_gutter: boolean; tint_failed_commands: boolean; jump_keys: string[]; [k: string]: unknown };
   ssh: { keepalive_seconds: number; [k: string]: unknown };
@@ -170,6 +173,27 @@ export function onTransferProgress(cb: (p: TransferProgress) => void): Promise<U
   return listen<TransferProgress>("sftp:progress", (e) => cb(e.payload));
 }
 
+// Recursive / multi-item transfers. What to do when the top-level item already
+// exists at the destination.
+export type Conflict = "overwrite" | "skip" | "rename";
+export interface TreeOpts { follow_symlinks: boolean; preserve_mode: boolean; preserve_mtime: boolean; conflict: Conflict }
+export interface PlanFile { rel: string; size: number }
+/** One progress event for a tree transfer, tagged with its `transfer` id (event `sftp:tree`). */
+export type TreeEvent =
+  | { transfer: string; event: "plan"; files: PlanFile[]; bytes_total: number; dest: string }
+  | { transfer: string; event: "file"; rel: string; done: number; total: number; state: "running" | "done" | "failed" | "skipped"; error: string | null }
+  | { transfer: string; event: "warn"; message: string }
+  | { transfer: string; event: "done"; files_done: number; files_total: number; bytes_done: number; bytes_total: number; failed: string[]; cancelled: boolean };
+/** Recursively download `remote` (file or dir) into local dir `destDir`. `only` retries just those rels. */
+export const sftpGetTree = (session: S, transfer: string, remote: string, destDir: string, opts: TreeOpts, via?: FsVia, only?: string[]) =>
+  invoke<void>("sftp_get_tree", { session, transfer, remote, destDir, opts, via, only });
+/** Recursively upload local file/dir `local` into remote dir `destDir`. */
+export const sftpPutTree = (session: S, transfer: string, local: string, destDir: string, opts: TreeOpts, via?: FsVia, only?: string[]) =>
+  invoke<void>("sftp_put_tree", { session, transfer, local, destDir, opts, via, only });
+export function onTreeEvent(cb: (e: TreeEvent) => void): Promise<UnlistenFn> {
+  return listen<TreeEvent>("sftp:tree", (e) => cb(e.payload));
+}
+
 // Editor: whole-file text with detected encoding/EOL; writes are atomic.
 export type Encoding = "utf-8" | "utf-8-bom" | "latin-1";
 export type Eol = "lf" | "crlf";
@@ -185,6 +209,10 @@ export interface SudoOutcome { ok: boolean; probe: string | null; sudo: "ok" | "
 export const sftpSudoOpen = (session: string, password?: string) => invoke<SudoOutcome>("sftp_sudo_open", { session, password });
 export const sftpSudoHasPassword = (session: string) => invoke<boolean>("sftp_sudo_has_password", { session });
 export const sftpSudoClear = (session: string) => invoke<void>("sftp_sudo_clear", { session });
+/** True if the session has a stored password to answer a sudo/su prompt with. */
+export const sudoHasPassword = (session: string) => invoke<boolean>("sftp_sudo_has_password", { session });
+/** Send the stored password to a sudo/su prompt (backend writes it, never returns it). */
+export const sudoSendPassword = (session: string) => invoke<boolean>("sudo_send_password", { session });
 
 // P5: `<cmd> --help` over the session, cached per host in data/help-cache.
 export const helpFetch = (session: string, cmd: string) => invoke<string>("help_fetch", { session, cmd });

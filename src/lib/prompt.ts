@@ -34,3 +34,24 @@ export function parseOsc7(data: string): string | undefined {
 export function promptUserOf(line: string): string | undefined {
   return /(?:^|\s|\[)([A-Za-z_][\w.-]*)@[\w.-]+/.exec(line)?.[1];
 }
+
+/** A line waiting on a sudo/su password: `[sudo] password for X:` or a bare `Password:`. */
+export function looksLikeSudoPrompt(line: string): boolean {
+  const l = line.replace(/\s+$/, "");
+  if (!l.endsWith(":")) return false;
+  return /\[sudo\] password for .+:$/.test(l) || /(?:^|\s)[Pp]assword:$/.test(l);
+}
+
+/** The user named in a `[sudo] password for <user>:` prompt, or null. */
+export function sudoUserOf(line: string): string | null {
+  return /\[sudo\] password for ([^:]+):/.exec(line)?.[1]?.trim() ?? null;
+}
+
+/**
+ * Whether a prompt is eligible for *automatic* password send: only the login
+ * user's own `[sudo] password for <login-user>:`. A prompt for someone else, or a
+ * bare `Password:` (su), is never auto-sent — it stays a manual button.
+ */
+export function sudoAutoEligible(line: string, loginUser?: string): boolean {
+  return !!loginUser && sudoUserOf(line) === loginUser;
+}
