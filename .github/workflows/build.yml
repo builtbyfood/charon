@@ -102,3 +102,57 @@ jobs:
             charon-windows-portable.zip
             charon-linux-portable.tar.gz
           if-no-files-found: ignore
+
+  # macOS: one job per architecture. Builds on every push/PR like the others;
+  # attaches a .dmg to the release only on a v* tag (see the tauri-action step).
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14 # Apple Silicon (arm64)
+            label: macos-arm64
+          - os: macos-13 # Intel (x86_64)
+            label: macos-intel
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with: { node-version: 22, cache: npm }
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with: { workspaces: src-tauri }
+
+      - run: npm ci
+
+      - name: Frontend check
+        run: npm run check
+
+      - name: Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Frontend tests
+        run: npm test
+
+      # Host-arch build: macos-14 → aarch64 .dmg, macos-13 → x86_64 .dmg. On a
+      # v* tag the .dmg is attached to the draft release; on a plain push/PR it
+      # just builds (empty tagName → tauri-action makes no release).
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: --bundles dmg
+          tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+          releaseName: ${{ startsWith(github.ref, 'refs/tags/') && format('Charon {0}', github.ref_name) || '' }}
+          releaseDraft: true
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: charon-${{ matrix.label }}
+          path: |
+            src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/release/bundle/macos/*.app
+          if-no-files-found: ignore
