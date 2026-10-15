@@ -10,7 +10,25 @@ permissions:
   contents: write # tauri-action / gh release need this to draft releases on tags
 
 jobs:
+  # On a v* tag: create the draft release once, up front. Letting each parallel
+  # tauri-action job create it races and can leave duplicate drafts.
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    outputs:
+      id: ${{ steps.create.outputs.id }}
+    steps:
+      - id: create
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          id=$(gh api "repos/${{ github.repository }}/releases"             -f tag_name="${{ github.ref_name }}" -f name="Charon ${{ github.ref_name }}"             -F draft=true -F generate_release_notes=true --jq .id)
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
   bundle:
+    needs: release
+    # Run on plain pushes/PRs too, where `release` is skipped.
+    if: ${{ !cancelled() && (needs.release.result == 'success' || needs.release.result == 'skipped') }}
     strategy:
       fail-fast: false
       matrix:
@@ -52,15 +70,14 @@ jobs:
       - name: Frontend tests
         run: npm test
 
+      # releaseId is empty on non-tag runs → build only, no release upload.
       - uses: tauri-apps/tauri-action@v0
         id: tauri
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           args: ${{ matrix.args }}
-          tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
-          releaseName: ${{ startsWith(github.ref, 'refs/tags/') && format('Charon {0}', github.ref_name) || '' }}
-          releaseDraft: true
+          releaseId: ${{ needs.release.outputs.id }}
 
       # Portable builds: bare binary + portable.flag, no installer.
       - name: Portable (Windows)
@@ -87,8 +104,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # By release id: a draft's tag doesn't exist yet, so don't look it up by tag.
           for f in charon-windows-portable.zip charon-linux-portable.tar.gz; do
-            [ -f "$f" ] && gh release upload "${{ github.ref_name }}" "$f" --clobber
+            [ -f "$f" ] || continue
+            curl -fsSL -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/octet-stream"               --data-binary @"$f"               "https://uploads.github.com/repos/${{ github.repository }}/releases/${{ needs.release.outputs.id }}/assets?name=$f"
           done
 
       - uses: actions/upload-artifact@v5
@@ -103,18 +122,21 @@ jobs:
             charon-linux-portable.tar.gz
           if-no-files-found: ignore
 
-  # macOS: one job per architecture. Builds on every push/PR like the others;
-  # attaches a .dmg to the release only on a v* tag (see the tauri-action step).
+  # macOS: one job per architecture, both on the Apple Silicon runner (GitHub
+  # retired the macos-13 Intel image); Intel is cross-compiled with --target.
+  # Builds on every push/PR; attaches a .dmg to the release only on a v* tag.
   macos:
+    needs: release
+    if: ${{ !cancelled() && (needs.release.result == 'success' || needs.release.result == 'skipped') }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14 # Apple Silicon (arm64)
-            label: macos-arm64
-          - os: macos-13 # Intel (x86_64)
-            label: macos-intel
-    runs-on: ${{ matrix.os }}
+          - label: macos-arm64
+            target: aarch64-apple-darwin
+          - label: macos-intel
+            target: x86_64-apple-darwin
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
 
@@ -122,37 +144,34 @@ jobs:
         with: { node-version: 22, cache: npm }
 
       - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "${{ matrix.target }}" }
 
       - uses: swatinem/rust-cache@v2
-        with: { workspaces: src-tauri }
+        with: { workspaces: src-tauri, key: "${{ matrix.target }}" }
 
       - run: npm ci
 
       - name: Frontend check
         run: npm run check
 
-      - name: Rust tests
+      - name: Rust tests # native (arm64) run; the Intel binary is cross-built below
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
       - name: Frontend tests
         run: npm test
 
-      # Host-arch build: macos-14 → aarch64 .dmg, macos-13 → x86_64 .dmg. On a
-      # v* tag the .dmg is attached to the draft release; on a plain push/PR it
-      # just builds (empty tagName → tauri-action makes no release).
+      # aarch64 / x86_64 .dmg. On a v* tag it is attached to the draft release;
+      # on a plain push/PR it just builds (empty releaseId → no release).
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          args: --bundles dmg
-          tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
-          releaseName: ${{ startsWith(github.ref, 'refs/tags/') && format('Charon {0}', github.ref_name) || '' }}
-          releaseDraft: true
+          args: --target ${{ matrix.target }} --bundles dmg
+          releaseId: ${{ needs.release.outputs.id }}
 
       - uses: actions/upload-artifact@v5
         with:
           name: charon-${{ matrix.label }}
           path: |
-            src-tauri/target/release/bundle/dmg/*.dmg
-            src-tauri/target/release/bundle/macos/*.app
+            src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
           if-no-files-found: ignore

@@ -36,6 +36,9 @@ keepalive_seconds = 30          # server-alive interval; 0 = off. No idle-discon
 [sudo]
 auto_send = false               # true: auto-send the saved password at a sudo/su prompt (300 ms debounce); else button / Ctrl+Shift+P
 
+[local]
+credential = ""                 # vault entry whose password the bare Local shell offers to sudo (Unix); saved local nodes use their own credential
+
 [commands]                      # OSC 133 driven
 mark_gutter = true
 tint_failed_commands = true

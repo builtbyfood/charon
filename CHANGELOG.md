@@ -4,6 +4,33 @@ All notable changes to Charon are recorded here. Versions follow semver; the
 canonical version lives in `src-tauri/tauri.conf.json` and is propagated to
 `package.json` and `Cargo.toml` by `npm run bump` (`scripts/bump-version.mjs`).
 
+## 0.2.1
+
+### Terminal
+- **Flag picker ignores pastes** — pasting a block whose last line ends in a flag
+  (`cd /tmp` ⏎ `ls --all`) no longer opens the popup and swallows the Enter that
+  should run it; the picker only reacts to typed keystrokes.
+- Flag picker: a mouse click accepts a flag (keeps terminal focus, inserts only the
+  missing suffix).
+- Fixed a crash on very large pastes and a doubled prompt on connect.
+- Floating **Copy** button on a terminal selection.
+- The paste guard only engages on real warnings, and its held-paste bar is easier
+  to notice.
+
+### Sessions
+- SSH password logins fall back to keyboard-interactive auth when the server
+  doesn't offer plain `password`.
+- Local sessions can use a stored sudo credential; the sudo button appears only
+  where sudo takes a tty password (not on Windows) and is detected reliably.
+- Output coalescing always flushes the tail, is size-capped, and now also covers
+  local PTY sessions.
+
+### Platform / CI
+- macOS builds both run on `macos-latest` (Intel cross-compiled; the `macos-13`
+  image is retired); a tag creates one draft release that every job uploads into.
+- `.gitattributes` forces LF checkouts, so CI-built Windows releases don't ship
+  CRLF shell hooks.
+
 ## 0.2.0
 
 ### Files pane

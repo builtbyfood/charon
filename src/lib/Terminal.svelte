@@ -30,17 +30,22 @@
   import { helpFetch, onMcpScrollback, mcpAnswer } from "./api";
   import { cmdContext, currentCommand } from "./cmdline";
   import { tldrPage, preloadTldr } from "./tldr";
-  import { flagsFromHelp, flagsFromTldr, mergeFlags, matchFlags, runFlagAccept, type Flag } from "./flags";
+  import { flagsFromHelp, flagsFromTldr, mergeFlags, matchFlags, runFlagAccept, PickerGate, type Flag } from "./flags";
   import { CommandTracker, InjectionSwallower, detectShell, injectionFor, hookTextFor, looksLikeShellPrompt, looksLikeSudoPrompt, sudoUserOf, sudoAutoEligible, parseOsc7, promptUserOf, type Shell } from "./osc133";
   import { sudoHasPassword, sudoSendPassword } from "./api";
 
-  let { open, color, prefs, active = true, onfontsize, onclosed, onabort, oncwd, onopenfile, onfiles, oncommand }: {
+  let { open, color, prefs, active = true, os, osUser, onfontsize, onclosed, onabort, oncwd, onopenfile, onfiles, oncommand }: {
     open: OpenTarget;
     color?: string;
     prefs: Prefs;
     /** This tab is the visible one. Inactive tabs buffer output and drop their
      *  WebGL context (browsers lose contexts past ~16 live), flushing on show. */
     active?: boolean;
+    /** Host OS ("windows"|"macos"|"linux") and current OS user, from app_info.
+     *  Used to gate the local sudo button (Windows UAC takes no tty password) and
+     *  as the login user for a local sudo prompt. */
+    os?: string;
+    osUser?: string;
     /** Ctrl+= / Ctrl+- changed the size; the owner persists it to the profile. */
     onfontsize: (size: number) => void;
     onclosed: (reason: string) => void;
@@ -100,6 +105,10 @@
   export function filesShown(): boolean { return filesOpen; }
   // Who the shell is vs who SFTP is: differ after sudo -i / su -, so the pane switches backend.
   let sshUser = $state<string | undefined>();
+  // The login user for a sudo prompt: SSH login user, or the OS user for a local shell.
+  const loginUser = $derived(open.kind === "local" ? osUser : sshUser);
+  // Windows local shells elevate via UAC (no tty password): never offer the button.
+  const winLocalNoSudo = $derived(open.kind === "local" && os === "windows");
   let promptUser = $state<string | undefined>();
   let program = $state("");
   /** At a prompt with nothing running: safe for the pane to type hidden commands / cd. */
@@ -135,6 +144,10 @@
   // Right-click menu.
   let menu = $state<{ x: number; y: number; items: MenuItem[] } | null>(null);
 
+  // Floating "Copy" button shown near a settled text selection.
+  let copyBtn = $state<{ x: number; y: number } | null>(null);
+  let selTimer: ReturnType<typeof setTimeout> | undefined;
+
   // Paste guard: an inline, non-modal bar (Enter/Esc or buttons) shown when a paste
   // trips a warning, so xterm never loses focus to a confirm() dialog.
   let pasteGuard = $state<{ cleaned: string; warns: string[]; route: string } | null>(null);
@@ -154,6 +167,8 @@
   let flagAll: Flag[] = [];                 // unfiltered flags for the current command
   const flagCache = new Map<string, { all: Flag[]; helpDone: boolean }>();
   let flagEvalTimer: ReturnType<typeof setTimeout> | undefined;
+  // Typed keystrokes only: a paste suppresses the picker until the next prompt.
+  const pickerGate = new PickerGate();
 
   let sessionId = $state<string | null>(null);
   let status = $state<"connecting" | "auth" | "hostkey" | "up" | "closed">("connecting");
@@ -197,7 +212,7 @@
       color: color ?? "#6aa2ff",
       onchange: () => { osc133 = true; markCount = tracker.marks.length; },
       // Re-evaluate who the shell is on every prompt (sudo -i / su - / exit), un-latched.
-      onprompt: (line) => { const u = promptUserOf(line); if (u) promptUser = u; },
+      onprompt: (line) => { pickerGate.prompt(); const u = promptUserOf(line); if (u) promptUser = u; },
     });
     // OSC 7: the hook reports the cwd after every command.
     term.parser.registerOscHandler(7, (data) => {
@@ -205,7 +220,19 @@
       if (dir && dir !== cwd) { cwd = dir; if (sessionId) sessionSetCwd(sessionId, dir).catch(() => {}); oncwd?.(dir); }
       return true;
     });
-    if (prefs.copyOnSelect) term.onSelectionChange(() => { if (term.hasSelection()) copySelection(); });
+    // Selection: show a floating Copy button and (if enabled) copy — both debounced
+    // so dragging a selection doesn't fire a clipboard write / reposition per frame
+    // (the "slight delay while selecting"). Deselect hides the button at once.
+    term.onSelectionChange(() => {
+      clearTimeout(selTimer);
+      if (!term.hasSelection()) { copyBtn = null; return; }
+      selTimer = setTimeout(() => {
+        if (!term.hasSelection()) { copyBtn = null; return; }
+        if (prefs.copyOnSelect) copySelection();
+        copyBtn = selectionAnchor();
+      }, 120);
+    });
+    term.onScroll(() => { if (copyBtn) copyBtn = null; }); // stale position once scrolled
     // No cursor while connecting/authenticating; the remote shell shows it once up.
     term.write(HIDE_CURSOR);
 
@@ -261,7 +288,7 @@
     el.addEventListener("auxclick", (e) => { if (e.button === 1 && prefs.middleClickPaste) { e.preventDefault(); pasteFromClipboard("middle-click"); } });
     el.addEventListener("mousedown", (e) => { if (e.button === 1 && prefs.middleClickPaste) e.preventDefault(); });
 
-    term.onData((d) => { if (sessionId) sessionWrite(sessionId, d); });
+    term.onData((d) => { pickerGate.input(d); if (sessionId) sessionWrite(sessionId, d); });
     term.onResize(({ cols, rows }) => { if (sessionId) sessionResize(sessionId, cols, rows); });
     perfTimer = setInterval(logPerf, 5000);
 
@@ -418,6 +445,7 @@
   onDestroy(() => {
     clearTimeout(injectTimer);
     clearTimeout(flagEvalTimer);
+    clearTimeout(selTimer);
     clearInterval(perfTimer);
     unlisteners.forEach((u) => u());
     if (sessionId) sessionClose(sessionId);
@@ -438,6 +466,11 @@
   function closeFlagPicker() { flagPopup = null; flagList = []; flagSel = 0; }
   function evalFlagPicker() {
     if (!osc133 || !sessionId || !active) { closeFlagPicker(); return; }
+    const blocked = pickerGate.blocked();
+    if (blocked) {
+      if (pickerGate.shouldLog()) console.info(`[charon] flags: suppressed reason=${blocked}`);
+      closeFlagPicker(); return;
+    }
     // Never complete a token mid-line: the picker can't see what's to the right.
     if (!cursorAtLineEnd()) { closeFlagPicker(); return; }
     const input = tracker.inputToCursor();
@@ -682,9 +715,38 @@
     const sel = term.getSelection();
     if (sel) await writeText(cleanForCopy(sel, { smartQuotes: prefs.smartQuotesToAscii, trimTrailing: prefs.trimTrailingWhitespace }));
   }
+  /** Pixel anchor (fixed coords) just below the end of the selection; falls back to
+   *  the terminal's bottom-right when the end is scrolled off or internals move. */
+  function selectionAnchor(): { x: number; y: number } {
+    const rect = el.getBoundingClientRect();
+    const corner = { x: rect.right - 72, y: rect.bottom - 34 };
+    try {
+      const pos = term.getSelectionPosition();
+      if (!pos) return corner;
+      const cell = (term as unknown as { _core: { _renderService: { dimensions: { css: { cell: { width: number; height: number } } } } } })._core._renderService.dimensions.css.cell;
+      const row = pos.end.y - term.buffer.active.viewportY; // viewport-relative
+      if (row < 0 || row >= term.rows) return corner;
+      const x = Math.min(rect.left + 12 + pos.end.x * cell.width + 4, rect.right - 64);
+      const y = Math.min(rect.top + 4 + (row + 1) * cell.height + 2, rect.bottom - 30);
+      return { x: Math.max(8, x), y };
+    } catch {
+      return corner;
+    }
+  }
+  function copyFromButton() {
+    copySelection();
+    term.clearSelection();
+    copyBtn = null;
+    term.focus();
+  }
   /** Every paste route (Ctrl+Shift+V, menu, middle click, native paste event) ends here. */
   function pasteToSession(text: string, route: string) {
     if (!text || !sessionId) return;
+    // The flag picker must never react to pasted text: close it now and keep it
+    // shut until the next prompt (else a trailing `--all` pops it and eats Enter).
+    pickerGate.pasteBegin();
+    clearTimeout(flagEvalTimer);
+    closeFlagPicker();
     const cleaned = cleanForCopy(text, { trimTrailing: false, smartQuotes: prefs.smartQuotesToAscii });
     // Guard only on a real warning: ≥ paste_guard_lines content lines, hidden
     // characters, or `$ `-prefixed doc lines. An ordinary one-line paste goes
@@ -706,6 +768,9 @@
     term.focus();
   }
   function writePaste(cleaned: string, bracketed: boolean) {
+    pickerGate.send(() => writePasteNow(cleaned, bracketed));
+  }
+  function writePasteNow(cleaned: string, bracketed: boolean) {
     // Bracketed + "auto" + trailing newline: paste the body inside the 200~/201~
     // markers, then send the newline *after* 201~ so the shell executes it instead
     // of leaving it highlighted. Otherwise xterm's paste keeps the newline inside.
@@ -734,7 +799,7 @@
   function cancelPaste() {
     if (!pasteGuard) return;
     console.info(`[charon] paste: route=${pasteGuard.route} bytes=${pasteGuard.cleaned.length} bracketed=${!!term.modes.bracketedPasteMode} queued=false (cancelled)`);
-    pasteGuard = null; term.focus();
+    pasteGuard = null; pickerGate.pasteCancelled(); term.focus();
   }
   async function pasteFromClipboard(route: string) {
     pasteToSession(await readText(), route);
@@ -743,7 +808,7 @@
   // ---- sudo password prompt (T3)
   /** Detect a sudo/su password prompt on the live line; colon-gated so a flood is cheap. */
   function maybeSudoPrompt(b: Uint8Array) {
-    if (!sessionId) return;
+    if (!sessionId || winLocalNoSudo) return;
     if (sudoPrompt) {
       // Clear once the sudo line is gone from screen (answered, scrolled, new prompt).
       // Not gated on OSC 133: a session without shell integration must still work.
@@ -760,11 +825,11 @@
     if (sudoHasPw === null && sessionId) sudoHasPw = await sudoHasPassword(sessionId).catch(() => false);
     // Auto-send only for the login user's own sudo prompt; a bare `Password:` (su)
     // or another user's prompt shows the button but never auto-sends.
-    const eligible = sudoAutoEligible(line, sshUser);
+    const eligible = sudoAutoEligible(line, loginUser);
     const auto = !!sudoHasPw && prefs.sudoAutoSend && eligible;
     // One diagnostic line (no secret): hasPassword drives the button; eligible +
-    // autoSend drive auto-send; sshUser is the credential owner we'd send.
-    console.info(`[charon] sudo: prompt detected user=${user ?? "?"} sshUser=${sshUser ?? "?"} hasPassword=${sudoHasPw} autoSend=${prefs.sudoAutoSend} eligible=${eligible} button=${!!sudoHasPw} sent=${auto}`);
+    // autoSend drive auto-send; loginUser is the credential owner we'd send.
+    console.info(`[charon] sudo: prompt detected user=${user ?? "?"} loginUser=${loginUser ?? "?"} hasPassword=${sudoHasPw} autoSend=${prefs.sudoAutoSend} eligible=${eligible} button=${!!sudoHasPw} sent=${auto}`);
     if (auto) sudoAutoTimer = setTimeout(() => sendSudo(), 300);
   }
   async function sendSudo() {
@@ -866,6 +931,11 @@
     </div>
   {/if}
   </div>
+  {#if copyBtn}
+    <!-- mousedown preventDefault keeps the selection while the click copies it. -->
+    <button type="button" class="sel-copy" style:left="{copyBtn.x}px" style:top="{copyBtn.y}px"
+      onmousedown={(e) => e.preventDefault()} onclick={copyFromButton} title="Copy selection (Ctrl+Shift+C)">Copy</button>
+  {/if}
   {#if menu}
     <ContextMenu x={menu.x} y={menu.y} items={menu.items} onclose={() => (menu = null)} />
   {/if}
@@ -998,6 +1068,8 @@
   .chip { margin-left: auto; font: inherit; font-family: var(--font-mono); color: inherit; background: transparent; padding: 0 6px; border: 1px solid var(--line); border-radius: 8px; cursor: pointer; }
   .reconnect { margin-left: 6px; border-color: var(--accent); color: var(--fg); }
   .sudo { margin-left: 6px; border-color: #ffb454; color: #ffb454; }
+  .sel-copy { position: fixed; z-index: 25; padding: 2px 10px; font: inherit; font-size: 12px; color: var(--fg); background: var(--bg-raised); border: 1px solid var(--accent); border-radius: 4px; box-shadow: 0 3px 10px #0008; cursor: pointer; }
+  .sel-copy:hover { background: var(--accent); color: #06101f; }
   .chip:hover { border-color: var(--fg-dim); color: var(--fg); }
   .up .dot { background: #5fd38a; } .closed .dot { background: var(--danger); }
 </style>

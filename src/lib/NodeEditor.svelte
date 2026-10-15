@@ -130,7 +130,7 @@
       </label>
     </div>
 
-    <label hidden={!isSsh && !isFolder}>Credential
+    <label hidden={!isSsh && !isFolder && !isLocal}>{isLocal ? "Credential (sudo password, Unix)" : "Credential"}
       <select bind:value={f.credential} class:inh={f.credential === ""}>
         <option value="">({inhCred})</option>
         {#each creds as c (c.name)}<option value={c.name}>{c.name}</option>{/each}

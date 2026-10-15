@@ -1,2 +1,12 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# LF everywhere, on every checkout. GitHub's Windows runners default to
+# core.autocrlf=true; CRLF would leak into the ?raw-imported shell hooks and
+# break them on remote bash/zsh in CI-built Windows releases.
+* text=auto eol=lf
+
+*.png  binary
+*.ico  binary
+*.icns binary
+*.gz   binary
+
+# Fixtures that must keep their native line endings.
+*.mxtsessions -text

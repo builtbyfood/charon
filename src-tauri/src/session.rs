@@ -181,34 +181,60 @@ impl SessionManager {
     }
 }
 
-/// Batches a session's output so the UI gets at most one `term:data` event per
-/// window (16 ms), instead of one per SSH packet / PTY read. The first byte of a
-/// burst is emitted immediately (low latency); subsequent bytes within the window
-/// accumulate and flush together (fewer IPC round-trips + JSON/base64 encodes).
+/// Batches a session's output so the UI gets at most one event per window (16 ms)
+/// instead of one per SSH packet / PTY read. The first byte of a burst is emitted
+/// immediately (low latency); bytes within the window accumulate and flush
+/// together. The batch tail never waits for the next event: the driver arms a
+/// timer from `due_in()` and calls `flush_timer()` when it elapses, even with no
+/// further traffic. A size cap bounds memory during a flood.
+///
+/// The emit is a closure (no `AppHandle` in the struct) so this is unit-testable
+/// without a Tauri handle: an `AppHandle` in the test binary links the dialog
+/// plugin's comctl32 v6 imports, and the manifest-less harness then fails on
+/// Windows with STATUS_ENTRYPOINT_NOT_FOUND.
 pub struct Coalescer {
-    app: AppHandle,
     id: String,
+    emit: Box<dyn FnMut(&[u8]) + Send>,
     buf: Vec<u8>,
+    /// How many pushes are held in `buf` (for the log line).
+    chunks: u32,
     last_flush: std::time::Instant,
     window: std::time::Duration,
+    max: usize,
 }
 
 impl Coalescer {
-    pub fn new(app: AppHandle, id: String) -> Self {
-        // Start "due" so the first push flushes at once.
-        let window = std::time::Duration::from_millis(16);
-        Self { app, id, buf: Vec::new(), last_flush: std::time::Instant::now() - window, window }
+    pub fn new(id: String, emit: impl FnMut(&[u8]) + Send + 'static) -> Self {
+        Self::with_window(id, emit, std::time::Duration::from_millis(16))
     }
 
-    /// Append output; flush now if the window has elapsed since the last flush.
-    pub fn push(&mut self, data: &[u8]) {
-        self.buf.extend_from_slice(data);
-        if self.last_flush.elapsed() >= self.window {
-            self.flush();
+    pub fn with_window(id: String, emit: impl FnMut(&[u8]) + Send + 'static, window: std::time::Duration) -> Self {
+        Self {
+            id,
+            emit: Box::new(emit),
+            buf: Vec::new(),
+            chunks: 0,
+            // Start "due" so the first push flushes at once.
+            last_flush: std::time::Instant::now() - window,
+            window,
+            max: 256 * 1024,
         }
     }
 
-    /// Time until a buffered flush is due, or `None` when nothing is pending.
+    /// Append output; flush now if the buffer hit the size cap, or the window has
+    /// elapsed since the last flush. Otherwise it's held for the driver's timer.
+    pub fn push(&mut self, data: &[u8]) {
+        self.buf.extend_from_slice(data);
+        self.chunks += 1;
+        if self.buf.len() >= self.max {
+            self.flush("size");
+        } else if self.last_flush.elapsed() >= self.window {
+            self.flush("timer");
+        }
+    }
+
+    /// Time until a buffered flush is due, or `None` when nothing is pending. The
+    /// driver sleeps this long, then calls `flush_timer()`.
     pub fn due_in(&self) -> Option<std::time::Duration> {
         if self.buf.is_empty() {
             None
@@ -217,12 +243,83 @@ impl Coalescer {
         }
     }
 
-    pub fn flush(&mut self) {
+    /// Flush because the window elapsed (the driver's timer fired).
+    pub fn flush_timer(&mut self) {
+        self.flush("timer");
+    }
+
+    /// Flush a batch boundary (session closing, or before a hidden-command capture).
+    pub fn flush_close(&mut self) {
+        self.flush("close");
+    }
+
+    fn flush(&mut self, reason: &'static str) {
         if self.buf.is_empty() {
             return;
         }
-        SessionManager::emit_data(&self.app, &self.id, &self.buf);
+        tracing::debug!("[charon] coalesce: held={} flushed={} reason={} session={}", self.chunks, self.buf.len(), reason, self.id);
+        (self.emit)(&self.buf);
         self.buf.clear();
+        self.chunks = 0;
         self.last_flush = std::time::Instant::now();
+    }
+}
+
+#[cfg(test)]
+mod coalescer_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    fn collector() -> (Arc<Mutex<Vec<Vec<u8>>>>, impl FnMut(&[u8]) + Send + 'static) {
+        let events = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let sink = events.clone();
+        (events, move |b: &[u8]| sink.lock().unwrap().push(b.to_vec()))
+    }
+
+    #[test]
+    fn a_single_write_emits_once_with_all_bytes() {
+        let (events, emit) = collector();
+        let mut c = Coalescer::new("t".into(), emit);
+        // Fresh coalescer starts "due": one write of N bytes → exactly one event now.
+        c.push(b"twelve-bytes");
+        let ev = events.lock().unwrap();
+        assert_eq!(ev.len(), 1, "exactly one event");
+        assert_eq!(ev[0], b"twelve-bytes", "all N bytes in it");
+    }
+
+    #[test]
+    fn a_buffered_tail_flushes_in_one_event_within_the_window_no_more_traffic() {
+        let (events, emit) = collector();
+        let mut c = Coalescer::with_window("t".into(), emit, Duration::from_millis(16));
+        // Prior traffic flushes immediately (event 0) and resets the window.
+        c.push(b"prompt$ ");
+        assert_eq!(events.lock().unwrap().len(), 1);
+        // The paste echo arrives within the window → held, not emitted yet.
+        c.push(b"the-pasted-command");
+        assert_eq!(events.lock().unwrap().len(), 1, "tail is held, not emitted per-event");
+        // A flush is pending and never waits longer than the window.
+        let due = c.due_in().expect("a flush is pending");
+        assert!(due <= Duration::from_millis(16), "flush is due within the window");
+        // The driver fires the timer with no further traffic: exactly one more event,
+        // carrying the whole tail.
+        c.flush_timer();
+        let ev = events.lock().unwrap();
+        assert_eq!(ev.len(), 2, "exactly one more event for the tail");
+        assert_eq!(ev[1], b"the-pasted-command", "all tail bytes in one event");
+        // Nothing else pending afterwards.
+        assert!(c.due_in().is_none());
+    }
+
+    #[test]
+    fn the_size_cap_flushes_a_flood_without_waiting() {
+        let (events, emit) = collector();
+        let mut c = Coalescer::with_window("t".into(), emit, Duration::from_millis(16));
+        c.push(b"x"); // fresh → flushes (event 0)
+        let big = vec![b'y'; 300 * 1024];
+        c.push(&big); // exceeds the 256 KiB cap → flushes immediately (reason=size)
+        let ev = events.lock().unwrap();
+        assert_eq!(ev.len(), 2);
+        assert_eq!(ev[1].len(), 300 * 1024);
     }
 }

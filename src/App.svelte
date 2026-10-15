@@ -168,7 +168,7 @@
           {#if t.editor}
             <EditorPane bind:this={editorPane} onsend={sendToSession} ondirty={(d) => (editorDirty = d)} />
           {:else if t.open}
-            <Terminal bind:this={terms[t.id]} open={t.open} color={t.color} {prefs} active={active === t.id} onfontsize={setFontSize} onclosed={() => {}} onabort={() => closeTab(t.id)}
+            <Terminal bind:this={terms[t.id]} open={t.open} color={t.color} {prefs} active={active === t.id} os={info?.os} osUser={info?.user} onfontsize={setFontSize} onclosed={() => {}} onabort={() => closeTab(t.id)}
               onopenfile={openInEditor} onfiles={(o) => (filesOpen[t.id] = o)}
               oncommand={(cmd, sess) => { if (active === t.id) { docsCommand = cmd; docsSession = sess; } }} />
           {/if}

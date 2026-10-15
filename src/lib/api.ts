@@ -31,7 +31,7 @@ export interface Node {
 export interface SessionInfo { id: string; title: string; kind: string; shell_integration: boolean; shell: string | null; cwd: string | null }
 export const sessionSetShell = (id: string, shell: string | null) => invoke<void>("session_set_shell", { id, shell });
 export const sessionSetCwd = (id: string, cwd: string | null) => invoke<void>("session_set_cwd", { id, cwd });
-export interface AppInfo { version: string; portable: boolean; data_dir: string }
+export interface AppInfo { version: string; portable: boolean; data_dir: string; os: "windows" | "macos" | "linux" | string; user: string }
 
 export const appInfo = () => invoke<AppInfo>("app_info");
 
@@ -43,6 +43,7 @@ export interface Profile {
   terminal: { copy_on_select: boolean; ctrl_c_copies_when_selected: boolean; middle_click_paste: boolean; right_click?: "moba" | "menu" | string; bracketed_paste: boolean; paste_guard_lines: number; paste_run?: "auto" | "wait" | string; [k: string]: unknown };
   files?: { auto_open?: boolean; parallel_transfers?: number; [k: string]: unknown };
   sudo?: { auto_send?: boolean; [k: string]: unknown };
+  local?: { credential?: string; [k: string]: unknown };
   clipboard: { strip_zero_width: boolean; nbsp_to_space: boolean; smart_quotes_to_ascii: boolean; trim_trailing_whitespace: boolean; crlf_to_lf: boolean; [k: string]: unknown };
   commands: { mark_gutter: boolean; tint_failed_commands: boolean; jump_keys: string[]; [k: string]: unknown };
   ssh: { keepalive_seconds: number; [k: string]: unknown };
@@ -117,7 +118,14 @@ export const isOpenError = (e: unknown): e is OpenError =>
 export const openSsh = (req: OpenSsh) => invoke<SessionInfo>("session_open_ssh", { req });
 
 const enc = new TextEncoder();
-const b64 = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes));
+// Chunked so a large paste can't blow the call stack: `String.fromCharCode(...bytes)`
+// spreads every byte as an argument and overflows past ~100k bytes.
+const b64 = (bytes: Uint8Array): string => {
+  let bin = "";
+  const CH = 0x8000; // 32 KiB per fromCharCode call
+  for (let i = 0; i < bytes.length; i += CH) bin += String.fromCharCode(...bytes.subarray(i, i + CH));
+  return btoa(bin);
+};
 const unb64 = (s: string) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
 
 export const sessionWrite = (id: string, text: string) =>

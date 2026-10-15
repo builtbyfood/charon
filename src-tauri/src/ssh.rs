@@ -28,7 +28,7 @@ pub struct SshParams {
     pub cols: u16,
     pub rows: u16,
     /// Server-alive interval; `None` (profile 0) disables keepalive. Applies to
-    /// the whole connection — the shell, SFTP, and sudo channels share it.
+    /// the whole connection â the shell, SFTP, and sudo channels share it.
     pub keepalive: Option<std::time::Duration>,
 }
 
@@ -98,7 +98,7 @@ impl std::fmt::Display for HostKeyChanged {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "HOST KEY CHANGED for {}:{} — the {} key the server presented ({}) does not match \
+            "HOST KEY CHANGED for {}:{} â the {} key the server presented ({}) does not match \
              the one recorded in {} line {}. Someone could be intercepting this connection.",
             self.host, self.port, self.key_type, self.fingerprint, self.file, self.line
         )
@@ -234,7 +234,19 @@ async fn authenticate(handle: &mut Handle<Handler>, user: &str, host: &str, auth
             let key = Auth::load_key(key, passphrase.as_deref())?;
             handle.authenticate_publickey(user, Arc::new(key)).await?
         }
-        Auth::Password(pw) => handle.authenticate_password(user, pw).await?,
+        Auth::Password(pw) => {
+            // Try the plain "password" method first, then fall back to keyboard-
+            // interactive with the same password. Many servers (HPE iLO, and any
+            // OpenSSH with `PasswordAuthentication no` + `KbdInteractiveAuthentication
+            // yes`) accept a password *only* through keyboard-interactive, which they
+            // often present as an "MFA"/challenge — so a plain password attempt is
+            // rejected and it looks like MFA is required when it isn't.
+            if handle.authenticate_password(user, pw).await? {
+                true
+            } else {
+                keyboard_interactive(handle, user, pw).await?
+            }
+        }
     };
     if !authed {
         return Err(anyhow!("authentication rejected for {user}@{host}"));
@@ -242,11 +254,32 @@ async fn authenticate(handle: &mut Handle<Handler>, user: &str, host: &str, auth
     Ok(())
 }
 
+/// Answer keyboard-interactive prompts with the password. This covers the common
+/// single-factor case (one non-echo "Password:" prompt); a genuine second factor
+/// (an OTP prompt we can't fill from a stored password) is left to fail cleanly
+/// rather than loop. Echoed prompts get an empty answer so the password is never
+/// sent to a visible field.
+async fn keyboard_interactive(handle: &mut Handle<Handler>, user: &str, pw: &str) -> Result<bool> {
+    use russh::client::KeyboardInteractiveAuthResponse as Kir;
+    let mut resp = handle.authenticate_keyboard_interactive_start(user, None).await?;
+    for _ in 0..10 {
+        match resp {
+            Kir::Success => return Ok(true),
+            Kir::Failure => return Ok(false),
+            Kir::InfoRequest { prompts, .. } => {
+                let answers = prompts.iter().map(|p| if p.echo { String::new() } else { pw.to_string() }).collect();
+                resp = handle.authenticate_keyboard_interactive_respond(answers).await?;
+            }
+        }
+    }
+    Ok(false)
+}
+
 impl SshSession {
     pub async fn connect(mgr: SessionManager, keys: Arc<HostKeys>, id: String, p: SshParams) -> Result<Arc<Self>> {
         // No inactivity timeout (it dropped idle sessions); keep the link alive and
         // detect dead ones with server-alive requests instead. keepalive_max=3 means
-        // ~3 missed replies (≈ 3× interval) before russh gives up.
+        // ~3 missed replies (â 3Ã interval) before russh gives up.
         let config = Arc::new(client::Config {
             inactivity_timeout: None,
             keepalive_interval: p.keepalive,
@@ -311,7 +344,10 @@ impl SshSession {
         // While a hidden command runs, output goes through `Capture` first.
         tokio::spawn(async move {
             // Coalesce output into ≤ 1 UI event per 16 ms (see session::Coalescer).
-            let mut out = crate::session::Coalescer::new(app.clone(), id.clone());
+            let mut out = crate::session::Coalescer::new(id.clone(), {
+                let (app, id) = (app.clone(), id.clone());
+                move |b: &[u8]| SessionManager::emit_data(&app, &id, b)
+            });
             let mut capture: Option<(crate::hidden::Capture, oneshot::Sender<Result<(Vec<u8>, i32)>>)> = None;
             // User keystrokes / pastes that arrive while a hidden command is capturing
             // are held here and flushed once it finishes, so they never interleave with
@@ -331,7 +367,7 @@ impl SshSession {
                                 Some((cap, _)) => {
                                     let show = cap.feed(&data);
                                     // Keep ordering: drain any coalesced normal output first.
-                                    if !show.is_empty() { out.flush(); SessionManager::emit_data(&app, &id, &show); }
+                                    if !show.is_empty() { out.flush_close(); SessionManager::emit_data(&app, &id, &show); }
                                     // Auto-answer a sudo/su prompt so hidden commands don't hang.
                                     let pw_send = cap.take_password_send();
                                     if cap.done() { finish(capture.take(), Ok(())); }
@@ -344,11 +380,11 @@ impl SshSession {
                             }
                         }
                         Some(ChannelMsg::ExitStatus { exit_status }) => {
-                            out.flush();
+                            out.flush_close();
                             SessionManager::emit_closed(&app, &id, &format!("exit {exit_status}"));
                         }
                         Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
-                            out.flush();
+                            out.flush_close();
                             SessionManager::emit_closed(&app, &id, "closed");
                             break;
                         }
@@ -362,7 +398,7 @@ impl SshSession {
                         }
                         Some(Cmd::Resize(c, r)) => { let _ = channel.window_change(c as u32, r as u32, 0, 0).await; }
                         Some(Cmd::Capture { line, allow_sudo, reply }) => {
-                            out.flush(); // don't let buffered output land inside the capture window
+                            out.flush_close(); // don't let buffered output land inside the capture window
                             if capture.is_some() {
                                 let _ = reply.send(Err(anyhow!("another hidden command is still running")));
                             } else if channel.data(&line[..]).await.is_err() {
@@ -390,7 +426,7 @@ impl SshSession {
                     }
                     // Flush coalesced output once its window elapses.
                     _ = tokio::time::sleep(flush_due.unwrap_or(std::time::Duration::from_millis(16))), if flush_due.is_some() => {
-                        out.flush();
+                        out.flush_timer();
                     }
                 }
                 // A hidden command just finished: flush any input queued during it.

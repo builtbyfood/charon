@@ -219,10 +219,15 @@ Keep `package-lock.json` in the copy so both sides resolve identical JS deps;
 test`, `npm test`, then `tauri-action` bundles NSIS (Windows) and deb/rpm/AppImage
 (Linux). Artefacts upload on every run; **pushing a `v*` tag** additionally drafts
 a GitHub release with the installers, both bundles, and the portable zip/tarball
-attached. The separate `macos` job runs **on tags only** (bundles are heavier and
-unsigned): one runner per architecture — `macos-14` for Apple Silicon (arm64),
-`macos-13` for Intel (x86_64) — each producing a host-arch `.dmg` attached to the
-same draft release. Cut a release from a green `main`:
+attached. The separate `macos` job builds on every push/PR too — two jobs on the
+Apple Silicon `macos-latest` runner, one native arm64 and one cross-compiled for
+Intel (`--target x86_64-apple-darwin`; GitHub retired the Intel `macos-13` image) —
+each producing a `.dmg`; on a `v*` tag those dmgs are also attached to the draft
+release. On a tag a small `release` job creates the draft once and every build job
+uploads into it by id (parallel jobs creating it themselves race into duplicates).
+`.gitattributes` forces LF on every checkout: Windows runners default to CRLF,
+which would break the `?raw`-embedded shell hooks on remote shells. Cut a release
+from a green `main`:
 
 ```bash
 git tag v0.2.0 && git push origin v0.2.0

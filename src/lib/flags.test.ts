@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { flagsFromHelp, flagsFromTldr, mergeFlags, matchFlags, flagAccept, runFlagAccept } from "./flags.ts";
+import { flagsFromHelp, flagsFromTldr, mergeFlags, matchFlags, flagAccept, runFlagAccept, PickerGate, isSingleKeypress, type Flag } from "./flags.ts";
+import { cmdContext } from "./cmdline.ts";
 
 test("flagsFromHelp parses common --help layouts", () => {
   const help = [
@@ -123,4 +124,108 @@ test("runFlagAccept passes through (no send) on an exact match, still closes + r
   assert.equal(r.consumed, false);
   assert.deepEqual(calls.sent, []);
   assert.ok(calls.focus >= 1 && calls.close >= 1);
+});
+
+// A minimal shell + Terminal.svelte picker loop: the shell echoes input, runs a
+// line on CR/LF and prints a fresh prompt (133;B → gate.prompt()); after every
+// echo the picker evaluates (the debounced cursor-move hook); a typed Enter is
+// steered by the popup exactly as attachCustomKeyEventHandler does.
+function harness(flags: Flag[], gated: boolean) {
+  const gate = new PickerGate();
+  const ran: string[] = [];
+  const logs: string[] = [];
+  let line = "";
+  let popup: { token: string; list: Flag[] } | null = null;
+  const evalPicker = () => {
+    const b = gate.blocked();
+    if (gated && b) { if (gate.shouldLog()) logs.push(`[charon] flags: suppressed reason=${b}`); popup = null; return; }
+    const ctx = cmdContext(line);
+    popup = ctx ? { token: ctx.token, list: matchFlags(flags, ctx.token) } : null;
+  };
+  const shell = (bytes: string) => {
+    for (const ch of bytes.replace(/\x1b\[20[01]~/g, "")) {
+      if (ch === "\r" || ch === "\n") { ran.push(line); line = ""; gate.prompt(); }
+      else line += ch;
+    }
+    evalPicker();
+  };
+  return {
+    ran, logs, get popup() { return popup; }, get line() { return line; },
+    /** pasteToSession → writePaste (bracketed, pasteRun=auto keeps no trailing \n here). */
+    paste(text: string) {
+      if (gated) { gate.pasteBegin(); popup = null; }
+      gate.send(() => gate.input(text));   // term.paste → onData, synchronous
+      shell(text);                           // the shell's echo/prompts arrive later
+    },
+    /** A typed key: the key handler first, then (if not swallowed) onData. */
+    key(d: string) {
+      if (d === "\r" && popup) {
+        const r = runFlagAccept(popup.token, popup.list, 0, { send: (s) => { line += s; }, focus: () => {}, close: () => { popup = null; } });
+        if (r.consumed) return;            // Enter swallowed by the popup
+      }
+      gate.input(d);
+      shell(d);
+    },
+  };
+}
+// Any list whose top match for `--all` isn't `--all` itself makes Enter insert, not run.
+const ALL_FLAGS: Flag[] = [{ names: ["--all-files"], from: "help" }, { names: ["-a", "--all"], from: "help" }];
+
+test("paste ending in a flag: without the gate the popup opens and eats Enter (the bug)", () => {
+  const h = harness(ALL_FLAGS, false);
+  h.paste("cd /tmp\nls --all");
+  assert.ok(h.popup, "popup opened on pasted text");
+  h.key("\r");
+  assert.deepEqual(h.ran, ["cd /tmp"], "last line did not run");
+});
+
+test("paste text ending in --all → no popup, all lines execute", () => {
+  const h = harness(ALL_FLAGS, true);
+  h.paste("cd /tmp\nls --all");
+  assert.equal(h.popup, null);
+  h.key("\r");
+  assert.deepEqual(h.ran, ["cd /tmp", "ls --all"]);
+  assert.equal(h.popup, null);
+  assert.deepEqual(h.logs, ["[charon] flags: suppressed reason=paste"]);
+});
+
+test("paste closes an already-open popup, and typing after the next prompt re-enables it", () => {
+  const h = harness(ALL_FLAGS, true);
+  for (const c of "ls --a") h.key(c);
+  assert.ok(h.popup, "typed flag opens the picker");
+  h.paste("ll\n");
+  assert.equal(h.popup, null);
+  for (const c of "ls -") h.key(c);
+  assert.ok(h.popup, "prompt after the pasted newline ended suppression; typed keys evaluate");
+});
+
+test("pasted line without newline stays suppressed for typed keys until the next prompt", () => {
+  const h = harness(ALL_FLAGS, true);
+  h.paste("ls");
+  for (const c of " --a") h.key(c);
+  assert.equal(h.popup, null);
+  h.key("\r");
+  for (const c of "ls --a") h.key(c);
+  assert.ok(h.popup);
+});
+
+test("cancelled paste lifts suppression; the gate ignores the paste's own echo", () => {
+  const g = new PickerGate();
+  g.pasteBegin();
+  g.send(() => g.input("x"));               // single-char paste echo is not a keypress
+  g.prompt();
+  assert.equal(g.blocked(), "paste");
+  g.input("a");
+  assert.equal(g.blocked(), null);
+  g.pasteBegin(); g.pasteCancelled();
+  assert.equal(g.blocked(), "paste");       // last input was the paste…
+  g.input("-");
+  assert.equal(g.blocked(), null);          // …until the user types
+  g.input("bulk text from an IME");
+  assert.equal(g.blocked(), "bulk");
+});
+
+test("isSingleKeypress", () => {
+  for (const k of ["a", "-", "\r", "\x7f", "😀", "\x1b[A", "\x1bOA", "\x1b[3~", "\x1b[1;5C", "\x1bb"]) assert.ok(isSingleKeypress(k), JSON.stringify(k));
+  for (const k of ["ls", "cd /tmp\n", "\x1b[200~x\x1b[201~"]) assert.ok(!isSingleKeypress(k), JSON.stringify(k));
 });

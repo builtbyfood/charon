@@ -332,8 +332,10 @@ export function injectionFor(shell: Shell): string {
 /**
  * Drops session output while an injection is being echoed, until INJECT_END
  * (which may straddle chunks) or a safety timeout. Bytes after the sentinel pass
- * through, preceded by CR LF so the next prompt lands on a fresh line as it
- * would after an empty Enter.
+ * through, preceded by CR + erase-line (`\r\x1b[2K`) so the freshly-hooked prompt
+ * overwrites the original prompt still on screen — otherwise the injection leaves
+ * two prompts stacked (the "double bash" on first connect), since the echo of the
+ * typed hook is swallowed and never advanced xterm's cursor off that first line.
  */
 export class InjectionSwallower {
   private active = false;
@@ -355,7 +357,9 @@ export class InjectionSwallower {
       return new Uint8Array(0);
     }
     this.active = false; this.tail = [];
-    return new Uint8Array([0x0d, 0x0a, ...buf.slice(at + INJECT_END_BYTES.length)]);
+    // \r \x1b [ 2 K : return to column 0 and clear the line the stale prompt is on,
+    // so the new hooked prompt replaces it instead of appearing beneath it.
+    return new Uint8Array([0x0d, 0x1b, 0x5b, 0x32, 0x4b, ...buf.slice(at + INJECT_END_BYTES.length)]);
   }
 }
 

@@ -166,3 +166,47 @@ function dedupe(flags: Flag[]): Flag[] {
     return true;
   });
 }
+
+/** Decides whether the flag picker may evaluate. It only ever reacts to typed
+ *  keystrokes: a paste suppresses it from the moment it begins until the next
+ *  133;B prompt after the send, and any input that wasn't a single keypress
+ *  (a paste, an IME burst) keeps it closed until the user types again. */
+export class PickerGate {
+  private suppressed = false;
+  private sending = false;
+  private last: "key" | "paste" | "bulk" = "key";   // kind of the last input event
+  private logged = false;          // one log line per suppression
+
+  /** A paste is starting (before the guard bar / queue / send). */
+  pasteBegin(): void { this.suppressed = true; this.last = "paste"; this.logged = false; }
+  /** Wrap the actual write so its onData echo isn't mistaken for a keypress. */
+  send(fn: () => void): void {
+    this.sending = true;
+    try { fn(); } finally { this.sending = false; }
+  }
+  /** A paste was cancelled at the guard bar: nothing was sent, nothing to wait for. */
+  pasteCancelled(): void { this.suppressed = false; }
+  /** 133;B — a fresh prompt. Ends a paste's suppression once its send is done. */
+  prompt(): void { if (!this.sending) this.suppressed = false; }
+  /** Every xterm onData. Outside a paste send, classify it as keypress or bulk. */
+  input(d: string): void {
+    if (this.sending) return;
+    this.last = isSingleKeypress(d) ? "key" : "bulk";
+    if (this.last === "key") this.logged = false;
+  }
+  /** null → may evaluate; otherwise the reason it may not. */
+  blocked(): "paste" | "bulk" | null {
+    if (this.suppressed || this.last === "paste") return "paste";
+    if (this.last === "bulk") return "bulk";
+    return null;
+  }
+  /** True the first time a given suppression is hit (so the log isn't per-cursor-move). */
+  shouldLog(): boolean { if (this.logged) return false; this.logged = true; return true; }
+}
+
+/** One key's worth of terminal input: a single character (incl. a surrogate
+ *  pair) or one escape sequence (arrows, Alt+x, F-keys). */
+export function isSingleKeypress(d: string): boolean {
+  if ([...d].length === 1) return true;
+  return /^\x1b(\[[0-9;?]*[ -\/]*[@-~]|O.|.)$/s.test(d);
+}

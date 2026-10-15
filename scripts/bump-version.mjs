@@ -26,22 +26,33 @@ if (arg && !SEMVER.test(arg)) {
 }
 
 // tauri.conf.json is canonical. If a version was passed, write it there first.
-const tauriConf = JSON.parse(readFileSync(tauriConfPath, "utf8"));
-if (arg) {
-  tauriConf.version = arg;
-  writeFileSync(tauriConfPath, JSON.stringify(tauriConf, null, 2) + "\n");
+// JSON files are edited in place (the top-level "version" line only) so their hand
+// formatting survives; re-serialising would reflow every array.
+const TOP_VERSION = /^(  "version":\s*")([^"]*)(")/m;
+function setJsonVersion(text, v) {
+  let was = null;
+  const next = text.replace(TOP_VERSION, (_m, a, old, b) => { was = old; return a + v + b; });
+  return { next, was };
 }
-const version = tauriConf.version;
+const tauriText = readFileSync(tauriConfPath, "utf8");
+if (arg) writeFileSync(tauriConfPath, setJsonVersion(tauriText, arg).next);
+const version = arg ?? JSON.parse(tauriText).version;
 if (!SEMVER.test(version)) {
   console.error(`bump-version: tauri.conf.json version "${version}" is not valid semver`);
   process.exit(1);
 }
 
 // package.json — keep every other field byte-for-byte; only the version changes.
-const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
-const pkgWas = pkg.version;
-pkg.version = version;
-writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + "\n");
+const pkgSet = setJsonVersion(readFileSync(pkgPath, "utf8"), version);
+const pkgWas = pkgSet.was;
+writeFileSync(pkgPath, pkgSet.next);
+
+// package-lock.json — the root package's version: top level and under packages[""].
+const lockPath = join(root, "package-lock.json");
+const lockNext = readFileSync(lockPath, "utf8")
+  .replace(TOP_VERSION, `$1${version}$3`)
+  .replace(/("packages":\s*\{\s*"":\s*\{[^}]*?"version":\s*")[^"]*(")/, `$1${version}$2`);
+writeFileSync(lockPath, lockNext);
 
 // Cargo.toml — rewrite only the first `version = "..."` (the [package] one).
 const cargo = readFileSync(cargoPath, "utf8");
@@ -59,5 +70,6 @@ writeFileSync(cargoPath, cargoNext);
 console.log(`version → ${version}`);
 console.log(`  tauri.conf.json ${arg ? "(set, canonical)" : "(source)"}`);
 console.log(`  package.json    ${pkgWas} → ${version}`);
+console.log(`  package-lock    → ${version}`);
 console.log(`  Cargo.toml      ${cargoWas} → ${version}`);
 console.log("Note: run a build so Cargo.lock records the new package version.");

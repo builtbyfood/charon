@@ -24,14 +24,23 @@ pub struct AppInfo {
     pub version: String,
     pub portable: bool,
     pub data_dir: String,
+    /// "windows" | "macos" | "linux" — the UI gates the local sudo button (no tty
+    /// password under Windows UAC).
+    pub os: String,
+    /// Current OS user, the login user for a local sudo prompt.
+    pub user: String,
 }
 
 #[tauri::command]
 pub fn app_info(state: State<'_, AppState>) -> AppInfo {
+    let os = if cfg!(windows) { "windows" } else if cfg!(target_os = "macos") { "macos" } else { "linux" };
+    let user = std::env::var("USERNAME").or_else(|_| std::env::var("USER")).unwrap_or_default();
     AppInfo {
         version: env!("CARGO_PKG_VERSION").into(),
         portable: state.paths.portable,
         data_dir: state.paths.data_dir.display().to_string(),
+        os: os.into(),
+        user,
     }
 }
 
@@ -272,7 +281,18 @@ pub async fn session_open_local(state: State<'_, AppState>, req: OpenLocal) -> C
     } else {
         (shell.clone(), vec![])
     };
-    let params = LocalParams { shell: Some(program), args, cwd: req.cwd.or(eff.cwd), cols: req.cols, rows: req.rows };
+    // Optional sudo password (Unix): the node's credential, else the bare-Local
+    // profile setting. Best-effort — a missing/locked/non-password credential just
+    // means no sudo button. LocalSession ignores it on Windows (UAC).
+    let cred_name = eff.credential.clone().or_else(|| {
+        let c = state.profile.read().unwrap().local.credential.trim().to_string();
+        (!c.is_empty()).then_some(c)
+    });
+    let sudo_password = cred_name.and_then(|name| match state.vault.get(&name) {
+        Ok(Some(Secret { kind: SecretKind::Password, value, .. })) => Some(value),
+        _ => None,
+    });
+    let params = LocalParams { shell: Some(program), args, cwd: req.cwd.or(eff.cwd), cols: req.cols, rows: req.rows, sudo_password };
     let sess = LocalSession::spawn(state.sessions.app().clone(), id.clone(), params).map_err(err)?;
     let title = if req.admin { format!("{} (admin)", basename(&shell)) } else { basename(&sess.program) };
     let mut info = SessionInfo::new(id, title, "local");

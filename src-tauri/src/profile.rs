@@ -92,6 +92,13 @@ section!(Sudo {
     auto_send: bool = false,
 });
 
+section!(Local {
+    /// Vault entry name whose password the bare "Local" shell (no saved node)
+    /// offers to a sudo/su prompt (Unix). Empty = none. Saved local nodes use
+    /// their own credential instead.
+    credential: String = "".into(),
+});
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Profile {
@@ -109,6 +116,8 @@ pub struct Profile {
     pub files: Files,
     #[serde(default)]
     pub sudo: Sudo,
+    #[serde(default)]
+    pub local: Local,
     /// Sections this build does not model yet (docs, …) pass through untouched.
     #[serde(flatten)]
     pub extra: toml::Table,
@@ -127,6 +136,7 @@ impl Default for Profile {
             mcp: Default::default(),
             files: Default::default(),
             sudo: Default::default(),
+            local: Default::default(),
             extra: toml::Table::new(),
         }
     }

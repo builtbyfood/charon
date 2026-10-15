@@ -19,6 +19,9 @@ pub struct LocalParams {
     pub cwd: Option<String>,
     pub cols: u16,
     pub rows: u16,
+    /// Stored password offered (never shown) to a sudo/su prompt in this shell, on
+    /// Unix. From the node's credential or the `local.credential` profile setting.
+    pub sudo_password: Option<String>,
 }
 
 pub struct LocalSession {
@@ -27,6 +30,10 @@ pub struct LocalSession {
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     /// Basename of what was launched, for the tab title.
     pub program: String,
+    /// Stored sudo password (Unix), offered to a sudo/su prompt; never shown.
+    /// Read only under cfg(unix); harmless and unused on Windows.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    sudo_password: Option<String>,
 }
 
 /// First shell on PATH from the platform's preference list.
@@ -215,35 +222,27 @@ impl LocalSession {
         let sink = Arc::new(sink);
         let closed = Arc::new(AtomicBool::new(false));
         let short = &id[..8.min(id.len())];
-        // Emitter thread coalesces reads into ≤ 1 sink.data call per 16 ms, so a
-        // flood (yes | head -c 5M) becomes a handful of events, not thousands.
+        // Emitter thread coalesces reads into ≤ 1 sink.data call per 16 ms (same
+        // Coalescer as SSH), so a flood becomes a handful of events. It waits only
+        // as long as a buffered tail is due, then flushes even with no more reads —
+        // so a paste echo never sits unrendered waiting for the next chunk.
         let (dtx, drx) = std::sync::mpsc::channel::<Vec<u8>>();
         {
             let sink = sink.clone();
+            let co_id = format!("local:{short}");
             std::thread::Builder::new()
                 .name(format!("pty-emit-{short}"))
                 .spawn(move || {
                     use std::sync::mpsc::RecvTimeoutError;
-                    let window = std::time::Duration::from_millis(16);
-                    let mut acc: Vec<u8> = Vec::new();
-                    let mut last = std::time::Instant::now() - window;
+                    let mut co = crate::session::Coalescer::new(co_id, move |b: &[u8]| sink.data(b));
                     loop {
-                        match drx.recv_timeout(window) {
-                            Ok(chunk) => {
-                                acc.extend_from_slice(&chunk);
-                                if last.elapsed() >= window || acc.len() >= 64 * 1024 {
-                                    sink.data(&acc);
-                                    acc.clear();
-                                    last = std::time::Instant::now();
-                                }
-                            }
-                            Err(RecvTimeoutError::Timeout) => {
-                                if !acc.is_empty() { sink.data(&acc); acc.clear(); last = std::time::Instant::now(); }
-                            }
-                            Err(RecvTimeoutError::Disconnected) => {
-                                if !acc.is_empty() { sink.data(&acc); }
-                                break;
-                            }
+                        // Block indefinitely when nothing is buffered; otherwise only
+                        // until the tail is due.
+                        let wait = co.due_in().unwrap_or(std::time::Duration::from_secs(3600));
+                        match drx.recv_timeout(wait) {
+                            Ok(chunk) => co.push(&chunk),
+                            Err(RecvTimeoutError::Timeout) => co.flush_timer(),
+                            Err(RecvTimeoutError::Disconnected) => { co.flush_close(); break; }
                         }
                     }
                 })
@@ -297,6 +296,7 @@ impl LocalSession {
             writer: Mutex::new(writer),
             killer: Mutex::new(killer),
             program,
+            sudo_password: p.sudo_password,
         }))
     }
 }
@@ -326,6 +326,20 @@ impl Session for LocalSession {
     async fn fs(&self) -> Result<Arc<dyn crate::sftp::Fs>> {
         Ok(Arc::new(crate::sftp::LocalFs))
     }
+
+    /// Password offered (never shown) to a sudo/su prompt in this shell. Unix only:
+    /// Windows elevation is UAC, which takes no tty password, so a local Windows
+    /// shell exposes none (the UI also hides the button there).
+    async fn ssh_password(&self) -> Option<String> {
+        #[cfg(unix)]
+        {
+            self.sudo_password.clone()
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -353,7 +367,7 @@ mod tests {
         let (shell, args) = ("cmd.exe", vec!["/c".to_string(), "echo charon-pty-ok".to_string()]);
         #[cfg(not(windows))]
         let (shell, args) = ("/bin/sh", vec!["-c".to_string(), "echo charon-pty-ok".to_string()]);
-        let p = LocalParams { shell: Some(shell.into()), args, cwd: None, cols: 80, rows: 24 };
+        let p = LocalParams { shell: Some(shell.into()), args, cwd: None, cols: 80, rows: 24, sudo_password: None };
         let sess = LocalSession::spawn_with(ChanSink(Mutex::new(tx)), "test-session", p).unwrap();
         // The resolver turns the shell into an absolute path (even a bare name),
         // so the session reports that resolved path.
