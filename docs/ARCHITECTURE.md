@@ -46,6 +46,19 @@ move fails, `undetach` releases the hold and the tab stays. Dragging uses pointe
 events, not HTML5 drag-and-drop: the native file-drop handler turns that off in
 the webview on Windows.
 
+## Linux (WebKitGTK) workarounds
+
+- `WEBKIT_DISABLE_DMABUF_RENDERER=1` is set before the webview starts unless the
+  user set it (`lib.rs`).
+- Frame callbacks can stall on Wayland until an input event arrives. `main.ts`
+  wraps `requestAnimationFrame` on Linux (`rafguard.ts`) so each request also arms
+  a 50 ms timer; the first of the two runs the callback. xterm's render debouncer,
+  Monaco and everything else get frames without input.
+- Clipboard text goes through `clipboard_read` / `clipboard_write`
+  (`clipboard.rs`): GTK's clipboard on the main thread on Linux, the clipboard
+  plugin elsewhere. The plugin's Wayland path needs wlr-data-control, which GNOME
+  lacks.
+
 ## Talking to a remote host
 
 One SSH connection carries several channels; which one a feature uses matters.

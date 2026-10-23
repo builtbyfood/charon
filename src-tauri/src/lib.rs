@@ -1,6 +1,7 @@
 //! Charon backend. Tauri commands live in `commands.rs`; everything else is plain Rust
 //! so it can be unit-tested and later reused by the MCP server without the UI.
 
+pub mod clipboard;
 pub mod commands;
 pub mod connections;
 pub mod docs;
@@ -194,6 +195,8 @@ pub fn run() {
             commands::tab_window_open,
             commands::tab_send,
             commands::window_close_self,
+            commands::clipboard_read,
+            commands::clipboard_write,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Charon");

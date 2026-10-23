@@ -625,7 +625,7 @@ dependencies = [
 
 [[package]]
 name = "charon"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "aes",
  "age",
@@ -639,6 +639,7 @@ dependencies = [
  "filetime",
  "flate2",
  "futures",
+ "gtk",
  "hmac",
  "keyring",
  "portable-pty",

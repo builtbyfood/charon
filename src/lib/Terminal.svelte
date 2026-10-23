@@ -30,7 +30,6 @@
   import { WebglAddon } from "@xterm/addon-webgl";
   import { SearchAddon } from "@xterm/addon-search";
   import { SerializeAddon } from "@xterm/addon-serialize";
-  import { writeText, readText } from "@tauri-apps/plugin-clipboard-manager";
   import {
     openSsh, openLocal, openSerial, sessionWrite, sessionSetShell, sessionSetCwd, sessionResize, sessionClose, onSessionData, onSessionClosed,
     sessionHold, sessionRelease, isOpenError, vaultSet, linkCredential, notifyChanged, onHostKeyPrompt, sshHostKeyAnswer, hostkeyForget, sshKeygenRemove,
@@ -45,7 +44,7 @@
   import { attachOsc7 } from "./cwdtrack";
   import { findLinks, parseOsc52, type Row } from "./links";
   import FlagPopup from "./FlagPopup.svelte";
-  import { helpFetch, onMcpScrollback, mcpAnswer, openUrl } from "./api";
+  import { helpFetch, onMcpScrollback, mcpAnswer, openUrl, readText, writeText } from "./api";
   import { cmdContext, currentCommand } from "./cmdline";
   import { tldrPage, preloadTldr } from "./tldr";
   import { flagsFromHelp, flagsFromTldr, mergeFlags, matchFlags, runFlagAccept, PickerGate, type Flag } from "./flags";
@@ -931,7 +930,9 @@
 
   async function copySelection() {
     const sel = term.getSelection();
-    if (sel) await writeText(cleanForCopy(sel, { smartQuotes: prefs.smartQuotesToAscii, trimTrailing: prefs.trimTrailingWhitespace }));
+    if (!sel) return;
+    try { await writeText(cleanForCopy(sel, { smartQuotes: prefs.smartQuotesToAscii, trimTrailing: prefs.trimTrailingWhitespace })); }
+    catch (e) { console.warn(`[charon] clipboard: write failed: ${e}`); }
   }
   /** Pixel anchor (fixed coords) just below the end of the selection; falls back to
    *  the terminal's bottom-right when the end is scrolled off or internals move. */
@@ -1020,7 +1021,9 @@
     pasteGuard = null; pickerGate.pasteCancelled(); term.focus();
   }
   async function pasteFromClipboard(route: string) {
-    pasteToSession(await readText(), route);
+    let text: string;
+    try { text = await readText(); } catch (e) { console.warn(`[charon] clipboard: read failed route=${route}: ${e}`); return; }
+    pasteToSession(text, route);
   }
 
   // ---- sudo password prompt (T3)

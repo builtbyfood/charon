@@ -586,6 +586,16 @@ pub fn window_close_self(window: tauri::WebviewWindow) -> CmdResult<()> {
     window.close().map_err(err)
 }
 
+#[tauri::command]
+pub async fn clipboard_read(app: tauri::AppHandle) -> CmdResult<String> {
+    crate::clipboard::read_text(&app).await.map_err(err)
+}
+
+#[tauri::command]
+pub async fn clipboard_write(app: tauri::AppHandle, text: String) -> CmdResult<()> {
+    crate::clipboard::write_text(&app, text).await.map_err(err)
+}
+
 fn whoami() -> String {
     std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "root".into())
 }

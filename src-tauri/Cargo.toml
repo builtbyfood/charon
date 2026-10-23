@@ -1,6 +1,6 @@
 [package]
 name = "charon"
-version = "0.2.6"
+version = "0.2.7"
 description = "Connection manager, terminal, editor and MCP bridge for engineers"
 authors = ["Travis DeLuca"]
 license = "Apache-2.0"
@@ -62,6 +62,10 @@ flate2 = "1"
 filetime = "0.2"     # preserve mtime on downloaded files
 tar = "0.4"          # ShellFs whole-tree download (tar -cf - | base64)
 futures = "0.3"      # bounded-concurrency transfer pool
+
+# clipboard.rs: GTK clipboard (works on Wayland); same version tauri/wry use.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"

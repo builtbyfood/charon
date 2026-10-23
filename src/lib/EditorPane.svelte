@@ -4,9 +4,8 @@
   // back through file_write, which replaces atomically.
   import { onMount, onDestroy } from "svelte";
   import { open as pickOpen, save as pickSave } from "@tauri-apps/plugin-dialog";
-  import { readText } from "@tauri-apps/plugin-clipboard-manager";
   import { monaco, languageFor, languageIds, registerEditorExtras } from "./monaco";
-  import { fileRead, fileWrite, isPermissionError, sftpSudoOpen, type Encoding, type Eol, type FsVia } from "./api";
+  import { fileRead, fileWrite, isPermissionError, sftpSudoOpen, readText, type Encoding, type Eol, type FsVia } from "./api";
   import { canRetryAsSudo, ensureSudo } from "./sudoedit";
   import { cleanForCopy } from "./clipboard";
   import { basename } from "./paths";

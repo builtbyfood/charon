@@ -15,7 +15,7 @@
   <a href="CHANGELOG.md">Changelog</a>
 </p>
 
-<!-- screenshot: main window — connection tree on the left with a colored folder, an SSH tab
+<!-- screenshot: main window — connection tree on the left with a coloured folder, an SSH tab
      with a few command marks in the gutter (one red), Files pane on the right showing the
      "sftp as root (sudo)" badge. ~1600px wide, dark theme. -->
 ![Charon main window](docs/img/screenshot-main.png)
@@ -33,12 +33,12 @@ Single Rust + Tauri codebase. No Electron, no Java, no bundled Cygwin.
 
 ## Highlights
 
-**Connection tree with inheritance.** Folders carry user, credential, jump host, color,
+**Connection tree with inheritance.** Folders carry user, credential, jump host, colour,
 tags and startup commands; hosts inside inherit them. Set a bastion on the `prod` folder
 once. Import from `~/.ssh/config`, PuTTY (registry or files) and MobaXterm `.mxtsessions`,
 with a duplicate preview before anything is written. `.ppk` keys are read natively.
 
-<!-- screenshot: sidebar with two folders expanded, inherited color dots, and the host
+<!-- screenshot: sidebar with two folders expanded, inherited colour dots, and the host
      editor open showing greyed "inherit: travis" placeholders. ~900px wide. -->
 ![Connection tree and host editor](docs/img/screenshot-tree.png)
 

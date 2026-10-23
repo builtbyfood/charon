@@ -184,6 +184,10 @@ export const tabWindowOpen = (token: string, x: number, y: number, width: number
   invoke<string>("tab_window_open", { token, x, y, width, height });
 export const tabSend = (label: string, token: string, x: number, y: number) => invoke<void>("tab_send", { label, token, x, y });
 export const windowCloseSelf = () => invoke<void>("window_close_self");
+// Clipboard text goes through the backend: GTK on Linux (works on Wayland), the
+// clipboard plugin elsewhere — see clipboard.rs.
+export const readText = () => invoke<string>("clipboard_read");
+export const writeText = (text: string) => invoke<void>("clipboard_write", { text });
 /** A tab arrives in this window: `x`,`y` = drop point (physical px), for its place in the tab bar. */
 export interface TabAdopt { token: string; x: number; y: number }
 export function onTabAdopt(cb: (p: TabAdopt) => void): Promise<UnlistenFn> {

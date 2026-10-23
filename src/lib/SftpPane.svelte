@@ -5,7 +5,6 @@
   import { onMount, onDestroy, untrack } from "svelte";
   import { open as pickOpen } from "@tauri-apps/plugin-dialog";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
-  import { writeText } from "@tauri-apps/plugin-clipboard-manager";
   import {
     sftpHome, sftpList, sftpMkdir, sftpRename, sftpDelete, sftpChmod,
     sftpGetTree, sftpPutTree, sftpCancel, onTreeEvent,
@@ -14,7 +13,7 @@
   import ContextMenu, { type MenuItem } from "./ContextMenu.svelte";
   import { joinPath, crumbsOf, osc7ToLocal, humanSize, modeString } from "./paths";
   import { followTarget, pushTarget } from "./panecwd";
-  import { isPermissionError, sftpSudoOpen, sftpSudoHasPassword, sftpSudoClear, type FsVia } from "./api";
+  import { isPermissionError, sftpSudoOpen, sftpSudoHasPassword, sftpSudoClear, writeText, type FsVia } from "./api";
   import { ensureSudo } from "./sudoedit";
 
   let { session, cwd, color, sshUser, shellUser, isIdle, parallel, onopen, onchdir, onclose }: {

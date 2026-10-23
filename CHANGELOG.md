@@ -4,6 +4,20 @@ All notable changes to Charon are recorded here. Versions follow semver; the
 canonical version lives in `src-tauri/tauri.conf.json` and is propagated to
 `package.json` and `Cargo.toml` by `npm run bump` (`scripts/bump-version.mjs`).
 
+## 0.2.7
+
+### Linux
+- **Output no longer waits for a keypress** (Fedora / GNOME Wayland): WebKitGTK
+  could stop running frame callbacks until the next key or click, so `echo hello`
+  or a running `ping` showed up one update late. Every frame request now also
+  arms a 50 ms timer that renders if the frame never comes (terminal, file pane
+  and editor alike). The dev console logs `[charon] raf: native=… fallback=…`
+  when the timer had to step in.
+- **Copy and paste work on Wayland**: the terminal, file pane and editor read and
+  write the clipboard through GTK instead of the clipboard plugin, whose Wayland
+  path needs a protocol GNOME doesn't offer. Failures now log
+  `[charon] clipboard: … failed`.
+
 ## 0.2.6
 
 ### Tabs and windows

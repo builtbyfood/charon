@@ -2,8 +2,7 @@
   // Settings → MCP: enable/disable the server, show/regenerate the token, copy a
   // client config, and watch the live call log with tier decisions.
   import { onMount, onDestroy } from "svelte";
-  import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-  import { mcpStatus, mcpSetEnabled, mcpRegenToken, mcpConfig, mcpLog, type McpStatus, type McpLogLine } from "./api";
+  import { writeText, mcpStatus, mcpSetEnabled, mcpRegenToken, mcpConfig, mcpLog, type McpStatus, type McpLogLine } from "./api";
 
   let { onclose }: { onclose: () => void } = $props();
 
