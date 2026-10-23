@@ -82,6 +82,8 @@
               <span class="dec dec-{l.decision}">{l.decision}</span>
               <span class="dim">{l.tier}{l.session ? ` · ${l.session.slice(0, 8)}` : ""}</span>
               <span class="det">{l.exit_code !== undefined && l.exit_code !== null ? `exit ${l.exit_code} · ` : ""}{l.duration_ms}ms</span>
+              {#if l.subject}<div class="subj" title={l.subject}>{l.subject}</div>{/if}
+              {#if l.error}<div class="subj why" title={l.error}>{l.error}</div>{/if}
             </div>
           {/each}
           {#if !log.length}<div class="dim">no calls yet</div>{/if}
@@ -114,6 +116,8 @@
   .dec-allow, .dec-approved { color: #5fd38a; }
   .dec-deny, .dec-denied { color: var(--danger); }
   .det { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg-dim); }
+  .subj { grid-column: 2 / -1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg); }
+  .subj.why { color: var(--danger); }
   .err { color: var(--danger); margin: 0; }
   .foot { display: flex; justify-content: flex-end; }
   button { padding: 2px 8px; }

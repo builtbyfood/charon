@@ -16,6 +16,7 @@ pub mod profile;
 pub mod session;
 pub mod sftp;
 pub mod ssh;
+pub mod tabmove;
 pub mod textfile;
 pub mod transfer;
 pub mod vault;
@@ -34,6 +35,8 @@ pub struct AppState {
     /// Root SFTP sessions opened via sudo (P6), keyed by session id.
     pub sudo_fs: tokio::sync::Mutex<std::collections::HashMap<String, Arc<dyn sftp::Fs>>>,
     pub mcp: mcp::McpShared,
+    /// Tabs in flight between windows (`tabmove.rs`).
+    pub tab_stash: tabmove::Stash,
 }
 
 pub fn run() {
@@ -88,6 +91,13 @@ pub fn run() {
                 }
             }
         })
+        // Detached tab windows need the main one (sidebar, MCP approvals, editor):
+        // closing the main window ends the app, closing its tab windows too.
+        .on_window_event(|w, e| {
+            if w.label() == "main" && matches!(e, tauri::WindowEvent::Destroyed) {
+                w.app_handle().exit(0);
+            }
+        })
         .setup(move |app| {
             let store = connections::Store::open(&paths.data_dir.join("charon.db"))?;
             let vault: Arc<dyn vault::Vault> = Arc::from(vault::open(&paths.data_dir, paths.portable)?);
@@ -103,6 +113,7 @@ pub fn run() {
                 transfers: sftp::Transfers::default(),
                 sudo_fs: tokio::sync::Mutex::new(std::collections::HashMap::new()),
                 mcp: Arc::new(mcp::McpState::default()),
+                tab_stash: tabmove::Stash::default(),
             });
             // Start the MCP server if the profile has it enabled.
             {
@@ -131,6 +142,9 @@ pub fn run() {
             commands::vault_list,
             commands::vault_set,
             commands::vault_delete,
+            commands::vault_rename,
+            commands::connection_set_remote_shell,
+            commands::session_shells,
             commands::import_connections,
             commands::import_preview,
             commands::session_open_ssh,
@@ -172,6 +186,14 @@ pub fn run() {
             commands::session_set_cwd,
             commands::session_resize,
             commands::session_close,
+            commands::session_hold,
+            commands::session_release,
+            commands::tab_stash,
+            commands::tab_take,
+            commands::tab_drop_target,
+            commands::tab_window_open,
+            commands::tab_send,
+            commands::window_close_self,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Charon");

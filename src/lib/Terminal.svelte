@@ -6,18 +6,34 @@
     /** Local only: elevated shell (Windows sudo inline / sudo -i). */
     admin?: boolean;
   }
+  /** A terminal moving to another window: its session (kept open), its screen
+   *  serialised at its current size, and the state that is not on screen. */
+  export interface TabSnapshot {
+    sessionId: string | null;
+    status: "up" | "closed";
+    screen: string;
+    cols: number; rows: number;
+    marks: SavedMark[];
+    osc133: boolean; integrationEnabled: boolean; injectDone: boolean; reason: string;
+    shell?: Shell; cwd?: string; program: string; sshUser?: string; promptUser?: string;
+    filesOpen: boolean; filesWidth: number;
+    stamps: Stamp[]; startedShell: string;
+  }
+  import type { SavedMark, Shell } from "./osc133";
+  import type { Stamp } from "./stamps";
 </script>
 
 <script lang="ts">
   import { onMount, onDestroy, untrack } from "svelte";
-  import { Terminal } from "@xterm/xterm";
+  import { Terminal, type IMarker } from "@xterm/xterm";
   import { FitAddon } from "@xterm/addon-fit";
   import { WebglAddon } from "@xterm/addon-webgl";
   import { SearchAddon } from "@xterm/addon-search";
+  import { SerializeAddon } from "@xterm/addon-serialize";
   import { writeText, readText } from "@tauri-apps/plugin-clipboard-manager";
   import {
     openSsh, openLocal, openSerial, sessionWrite, sessionSetShell, sessionSetCwd, sessionResize, sessionClose, onSessionData, onSessionClosed,
-    isOpenError, vaultSet, linkCredential, notifyChanged, onHostKeyPrompt, sshHostKeyAnswer, hostkeyForget, sshKeygenRemove,
+    sessionHold, sessionRelease, isOpenError, vaultSet, linkCredential, notifyChanged, onHostKeyPrompt, sshHostKeyAnswer, hostkeyForget, sshKeygenRemove,
     type HostKeyPrompt, type HostKeyChanged,
   } from "./api";
   import { cleanForCopy, pasteWarnings } from "./clipboard";
@@ -26,16 +42,21 @@
   import type { Prefs } from "./prefs";
   import ContextMenu, { type MenuItem } from "./ContextMenu.svelte";
   import SftpPane from "./SftpPane.svelte";
+  import { attachOsc7 } from "./cwdtrack";
+  import { findLinks, parseOsc52, type Row } from "./links";
   import FlagPopup from "./FlagPopup.svelte";
-  import { helpFetch, onMcpScrollback, mcpAnswer } from "./api";
+  import { helpFetch, onMcpScrollback, mcpAnswer, openUrl } from "./api";
   import { cmdContext, currentCommand } from "./cmdline";
   import { tldrPage, preloadTldr } from "./tldr";
   import { flagsFromHelp, flagsFromTldr, mergeFlags, matchFlags, runFlagAccept, PickerGate, type Flag } from "./flags";
-  import { CommandTracker, InjectionSwallower, detectShell, injectionFor, hookTextFor, looksLikeShellPrompt, looksLikeSudoPrompt, sudoUserOf, sudoAutoEligible, parseOsc7, promptUserOf, type Shell } from "./osc133";
-  import { sudoHasPassword, sudoSendPassword } from "./api";
+  import { CommandTracker, InjectionSwallower, detectShell, injectionFor, hookTextFor, looksLikeShellPrompt, looksLikeSudoPrompt, sudoUserOf, sudoAutoEligible, promptUserOf } from "./osc133";
+  import { sudoHasPassword, sudoSendPassword, sessionShells, connectionSetRemoteShell, type HostShells } from "./api";
+  import { gutterRows, type GutterRow } from "./stamps";
 
-  let { open, color, prefs, active = true, os, osUser, onfontsize, onclosed, onabort, oncwd, onopenfile, onfiles, oncommand }: {
+  let { open, adopt, color, prefs, active = true, os, osUser, onfontsize, ontimestamps, onclosed, onabort, oncwd, onopenfile, onfiles, oncommand }: {
     open: OpenTarget;
+    /** Arrived from another window: restore this instead of connecting. */
+    adopt?: TabSnapshot;
     color?: string;
     prefs: Prefs;
     /** This tab is the visible one. Inactive tabs buffer output and drop their
@@ -48,6 +69,8 @@
     osUser?: string;
     /** Ctrl+= / Ctrl+- changed the size; the owner persists it to the profile. */
     onfontsize: (size: number) => void;
+    /** The timestamps switch was flipped; the owner persists it (all tabs follow prefs). */
+    ontimestamps?: (on: boolean) => void;
     onclosed: (reason: string) => void;
     /** The user rejected the host key: nothing to show, close the tab. */
     onabort: () => void;
@@ -65,12 +88,19 @@
   let term: Terminal;
   let fit: FitAddon;
   let search: SearchAddon;
+  let serializer: SerializeAddon;
+  // Moving to another window: the session stays open (onDestroy must not close it).
+  let handedOff = false;
+  // Resolves when the hold marker (an empty data event) arrives: all output before
+  // the hold has been received, everything after waits in the backend.
+  let holdSeen: (() => void) | null = null;
   let webgl: WebglAddon | null = null;
   let tracker: CommandTracker;
   // Hidden-tab buffering: while inactive we don't touch xterm's parser/renderer;
   // incoming bytes queue here and flush on activation. Capped so a runaway hidden
   // tab (`yes`) can't grow without bound — on overflow we reset + write the tail.
   let pendingWrites: Uint8Array[] = [];
+  let pendingTimes: number[] = [];   // arrival time of each pending chunk (line timestamps)
   let pendingBytes = 0;
   let pendingOverflow = false;
   const HIDDEN_BUF_CAP = 8 * 1024 * 1024;
@@ -141,11 +171,31 @@
   let searchEl = $state<HTMLInputElement | null>(null);
   const SEARCH_OPTS = { decorations: { matchBackground: "#ffb45455", activeMatchBackground: "#ffb454aa", matchOverviewRuler: "#ffb454", activeMatchColorOverviewRuler: "#ffb454" } };
 
+  // Line timestamps: one marker per second in which a line started (see stamps.ts).
+  // Always recorded, so switching the gutter on shows times for earlier output too.
+  let stampMarks: { marker: IMarker; t: number }[] = [];
+  let lastStampSec = -1;
+  // While flushing a hidden tab's buffered output: the time those bytes arrived.
+  let stampClock: number | null = null;
+  let gutter = $state<GutterRow[]>([]);
+  let cellH = $state(0);
+  let gutterFrame = 0;
+  // Shell menu (SSH): what the host offers, and the shell this session started.
+  let hostShells = $state<HostShells | string | null>(null);   // string = why it failed
+  let startedShell = $state("");                                 // "" = login shell
+  let shellOverride: string | undefined;                         // picked from the menu for the next connect
+
   // Right-click menu.
   let menu = $state<{ x: number; y: number; items: MenuItem[] } | null>(null);
 
   // Floating "Copy" button shown near a settled text selection.
   let copyBtn = $state<{ x: number; y: number } | null>(null);
+  /** Short hint shown when a click goes to a program that has the mouse (Claude Code, vim, htop). */
+  let mouseHint = $state(false);
+  let mouseHintShown = false;
+  let mouseHintTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Hovered link, shown as a small "Ctrl+click to open" tip. */
+  let linkTip = $state<{ x: number; y: number; url: string } | null>(null);
   let selTimer: ReturnType<typeof setTimeout> | undefined;
 
   // Paste guard: an inline, non-modal bar (Enter/Esc or buttons) shown when a paste
@@ -197,15 +247,40 @@
       fontSize: prefs.fontSize,
       scrollback: prefs.scrollback,
       allowProposedApi: true,
+      // macOS: Option+drag selects even when a program has the mouse (Shift does elsewhere).
+      macOptionClickForcesSelection: true,
+      // OSC 8 hyperlinks (programs that mark their links explicitly).
+      linkHandler: {
+        activate: (e, uri) => activateLink(e, uri),
+        hover: (e, uri) => showLinkTip(e, uri),
+        leave: () => (linkTip = null),
+        allowNonHttpProtocols: false,
+      },
       theme: { background: "#101215", foreground: "#d7dae0", cursor: color ?? "#6aa2ff", selectionBackground: "#2f4f8a80" },
+      // A moved tab restores its screen at the size it was serialised at, then fits.
+      ...(adopt ? { cols: adopt.cols, rows: adopt.rows } : {}),
     });
     fit = new FitAddon();
     term.loadAddon(fit);
     search = new SearchAddon();
     term.loadAddon(search);
+    serializer = new SerializeAddon();
+    term.loadAddon(serializer);
     term.open(el);
+    // Plain-text URLs, including ones broken over several rows.
+    term.registerLinkProvider({ provideLinks: (y, cb) => cb(linksOnRow(y)) });
+    // OSC 52: a program (Claude Code, tmux, vim with osc52) puts text on the clipboard.
+    // Writing only — a request to read the clipboard (`?`) is ignored.
+    term.parser.registerOscHandler(52, (data) => {
+      const text = parseOsc52(data);
+      if (text !== null && text !== "") {
+        writeText(text).catch(() => {});
+        console.info(`[charon] clipboard: osc52 chars=${text.length}`);
+      }
+      return true;
+    });
     if (active) enableWebgl(); // inactive tabs render on demand once shown
-    fit.fit();
+    if (!adopt) fit.fit();
     preloadTldr();
     term.onCursorMove(() => { clearTimeout(flagEvalTimer); flagEvalTimer = setTimeout(() => { evalFlagPicker(); reportCommand(); }, 60); });
     tracker = new CommandTracker(term, {
@@ -215,10 +290,9 @@
       onprompt: (line) => { pickerGate.prompt(); const u = promptUserOf(line); if (u) promptUser = u; },
     });
     // OSC 7: the hook reports the cwd after every command.
-    term.parser.registerOscHandler(7, (data) => {
-      const dir = parseOsc7(data);
-      if (dir && dir !== cwd) { cwd = dir; if (sessionId) sessionSetCwd(sessionId, dir).catch(() => {}); oncwd?.(dir); }
-      return true;
+    attachOsc7(term, () => cwd, (dir) => {
+      console.info(`[charon] cwd: osc7 ${JSON.stringify(cwd ?? null)} -> ${JSON.stringify(dir)} pane=${filesOpen}`);
+      cwd = dir; if (sessionId) sessionSetCwd(sessionId, dir).catch(() => {}); oncwd?.(dir);
     });
     // Selection: show a floating Copy button and (if enabled) copy — both debounced
     // so dragging a selection doesn't fire a clipboard write / reposition per frame
@@ -233,6 +307,10 @@
       }, 120);
     });
     term.onScroll(() => { if (copyBtn) copyBtn = null; }); // stale position once scrolled
+    term.onLineFeed(recordStamp);
+    term.onRender(scheduleGutter);
+    term.onScroll(scheduleGutter);
+    if (!adopt) recordStamp();
     // No cursor while connecting/authenticating; the remote shell shows it once up.
     term.write(HIDE_CURSOR);
 
@@ -287,13 +365,92 @@
     // Middle-click paste (X11 habit; on by default only on Linux).
     el.addEventListener("auxclick", (e) => { if (e.button === 1 && prefs.middleClickPaste) { e.preventDefault(); pasteFromClipboard("middle-click"); } });
     el.addEventListener("mousedown", (e) => { if (e.button === 1 && prefs.middleClickPaste) e.preventDefault(); });
+    // A program with mouse tracking on (Claude Code, vim, htop) gets clicks, so a
+    // plain drag selects nothing. Right-click (menu / MobaXterm copy-paste) and
+    // middle-click paste stay Charon's: stop them before xterm reports them.
+    // Shift+drag (Option on macOS) still selects; say so on the first plain click.
+    el.addEventListener("mousedown", (e) => {
+      if (term.modes.mouseTrackingMode === "none") return;
+      if (e.button === 2 || (e.button === 1 && prefs.middleClickPaste)) { e.stopPropagation(); return; }
+      if (e.button === 0 && !e.shiftKey && !e.altKey && !mouseHintShown) {
+        mouseHintShown = true; mouseHint = true;
+        clearTimeout(mouseHintTimer); mouseHintTimer = setTimeout(() => (mouseHint = false), 5000);
+        console.info(`[charon] mouse: program has mouse tracking (${term.modes.mouseTrackingMode}); Shift+drag selects`);
+      }
+    }, { capture: true });
 
     term.onData((d) => { pickerGate.input(d); if (sessionId) sessionWrite(sessionId, d); });
     term.onResize(({ cols, rows }) => { if (sessionId) sessionResize(sessionId, cols, rows); });
     perfTimer = setInterval(logPerf, 5000);
 
-    await connect();
+    if (adopt) await restore(adopt);
+    else await connect();
   });
+
+  /** Hand this tab to another window. Holds the session's output in the backend,
+   *  waits until everything before the hold is on screen, and serialises it. The
+   *  receiving window releases the hold; `undetach` undoes this if the move fails. */
+  export async function detach(): Promise<TabSnapshot> {
+    if (status !== "up" && status !== "closed") throw new Error("wait until the tab has connected");
+    if (sessionId && status === "up") {
+      const seen = new Promise<void>((r) => (holdSeen = r));
+      await sessionHold(sessionId);
+      await Promise.race([seen, new Promise((r) => setTimeout(r, 2000))]);
+      holdSeen = null;
+    }
+    flushHidden();
+    await new Promise<void>((r) => term.write("", r));
+    handedOff = true;
+    const snap: TabSnapshot = {
+      sessionId, status: status as "up" | "closed",
+      screen: serializer.serialize(), cols: term.cols, rows: term.rows,
+      marks: tracker.exportMarks(),
+      osc133, integrationEnabled, injectDone, reason, shell, cwd, program, sshUser, promptUser,
+      filesOpen, filesWidth,
+      stamps: stampMarks.filter((s) => !s.marker.isDisposed).map((s) => ({ line: s.marker.line, t: s.t })),
+      startedShell,
+    };
+    console.info(`[charon] tab: detach session=${sessionId} screen=${snap.screen.length} marks=${snap.marks.length}`);
+    return snap;
+  }
+  /** The move failed: keep the tab here and let the held output through. */
+  export function undetach() {
+    handedOff = false;
+    if (sessionId) sessionRelease(sessionId).catch(() => {});
+  }
+
+  /** Arrived from another window: put the screen back, pick up the session. */
+  async function restore(a: TabSnapshot) {
+    await new Promise<void>((r) => term.write(a.screen, r));
+    tracker.importMarks(a.marks);
+    osc133 = a.osc133; markCount = tracker.marks.length; integrationEnabled = a.integrationEnabled;
+    injectDone = a.injectDone; reason = a.reason; shell = a.shell; cwd = a.cwd; program = a.program;
+    sshUser = a.sshUser; promptUser = a.promptUser; filesWidth = a.filesWidth; startedShell = a.startedShell;
+    // Writing the screen back stamped its lines "now"; the real times come with it.
+    for (const st of stampMarks) st.marker.dispose();
+    stampMarks = [];
+    if (term.buffer.active.type === "normal") {
+      const cur = term.buffer.active.baseY + term.buffer.active.cursorY;
+      for (const st of a.stamps) {
+        const marker = term.registerMarker(st.line - cur);
+        if (marker) stampMarks.push({ marker, t: st.t });
+      }
+      lastStampSec = Math.floor((a.stamps.at(-1)?.t ?? 0) / 1000);
+    }
+    if (a.filesOpen && hasFiles) { filesOpen = true; onfiles?.(true); }
+    fit.fit(); // a different window size: the resize reaches the remote (SIGWINCH redraws TUIs)
+    if (a.sessionId && a.status === "up") {
+      sessionId = a.sessionId;
+      status = "up";
+      await listenSession(a.sessionId);
+      await sessionRelease(a.sessionId);
+      if (term.cols !== a.cols || term.rows !== a.rows) sessionResize(a.sessionId, term.cols, term.rows);
+    } else {
+      status = "closed";
+    }
+    console.info(`[charon] tab: adopted session=${a.sessionId} marks=${a.marks.length}`);
+    focusShown();
+  }
 
   /** Connect using the node's vault credential (or `pw` typed inline). */
   /** Re-open the session reusing the same node/host and credentials. */
@@ -327,53 +484,18 @@
         ? await openSerial({ id, node_id: open.nodeId, cols: term.cols, rows: term.rows })
         : await openSsh({
             id, node_id: open.nodeId, host: open.host, user: open.user, port: open.port,
-            password: pw, cols: term.cols, rows: term.rows,
+            password: pw, cols: term.cols, rows: term.rows, remote_shell: shellOverride,
           });
       sessionId = info.id;
       status = "up";
       program = info.title;
-      if (open.kind === "ssh") sshUser = info.title.split("@")[0];
+      if (open.kind === "ssh") { sshUser = info.title.split("@")[0]; startedShell = info.remote_shell ?? ""; }
       if (hasFiles && prefs.filesAutoOpen && !filesOpen) { filesOpen = true; onfiles?.(true); }
       term.write(SHOW_CURSOR);
       integrationEnabled = !!info.shell_integration;
       if (info.shell_integration) injectDeadline = Date.now() + 8000;
       else { reason = "off in settings"; console.info("[charon] 133: detected=none injected=false reason=disabled by node/folder setting"); }
-      unlisteners.push(await onSessionData(info.id, (raw) => {
-        evCount++; byteCount += raw.length;
-        // While the injected hook is being echoed back, show nothing until its end sentinel.
-        const b = swallower.filter(raw);
-        if (!b.length) return;
-        // Hidden tab: don't run the parser/renderer; buffer and flush on activation.
-        if (!active) { bufferHidden(b); return; }
-        // Leaving the alternate screen (vim, htop) can leave a stale cursor cell in
-        // the WebGL atlas; redraw everything once the bytes are processed.
-        const leftAlt = webgl && exitsAltScreen(b);
-        // Run post-parse work in the write callback: term.write is async, so the
-        // buffer (and thus lastLine()) only reflects `b` once this fires. Reading
-        // it synchronously here would see the previous prompt, not a sudo one.
-        term.write(b, () => {
-          if (leftAlt) { webgl?.clearTextureAtlas(); term.refresh(0, term.rows - 1); }
-          maybeSudoPrompt(b);
-        });
-        // An injected/hidden command just stopped being swallowed: release queued pastes.
-        if (pendingPaste.length && !swallower.swallowing) flushPendingPaste();
-        if (integrationEnabled) scheduleQuietCheck(info.id);
-      }));
-      unlisteners.push(await onSessionClosed(info.id, (r) => { status = "closed"; sudoPrompt = null; clearTimeout(sudoAutoTimer); term.write(`\r\n\x1b[2m[${r}]\x1b[0m\r\n${HIDE_CURSOR}`); onclosed(r); }));
-      // MCP read_scrollback: only the Terminal that owns this session answers.
-      unlisteners.push(await onMcpScrollback((p) => {
-        if (p.session !== sessionId) return;
-        flushHidden(); // materialise any output buffered while this tab was hidden
-        if (p.last_n_lines) {
-          const b = term.buffer.active;
-          const lines: string[] = [];
-          const start = Math.max(0, b.baseY + b.cursorY - p.last_n_lines + 1);
-          for (let i = start; i <= b.baseY + b.cursorY; i++) lines.push(b.getLine(i)?.translateToString(true) ?? "");
-          mcpAnswer(p.req_id, { lines: lines.join("\n") });
-        } else {
-          mcpAnswer(p.req_id, { commands: tracker.recent(p.last_n_commands ?? 10) });
-        }
-      }));
+      await listenSession(info.id);
       term.focus();
       if (pw && saveAs.trim()) await saveTypedPassword(pw, saveAs.trim());
       password = "";
@@ -396,6 +518,47 @@
       unHostkey();
       hostkey = null;
     }
+  }
+
+  /** Output, close and MCP scrollback requests for session `id`. */
+  async function listenSession(id: string) {
+    unlisteners.push(await onSessionData(id, (raw) => {
+      if (!raw.length) { holdSeen?.(); return; } // hold marker (tab moving windows)
+      evCount++; byteCount += raw.length;
+      // While the injected hook is being echoed back, show nothing until its end sentinel.
+      const b = swallower.filter(raw);
+      if (!b.length) return;
+      // Hidden tab: don't run the parser/renderer; buffer and flush on activation.
+      if (!active) { bufferHidden(b); return; }
+      // Leaving the alternate screen (vim, htop) can leave a stale cursor cell in
+      // the WebGL atlas; redraw everything once the bytes are processed.
+      const leftAlt = webgl && exitsAltScreen(b);
+      // Run post-parse work in the write callback: term.write is async, so the
+      // buffer (and thus lastLine()) only reflects `b` once this fires. Reading
+      // it synchronously here would see the previous prompt, not a sudo one.
+      term.write(b, () => {
+        if (leftAlt) { webgl?.clearTextureAtlas(); term.refresh(0, term.rows - 1); }
+        maybeSudoPrompt(b);
+      });
+      // An injected/hidden command just stopped being swallowed: release queued pastes.
+      if (pendingPaste.length && !swallower.swallowing) flushPendingPaste();
+      if (integrationEnabled) scheduleQuietCheck(id);
+    }));
+    unlisteners.push(await onSessionClosed(id, (r) => { status = "closed"; sudoPrompt = null; clearTimeout(sudoAutoTimer); term.write(`\r\n\x1b[2m[${r}]\x1b[0m\r\n${HIDE_CURSOR}`); onclosed(r); }));
+    // MCP read_scrollback: only the Terminal that owns this session answers.
+    unlisteners.push(await onMcpScrollback((p) => {
+      if (p.session !== sessionId || handedOff) return;
+      flushHidden(); // materialise any output buffered while this tab was hidden
+      if (p.last_n_lines) {
+        const b = term.buffer.active;
+        const lines: string[] = [];
+        const start = Math.max(0, b.baseY + b.cursorY - p.last_n_lines + 1);
+        for (let i = start; i <= b.baseY + b.cursorY; i++) lines.push(b.getLine(i)?.translateToString(true) ?? "");
+        mcpAnswer(p.req_id, { lines: lines.join("\n") });
+      } else {
+        mcpAnswer(p.req_id, { commands: tracker.recent(p.last_n_commands ?? 10) });
+      }
+    }));
   }
 
   /** Answer the prompt with the id it carried; the panel stays up until connect resolves. */
@@ -448,7 +611,7 @@
     clearTimeout(selTimer);
     clearInterval(perfTimer);
     unlisteners.forEach((u) => u());
-    if (sessionId) sessionClose(sessionId);
+    if (sessionId && !handedOff) sessionClose(sessionId);
     tracker?.destroy();
     term?.dispose();
   });
@@ -633,11 +796,19 @@
       { label: "Disable for this session", action: disableIntegration, disabled: !integrationEnabled },
       { separator: true, label: "" },
       { label: `Copy hook text (${which})`, action: () => writeText(hookTextFor(which)) },
+      ...shellItems(),
     ];
   }
   function onChipClick(e: MouseEvent) {
     e.stopPropagation();
     chipMenu = { x: e.clientX, y: e.clientY - 4 };
+    // The shells the host has, asked once per session (own exec channel).
+    if (open.kind === "ssh" && sessionId && status === "up" && (hostShells === null || typeof hostShells === "string")) {
+      hostShells = null;
+      sessionShells(sessionId)
+        .then((h) => { hostShells = h; console.info(`[charon] shell: host offers ${h.os} ${h.shells.join(", ")}`); })
+        .catch((err) => (hostShells = String(err)));
+    }
   }
 
   // CSI ? 1049 l / 1047 l / 47 l — alternate screen exits.
@@ -685,6 +856,52 @@
     if (query) search.findNext(query, { ...SEARCH_OPTS, incremental: true }); else search.clearDecorations();
   }
 
+  // ---- links
+  const isMac = navigator.userAgent.includes("Mac");
+  function activateLink(e: MouseEvent, url: string) {
+    // Ctrl+click (Cmd on macOS) so clicking around in a terminal never opens a browser by accident.
+    if (!(isMac ? e.metaKey : e.ctrlKey)) return;
+    if (!/^https?:\/\//i.test(url)) return;
+    console.info(`[charon] link: open ${url}`);
+    openUrl(url).catch((err) => console.info(`[charon] link: open failed ${String(err)}`));
+  }
+  function showLinkTip(e: MouseEvent, url: string) {
+    linkTip = { x: e.clientX + 12, y: e.clientY + 14, url };
+  }
+  /** Buffer row `y` (0-based) as text plus the cell column of every string index. */
+  function rowAt(y: number): Row | null {
+    const line = term.buffer.active.getLine(y);
+    if (!line) return null;
+    let text = "";
+    const cols: number[] = [];
+    for (let x = 0; x < term.cols; x++) {
+      const cell = line.getCell(x);
+      if (!cell) break;
+      if (cell.getWidth() === 0) continue; // right half of a wide character
+      const ch = cell.getChars() || " ";
+      for (let i = 0; i < ch.length; i++) cols.push(x);
+      text += ch;
+    }
+    return { text, cols, wrapped: line.isWrapped };
+  }
+  /** xterm link provider: links touching buffer row `y1` (1-based). Looks a few rows
+   *  up and down so a URL broken over several rows is one link on each of them. */
+  function linksOnRow(y1: number) {
+    const y = y1 - 1, from = Math.max(0, y - 6), to = y + 6;
+    const rows: Row[] = [];
+    for (let i = from; i <= to; i++) { const r = rowAt(i); if (!r) break; rows.push(r); }
+    return findLinks(rows, term.cols)
+      .filter((l) => l.start.row + from <= y && l.end.row + from >= y)
+      .map((l) => ({
+        range: { start: { x: l.start.col + 1, y: l.start.row + from + 1 }, end: { x: l.end.col + 1, y: l.end.row + from + 1 } },
+        text: l.url,
+        decorations: { underline: true, pointerCursor: true },
+        activate: (e: MouseEvent) => activateLink(e, l.url),
+        hover: (e: MouseEvent) => showLinkTip(e, l.url),
+        leave: () => (linkTip = null),
+      }));
+  }
+
   // MobaXterm habit: right-click copies the selection (and drops it) or pastes;
   // Shift+right-click always opens the menu.
   function onContextMenu(e: MouseEvent) {
@@ -708,6 +925,7 @@
       { separator: true, label: "" },
       { label: "Find…  Ctrl+Shift+F", action: openSearch },
       { label: `${filesOpen ? "Hide" : "Show"} files  Ctrl+Shift+E`, action: toggleFiles, disabled: !hasFiles },
+      { label: `Timestamps: ${prefs.timestamps ? "on → turn off" : "off → turn on"}`, action: toggleTimestamps },
     ];
   }
 
@@ -855,24 +1073,97 @@
 
   /** Buffer output for a hidden tab; drop oldest whole chunks past the cap. */
   function bufferHidden(b: Uint8Array) {
-    pendingWrites.push(b); pendingBytes += b.length;
+    pendingWrites.push(b); pendingTimes.push(Date.now()); pendingBytes += b.length;
     while (pendingBytes > HIDDEN_BUF_CAP && pendingWrites.length > 1) {
-      pendingBytes -= pendingWrites.shift()!.length; pendingOverflow = true;
+      pendingBytes -= pendingWrites.shift()!.length; pendingTimes.shift(); pendingOverflow = true;
     }
   }
   /** Write everything buffered while hidden; reset first if we had to drop bytes. */
   function flushHidden() {
     if (!pendingWrites.length && !pendingOverflow) return;
     if (pendingOverflow) { term.reset(); pendingOverflow = false; }
-    const items = pendingWrites; pendingWrites = []; pendingBytes = 0;
-    for (const b of items) term.write(b);
+    const items = pendingWrites, times = pendingTimes; pendingWrites = []; pendingTimes = []; pendingBytes = 0;
+    // Each chunk's lines are stamped with when it arrived, not when it is shown:
+    // a write callback runs once everything before it is parsed.
+    items.forEach((b, i) => { term.write("", () => (stampClock = times[i])); term.write(b); });
+    term.write("", () => (stampClock = null));
+  }
+
+  /** A new line started (line feed): stamp it if it is the first in this second. */
+  function recordStamp() {
+    if (term.buffer.active.type !== "normal") return; // full-screen programs: no stamps
+    const now = stampClock ?? Date.now();
+    const sec = Math.floor(now / 1000);
+    if (sec === lastStampSec) return;
+    lastStampSec = sec;
+    while (stampMarks.length && stampMarks[0].marker.isDisposed) stampMarks.shift();
+    const marker = term.registerMarker(0);
+    if (marker) stampMarks.push({ marker, t: now });
+  }
+  function scheduleGutter() {
+    if (!prefs.timestamps || !active || gutterFrame) return;
+    gutterFrame = requestAnimationFrame(() => { gutterFrame = 0; drawGutter(); });
+  }
+  function drawGutter() {
+    const b = term.buffer.active;
+    if (b.type !== "normal") { gutter = []; return; }
+    const screen = term.element?.querySelector(".xterm-screen") as HTMLElement | null;
+    if (screen) cellH = screen.getBoundingClientRect().height / term.rows;
+    const stamps = stampMarks.filter((s) => !s.marker.isDisposed).map((s) => ({ line: s.marker.line, t: s.t }));
+    gutter = gutterRows(stamps, b.viewportY, term.rows, (l) => {
+      const line = b.getLine(l);
+      return line ? { text: line.translateToString(true), wrapped: line.isWrapped } : undefined;
+    });
+  }
+  function toggleTimestamps() {
+    ontimestamps?.(!prefs.timestamps);
+    term?.focus();
+  }
+  // Switched on (here or in another tab): draw now; the terminal narrows to make room.
+  $effect(() => {
+    const on = prefs.timestamps;
+    if (!term) return;
+    untrack(() => { if (on) requestAnimationFrame(drawGutter); else gutter = []; fit?.fit(); });
+  });
+
+  /** Reconnect into another shell; a saved connection remembers it. */
+  async function chooseShell(sh: string | null) {
+    shellOverride = sh ?? "";
+    if (open.nodeId) {
+      try { await connectionSetRemoteShell(open.nodeId, sh); notifyChanged("connections"); }
+      catch (e) { console.warn("[charon] shell: could not save", e); }
+    }
+    console.info(`[charon] shell: reconnecting with ${sh ?? "the login shell"}`);
+    reconnect();
+  }
+  function shellItems(): MenuItem[] {
+    if (open.kind !== "ssh") return [];
+    const mark = (s: string) => (s === startedShell ? "✓ " : "\u2003");
+    const items: MenuItem[] = [
+      { separator: true, label: "" },
+      { label: open.nodeId ? "Start this connection in… (reconnects, saved)" : "Start this tab in… (reconnects)", disabled: true },
+      { label: `${mark("")}login shell (account default)`, action: () => chooseShell(null), disabled: !sessionId && status !== "closed" },
+    ];
+    if (typeof hostShells === "string") items.push({ label: `could not list shells: ${hostShells}`, disabled: true });
+    else if (hostShells) for (const s of hostShells.shells) items.push({ label: `${mark(s)}${s}`, action: () => chooseShell(s) });
+    else items.push({ label: "listing shells…", disabled: true });
+    return items;
+  }
+  /** Selecting a tab puts the keyboard in it: the password field while asking for one,
+   *  otherwise the terminal. Waits a frame for the pane to lose `hidden`. */
+  function focusShown() {
+    requestAnimationFrame(() => {
+      if (!active) return;
+      if (status === "auth") passwordEl?.focus();
+      else if (status !== "hostkey") term?.focus();
+    });
   }
   // Show/hide: (re)create or drop the GL context and flush any buffered output.
   $effect(() => {
     const a = active;
     if (!term) return;
     untrack(() => {
-      if (a) { enableWebgl(); flushHidden(); fit?.fit(); if (integrationEnabled && sessionId) scheduleQuietCheck(sessionId); }
+      if (a) { enableWebgl(); flushHidden(); fit?.fit(); focusShown(); if (integrationEnabled && sessionId) scheduleQuietCheck(sessionId); }
       else { disableWebgl(); }
     });
   });
@@ -911,6 +1202,11 @@
   <div class="split">
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div class="termbox" oncontextmenu={onContextMenu}>
+    {#if prefs.timestamps}
+      <div class="stamps" style:--cell-h="{cellH}px" aria-hidden="true" title="When each line started (local time)">
+        {#each gutter as g, i (i)}<div class:rep={g.repeat}>{g.text}</div>{/each}
+      </div>
+    {/if}
     <div class="term" bind:this={el}></div>
     {#if searchOpen}
       <div class="search">
@@ -935,6 +1231,12 @@
     <!-- mousedown preventDefault keeps the selection while the click copies it. -->
     <button type="button" class="sel-copy" style:left="{copyBtn.x}px" style:top="{copyBtn.y}px"
       onmousedown={(e) => e.preventDefault()} onclick={copyFromButton} title="Copy selection (Ctrl+Shift+C)">Copy</button>
+  {/if}
+  {#if linkTip}
+    <div class="link-tip" style:left="{linkTip.x}px" style:top="{linkTip.y}px">{linkTip.url}<span>{isMac ? "⌘" : "Ctrl"}+click to open</span></div>
+  {/if}
+  {#if mouseHint}
+    <div class="mouse-hint" role="status">This program has the mouse. Hold <b>{isMac ? "Option" : "Shift"}</b> and drag to select text for copying.</div>
   {/if}
   {#if menu}
     <ContextMenu x={menu.x} y={menu.y} items={menu.items} onclose={() => (menu = null)} />
@@ -1012,6 +1314,8 @@
         send saved password
       </button>
     {/if}
+    <button type="button" class="chip stamps-btn" class:on={prefs.timestamps} onclick={toggleTimestamps}
+      title="Show when each line was printed (all tabs; remembered)">time {prefs.timestamps ? "on" : "off"}</button>
     {#if hasFiles && status === "up"}
       <button type="button" class="chip files-btn" class:on={filesOpen} onclick={toggleFiles} title="File pane (Ctrl+Shift+E)">files</button>
     {/if}
@@ -1025,7 +1329,7 @@
 </div>
 
 <style>
-  .wrap { height: 100%; display: flex; flex-direction: column; border-left: 3px solid var(--session-color); }
+  .wrap { position: relative; height: 100%; display: flex; flex-direction: column; border-left: 3px solid var(--session-color); }
   .split { flex: 1; min-height: 0; display: flex; }
   .termbox { flex: 1; min-height: 0; min-width: 0; position: relative; display: flex; }
   .vsplit { width: 4px; cursor: col-resize; background: var(--line); }
@@ -1033,6 +1337,9 @@
   .files { flex: none; min-height: 0; }
   /* Left padding is the command-mark gutter (osc133.ts draws bars at -8px). */
   .term { flex: 1; min-height: 0; min-width: 0; padding: 4px 4px 4px 12px; background: #101215; }
+  .stamps { flex: none; padding: 4px 0 0 6px; background: #101215; color: var(--fg-dim); font-family: var(--font-mono); font-size: max(9px, calc(var(--cell-h) * 0.62)); overflow: hidden; user-select: none; border-right: 1px solid var(--line); }
+  .stamps div { height: var(--cell-h); line-height: var(--cell-h); white-space: pre; padding-right: 6px; min-width: 8ch; }
+  .stamps div.rep { opacity: .4; }
   .search { position: absolute; top: 6px; right: 18px; display: flex; gap: 2px; padding: 4px; background: var(--bg-raised); border: 1px solid var(--line); border-radius: 4px; box-shadow: 0 4px 14px #0008; }
   .search input { width: 220px; font-family: var(--font-mono); }
   .search button { padding: 2px 7px; }
@@ -1063,6 +1370,9 @@
   .files-btn { margin-left: auto; }
   .files-btn.on { border-color: var(--session-color); color: var(--fg); }
   .files-btn + .cwd, .files-btn + .chip { margin-left: 0; }
+  .stamps-btn { margin-left: auto; }
+  .stamps-btn.on { border-color: var(--session-color); color: var(--fg); }
+  .stamps-btn + .files-btn, .stamps-btn + .cwd, .stamps-btn + .chip { margin-left: 0; }
   .cwd { margin-left: auto; color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40%; }
   .cwd + .chip { margin-left: 0; }
   .chip { margin-left: auto; font: inherit; font-family: var(--font-mono); color: inherit; background: transparent; padding: 0 6px; border: 1px solid var(--line); border-radius: 8px; cursor: pointer; }
@@ -1070,6 +1380,9 @@
   .sudo { margin-left: 6px; border-color: #ffb454; color: #ffb454; }
   .sel-copy { position: fixed; z-index: 25; padding: 2px 10px; font: inherit; font-size: 12px; color: var(--fg); background: var(--bg-raised); border: 1px solid var(--accent); border-radius: 4px; box-shadow: 0 3px 10px #0008; cursor: pointer; }
   .sel-copy:hover { background: var(--accent); color: #06101f; }
+  .link-tip { position: fixed; z-index: 26; max-width: 520px; padding: 3px 8px; font-size: 11px; color: var(--fg); background: var(--bg-raised); border: 1px solid var(--line); border-radius: 4px; box-shadow: 0 3px 10px #0008; pointer-events: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .link-tip span { margin-left: 8px; color: var(--fg-dim); }
+  .mouse-hint { position: absolute; z-index: 24; left: 50%; bottom: 14px; transform: translateX(-50%); padding: 5px 12px; font-size: 12px; color: var(--fg); background: var(--bg-raised); border: 1px solid var(--accent); border-radius: 4px; box-shadow: 0 3px 10px #0008; pointer-events: none; }
   .chip:hover { border-color: var(--fg-dim); color: var(--fg); }
   .up .dot { background: #5fd38a; } .closed .dot { background: var(--danger); }
 </style>

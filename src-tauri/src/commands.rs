@@ -136,6 +136,53 @@ pub fn vault_delete(state: State<'_, AppState>, name: String) -> CmdResult<()> {
     state.vault.delete(&name).map_err(err)
 }
 
+/// Rename a credential and point every connection that used it at the new name.
+/// Returns how many connections changed.
+#[tauri::command]
+pub async fn vault_rename(state: State<'_, AppState>, from: String, to: String) -> CmdResult<usize> {
+    let to = to.trim().to_string();
+    state.vault.rename(&from, &to).map_err(err)?;
+    state.store.lock().await.rename_credential(&from, &to).map_err(err)
+}
+
+/// Save the shell a connection starts (None/blank = the login shell).
+#[tauri::command]
+pub async fn connection_set_remote_shell(state: State<'_, AppState>, id: String, shell: Option<String>) -> CmdResult<()> {
+    state.store.lock().await.set_remote_shell(&id, shell.as_deref()).map_err(err)
+}
+
+#[derive(Serialize)]
+pub struct HostShells {
+    /// "unix" (from /etc/shells) or "windows" (from `where`).
+    pub os: &'static str,
+    pub shells: Vec<String>,
+}
+
+/// The shells the host of an SSH session offers, asked on an exec channel.
+#[tauri::command]
+pub async fn session_shells(state: State<'_, AppState>, id: String) -> CmdResult<HostShells> {
+    let sess = state.sessions.get(&id).await.map_err(err)?;
+    let run = |cmd: &'static str| {
+        let sess = sess.clone();
+        async move {
+            tokio::time::timeout(std::time::Duration::from_secs(10), sess.exec_channel(cmd))
+                .await
+                .map_err(|_| "the host did not answer within 10s".to_string())?
+                .map_err(err)
+        }
+    };
+    let (out, code) = run("cat /etc/shells").await?;
+    if code == 0 {
+        return Ok(HostShells { os: "unix", shells: crate::ssh::parse_shells(&String::from_utf8_lossy(&out), true) });
+    }
+    let (out, _) = run("where pwsh powershell cmd").await?;
+    let shells = crate::ssh::parse_shells(&String::from_utf8_lossy(&out), false);
+    if shells.is_empty() {
+        return Err("this host does not list its shells".into());
+    }
+    Ok(HostShells { os: "windows", shells })
+}
+
 // ---------------------------------------------------------------- sessions
 
 /// `session_open_ssh` needs one distinguishable failure: "nothing to authenticate
@@ -180,6 +227,9 @@ pub struct OpenSsh {
     pub key_path: Option<String>,
     /// Vault entry name; overrides the node's effective credential.
     pub credential: Option<String>,
+    /// Shell to start; overrides the node's `remote_shell`.
+    #[serde(default)]
+    pub remote_shell: Option<String>,
     pub cols: u16,
     pub rows: u16,
 }
@@ -232,7 +282,8 @@ pub async fn session_open_ssh(state: State<'_, AppState>, req: OpenSsh) -> Resul
         let secs = state.profile.read().unwrap().ssh.keepalive_seconds;
         (secs > 0).then(|| std::time::Duration::from_secs(secs))
     };
-    let params = SshParams { host: host.clone(), port, user: user.clone(), auth, jumps, cols: req.cols, rows: req.rows, keepalive };
+    let shell = req.remote_shell.or(eff.remote_shell).filter(|s| !s.trim().is_empty());
+    let params = SshParams { host: host.clone(), port, user: user.clone(), auth, jumps, cols: req.cols, rows: req.rows, keepalive, shell: shell.clone() };
 
     let sess = SshSession::connect(state.sessions.clone(), state.hostkeys.clone(), id.clone(), params)
         .await
@@ -241,6 +292,7 @@ pub async fn session_open_ssh(state: State<'_, AppState>, req: OpenSsh) -> Resul
     info.shell_integration = eff.shell_integration.unwrap_or(true);
     info.node_id = req.node_id.clone();
     info.host = Some(host.clone());
+    info.remote_shell = shell;
     state.sessions.register(info.clone(), sess).await;
     Ok(info)
 }
@@ -438,7 +490,100 @@ pub async fn session_close(state: State<'_, AppState>, id: String) -> CmdResult<
         let _ = s.close().await;
     }
     state.sessions.remove(&id).await;
+    crate::session::SessionManager::release(state.sessions.app(), &id);
     Ok(())
+}
+
+// ---- moving a tab between windows (tabmove.rs)
+
+/// Park a session's output while its tab is in flight.
+#[tauri::command]
+pub fn session_hold(app: tauri::AppHandle, id: String) {
+    crate::session::SessionManager::hold(&app, &id);
+}
+
+/// The tab landed: emit what was held.
+#[tauri::command]
+pub fn session_release(app: tauri::AppHandle, id: String) {
+    crate::session::SessionManager::release(&app, &id);
+}
+
+#[tauri::command]
+pub fn tab_stash(state: State<'_, AppState>, json: String) -> String {
+    state.tab_stash.put(json)
+}
+
+#[tauri::command]
+pub fn tab_take(state: State<'_, AppState>, token: String) -> CmdResult<String> {
+    state.tab_stash.take(&token).ok_or_else(|| "that tab is no longer waiting to be moved".to_string())
+}
+
+#[derive(Serialize)]
+pub struct DropTarget {
+    /// Another Charon window under the cursor, if any.
+    pub window: Option<String>,
+    /// Cursor, physical screen pixels.
+    pub x: f64,
+    pub y: f64,
+}
+
+/// Where a tab dragged out of `from` was let go: over another window, or empty space.
+#[tauri::command]
+pub fn tab_drop_target(app: tauri::AppHandle, from: String) -> CmdResult<DropTarget> {
+    use tauri::Manager;
+    let p = app.cursor_position().map_err(err)?;
+    let wins: Vec<(String, crate::tabmove::Rect)> = app
+        .webview_windows()
+        .into_iter()
+        .filter(|(_, w)| w.is_visible().unwrap_or(false) && !w.is_minimized().unwrap_or(false))
+        .filter_map(|(l, w)| {
+            let pos = w.outer_position().ok()?;
+            let size = w.outer_size().ok()?;
+            Some((l, crate::tabmove::Rect { x: pos.x, y: pos.y, w: size.width, h: size.height }))
+        })
+        .collect();
+    let window = crate::tabmove::window_at(&wins, &from, p.x, p.y).map(str::to_string);
+    Ok(DropTarget { window, x: p.x, y: p.y })
+}
+
+/// Open a new window for the stashed tab `token`, its top-left near (x, y)
+/// (physical pixels), `width`×`height` logical. The window reads the token back
+/// from its label. Async: building a window inside a sync command deadlocks on Windows.
+#[tauri::command]
+pub async fn tab_window_open(app: tauri::AppHandle, token: String, x: f64, y: f64, width: f64, height: f64) -> CmdResult<String> {
+    let label = format!("tab-{token}");
+    let w = tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App("index.html".into()))
+        .title("Charon")
+        .inner_size(width.max(500.0), height.max(300.0))
+        .min_inner_size(500.0, 300.0)
+        .visible(false)
+        .build()
+        .map_err(err)?;
+    // Grab point a little inside the new window's title bar.
+    let _ = w.set_position(tauri::PhysicalPosition::new((x - 80.0) as i32, (y - 12.0) as i32));
+    let _ = w.show();
+    let _ = w.set_focus();
+    Ok(label)
+}
+
+#[derive(Serialize, Clone)]
+struct AdoptMsg { token: String, x: f64, y: f64 }
+
+/// Hand the stashed tab `token` to the existing window `label`, dropped at (x, y).
+#[tauri::command]
+pub fn tab_send(app: tauri::AppHandle, label: String, token: String, x: f64, y: f64) -> CmdResult<()> {
+    use tauri::{Emitter, Manager};
+    app.emit_to(label.as_str(), "tab:adopt", AdoptMsg { token, x, y }).map_err(err)?;
+    if let Some(w) = app.get_webview_window(&label) {
+        let _ = w.set_focus();
+    }
+    Ok(())
+}
+
+/// A tab window whose last tab left closes itself.
+#[tauri::command]
+pub fn window_close_self(window: tauri::WebviewWindow) -> CmdResult<()> {
+    window.close().map_err(err)
 }
 
 fn whoami() -> String {
@@ -547,11 +692,25 @@ pub struct SudoOutcome {
 
 /// Open a root SFTP session over sudo. `password` is used if given, else the
 /// session's own SSH password (never returned to the UI). On success later
-/// sftp_* calls with via="sudo" go through it.
+/// sftp_* calls with via="sudo" go through it. A live channel is reused, so the
+/// pane and editor documents bound to sudo share one (and one password ask).
 #[tauri::command]
 pub async fn sftp_sudo_open(state: State<'_, AppState>, session: String, password: Option<String>) -> CmdResult<SudoOutcome> {
+    let existing = state.sudo_fs.lock().await.get(&session).cloned();
+    if let Some(fs) = existing {
+        if fs.home().await.is_ok() {
+            return Ok(SudoOutcome { ok: true, probe: None, sudo: "ok", reason: "reused".into() });
+        }
+        state.sudo_fs.lock().await.remove(&session);
+    }
     let sess = state.sessions.get(&session).await.map_err(err)?;
-    let (out, code) = sess.exec_hidden(SFTP_SERVER_PROBE).await.map_err(err)?;
+    // Probe on its own exec channel, not the interactive shell, so this works while
+    // the terminal is busy (Retry as sudo from vim). Capped like the sudo handshake.
+    let probe = tokio::time::timeout(std::time::Duration::from_secs(10), sess.exec_channel(SFTP_SERVER_PROBE)).await;
+    let (out, code) = match probe {
+        Ok(r) => r.map_err(err)?,
+        Err(_) => return Ok(SudoOutcome { ok: false, probe: None, sudo: "timeout", reason: "sftp-server probe did not finish within 10s".into() }),
+    };
     let server = crate::hidden::strip_escapes(&String::from_utf8_lossy(&out)).trim().to_string();
     if server.is_empty() {
         tracing::warn!(session = %session, probe_exit = code, "sudo-sftp: probe=none");
@@ -853,7 +1012,14 @@ pub async fn help_fetch(state: State<'_, AppState>, session: String, cmd: String
     let sess = state.sessions.get(&session).await.map_err(err)?;
     // Try --help then -h; strip escapes, keep it bounded.
     let script = format!("{b} --help 2>&1 || {b} -h 2>&1 || true", b = crate::hidden::sq(&base));
-    let (out, _) = sess.exec_hidden(&format!("{script} | head -n 300")).await.map_err(err)?;
+    // Own exec channel, never the interactive shell: a hidden command there starts
+    // with Ctrl+U, which would wipe the line the user is typing the flag on.
+    let line = format!("{script} | head -n 300");
+    let run = sess.exec_channel(&line);
+    let (out, _) = tokio::time::timeout(std::time::Duration::from_secs(10), run)
+        .await
+        .map_err(|_| "--help did not finish within 10s".to_string())?
+        .map_err(err)?;
     let text = crate::hidden::strip_escapes(&String::from_utf8_lossy(&out));
     let _ = tokio::fs::create_dir_all(help_cache_dir(&state)).await;
     let _ = tokio::fs::write(&path, &text).await;
@@ -956,14 +1122,18 @@ pub async fn mcp_log(state: State<'_, AppState>, lines: Option<usize>) -> CmdRes
     Ok(all[start..].iter().filter_map(|l| serde_json::from_str(l).ok()).collect())
 }
 
-/// `man <cmd>` over the active session, hidden and escape-stripped, for the docs
+/// `man <cmd>` on the active session (own exec channel), escape-stripped, for the docs
 /// pane. `col -bx` flattens overstrike/backspaces; bounded so a huge page is fine.
 #[tauri::command]
 pub async fn man_fetch(state: State<'_, AppState>, session: String, cmd: String) -> CmdResult<String> {
     let base = safe_cmd(&cmd).ok_or_else(|| "unsafe command name".to_string())?;
     let sess = state.sessions.get(&session).await.map_err(err)?;
     let script = format!("man -P cat {b} 2>/dev/null | col -bx | head -n 500", b = crate::hidden::sq(&base));
-    let (out, code) = sess.exec_hidden(&script).await.map_err(err)?;
+    // Own exec channel: this runs while the user is typing the command at the prompt.
+    let (out, code) = tokio::time::timeout(std::time::Duration::from_secs(10), sess.exec_channel(&script))
+        .await
+        .map_err(|_| "man did not finish within 10s".to_string())?
+        .map_err(err)?;
     let text = crate::hidden::strip_escapes(&String::from_utf8_lossy(&out));
     if code != 0 || text.trim().is_empty() {
         return Err(format!("no man page for {base} on this host"));

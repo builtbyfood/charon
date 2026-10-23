@@ -182,10 +182,30 @@ struct LogLine<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     exit_code: Option<i32>,
     duration_ms: u128,
+    /// What the agent asked for: the command line, or the path(s) touched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subject: Option<&'a str>,
+    /// Why the call failed, when it did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'a str>,
 }
 
-pub async fn log_call(state: &AppState, tool: &str, session: Option<&str>, tier: Tier, decision: &str, ok: bool, exit_code: Option<i32>, duration_ms: u128) {
-    let line = LogLine { ts: now_iso(), tool, session, tier: tier.as_str(), decision, ok, exit_code, duration_ms };
+/// Longest `subject` / `error` kept per log line.
+const LOG_FIELD_MAX: usize = 2000;
+
+fn clip(s: &str) -> &str {
+    match s.char_indices().nth(LOG_FIELD_MAX) {
+        Some((at, _)) => &s[..at],
+        None => s,
+    }
+}
+
+/// One line in data/mcp.log per tool call, including denied ones. `subject` is
+/// what was asked for (see `tools::subject`), so an agent's command can be traced
+/// back to the session it ran in.
+#[allow(clippy::too_many_arguments)]
+pub async fn log_call(state: &AppState, tool: &str, session: Option<&str>, tier: Tier, decision: &str, ok: bool, exit_code: Option<i32>, duration_ms: u128, subject: Option<&str>, error: Option<&str>) {
+    let line = LogLine { ts: now_iso(), tool, session, tier: tier.as_str(), decision, ok, exit_code, duration_ms, subject: subject.map(clip), error: error.map(clip) };
     if let Ok(mut s) = serde_json::to_string(&line) {
         s.push('\n');
         let path = state.paths.data_dir.join("mcp.log");

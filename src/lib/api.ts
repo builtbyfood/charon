@@ -1,6 +1,7 @@
 // Typed wrappers around Tauri commands so the rest of the UI never spells command names.
 import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { listen, emit, emitTo, type UnlistenFn } from "@tauri-apps/api/event";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 
 export type Kind = "folder" | "ssh" | "serial" | "local" | "rdp";
 
@@ -12,6 +13,8 @@ export interface Settings {
   mcp_sudo?: boolean;
   /** Local sessions only. */
   shell?: string; cwd?: string;
+  /** SSH: shell to start instead of the login shell ("zsh", "/usr/bin/fish", "pwsh"). */
+  remote_shell?: string;
   /** Serial sessions only. */
   serial?: SerialSettings;
 }
@@ -28,7 +31,7 @@ export interface Node {
   id: string; parent_id: string | null; kind: Kind; name: string; sort: number; settings: Settings;
 }
 
-export interface SessionInfo { id: string; title: string; kind: string; shell_integration: boolean; shell: string | null; cwd: string | null }
+export interface SessionInfo { id: string; title: string; kind: string; shell_integration: boolean; shell: string | null; cwd: string | null; remote_shell?: string | null }
 export const sessionSetShell = (id: string, shell: string | null) => invoke<void>("session_set_shell", { id, shell });
 export const sessionSetCwd = (id: string, cwd: string | null) => invoke<void>("session_set_cwd", { id, cwd });
 export interface AppInfo { version: string; portable: boolean; data_dir: string; os: "windows" | "macos" | "linux" | string; user: string }
@@ -40,7 +43,7 @@ export const appInfo = () => invoke<AppInfo>("app_info");
 export interface Profile {
   name: string;
   appearance: { font: string; font_size: number; theme: string; scrollback: number; renderer: "webgl" | "dom" | string; [k: string]: unknown };
-  terminal: { copy_on_select: boolean; ctrl_c_copies_when_selected: boolean; middle_click_paste: boolean; right_click?: "moba" | "menu" | string; bracketed_paste: boolean; paste_guard_lines: number; paste_run?: "auto" | "wait" | string; [k: string]: unknown };
+  terminal: { timestamps?: boolean; copy_on_select: boolean; ctrl_c_copies_when_selected: boolean; middle_click_paste: boolean; right_click?: "moba" | "menu" | string; bracketed_paste: boolean; paste_guard_lines: number; paste_run?: "auto" | "wait" | string; [k: string]: unknown };
   files?: { auto_open?: boolean; parallel_transfers?: number; [k: string]: unknown };
   sudo?: { auto_send?: boolean; [k: string]: unknown };
   local?: { credential?: string; [k: string]: unknown };
@@ -53,6 +56,11 @@ export interface Profile {
 }
 export const getProfile = () => invoke<Profile>("get_profile");
 export const saveProfile = (profile: Profile) => invoke<void>("save_profile", { profile });
+/** Tell the other windows the profile changed (they reload it); `from` = this window's label. */
+export const announceProfile = (from: string) => emit("profile:saved", from);
+export function onProfileSaved(cb: (from: string) => void): Promise<UnlistenFn> {
+  return listen<string>("profile:saved", (e) => cb(e.payload));
+}
 export const listConnections = () => invoke<Node[]>("list_connections");
 export const saveConnection = (node: Node) => invoke<void>("save_connection", { node });
 export const deleteConnection = (id: string) => invoke<void>("delete_connection", { id });
@@ -90,6 +98,14 @@ export const vaultUnlock = (master: string) => invoke<VaultStatus>("vault_unlock
 export const vaultList = () => invoke<SecretMeta[]>("vault_list");
 export const vaultSet = (name: string, secret: Secret) => invoke<void>("vault_set", { name, secret });
 export const vaultDelete = (name: string) => invoke<void>("vault_delete", { name });
+/** Rename a credential; connections using it follow. Resolves to how many changed. */
+export const vaultRename = (from: string, to: string) => invoke<number>("vault_rename", { from, to });
+/** Save the shell a saved connection starts (null = its login shell). */
+export const connectionSetRemoteShell = (id: string, shell: string | null) =>
+  invoke<void>("connection_set_remote_shell", { id, shell });
+/** Shells the host of an SSH session offers (/etc/shells, or `where` on Windows). */
+export interface HostShells { os: "unix" | "windows"; shells: string[] }
+export const sessionShells = (id: string) => invoke<HostShells>("session_shells", { id });
 
 // Cross-component nudges (sidebar refresh after a terminal saves a credential).
 export const CHANGED = { connections: "charon:connections", vault: "charon:vault" } as const;
@@ -100,6 +116,8 @@ export interface OpenSsh {
   id?: string;
   node_id?: string; host?: string; port?: number; user?: string;
   password?: string; key_path?: string; credential?: string; cols: number; rows: number;
+  /** Start this shell instead of the node's remote_shell / the login shell. */
+  remote_shell?: string;
 }
 /** `session_open_ssh` rejects with this shape; `need_credential` means "ask the user". */
 export interface HostKeyChanged {
@@ -150,6 +168,32 @@ export function onSessionData(id: string, cb: (bytes: Uint8Array) => void): Prom
 }
 export function onSessionClosed(id: string, cb: (reason: string) => void): Promise<UnlistenFn> {
   return listen<string>(`term:closed:${id}`, (e) => cb(e.payload));
+}
+
+// Moving a tab between windows (src-tauri/src/tabmove.rs). The source holds the
+// session's output, stashes the serialised tab and hands the token to a new or
+// existing window, which takes it, restores the screen and releases the hold.
+export const sessionHold = (id: string) => invoke<void>("session_hold", { id });
+export const sessionRelease = (id: string) => invoke<void>("session_release", { id });
+export const tabStash = (json: string) => invoke<string>("tab_stash", { json });
+export const tabTake = (token: string) => invoke<string>("tab_take", { token });
+/** Where a dragged tab was let go: another Charon window under the cursor, or none (physical px). */
+export interface DropTarget { window: string | null; x: number; y: number }
+export const tabDropTarget = (from: string) => invoke<DropTarget>("tab_drop_target", { from });
+export const tabWindowOpen = (token: string, x: number, y: number, width: number, height: number) =>
+  invoke<string>("tab_window_open", { token, x, y, width, height });
+export const tabSend = (label: string, token: string, x: number, y: number) => invoke<void>("tab_send", { label, token, x, y });
+export const windowCloseSelf = () => invoke<void>("window_close_self");
+/** A tab arrives in this window: `x`,`y` = drop point (physical px), for its place in the tab bar. */
+export interface TabAdopt { token: string; x: number; y: number }
+export function onTabAdopt(cb: (p: TabAdopt) => void): Promise<UnlistenFn> {
+  return getCurrentWebviewWindow().listen<TabAdopt>("tab:adopt", (e) => cb(e.payload));
+}
+/** A detached window's file pane opens a file: the editor lives in the main window. */
+export interface EditorOpenReq { path: string; fs: string | null; origin: string | null; via: FsVia }
+export const editorOpenInMain = (r: EditorOpenReq) => emitTo("main", "editor:open", r);
+export function onEditorOpenReq(cb: (r: EditorOpenReq) => void): Promise<UnlistenFn> {
+  return getCurrentWebviewWindow().listen<EditorOpenReq>("editor:open", (e) => cb(e.payload));
 }
 
 // Files: the SFTP pane and the editor. `session` undefined/null = the local disk;
@@ -210,7 +254,7 @@ export const fileRead = (session: S, path: string, via?: FsVia) => invoke<TextFi
 export const fileWrite = (session: S, path: string, text: string, encoding: Encoding, eol: Eol, via?: FsVia) =>
   invoke<number>("file_write", { session, path, text, encoding, eol, via });
 /** Backend said the session's own file access may not read this (sudo territory). */
-export const isPermissionError = (e: unknown) => /permission denied|EACCES/i.test(String(e));
+export { isPermissionError } from "./sudoedit";
 
 // P6: root files over sudo-sftp (opened as an exec channel running `sudo -S sftp-server`).
 export interface SudoOutcome { ok: boolean; probe: string | null; sudo: "ok" | "refused" | "timeout" | "skipped" | "error"; reason: string }
@@ -235,11 +279,13 @@ export const mcpSetEnabled = (enabled: boolean) => invoke<McpStatus>("mcp_set_en
 export const mcpRegenToken = () => invoke<McpStatus>("mcp_regen_token");
 export const mcpConfig = (kind: "http" | "stdio") => invoke<string>("mcp_config", { kind });
 export const mcpAnswer = (reqId: string, value: unknown) => invoke<void>("mcp_answer", { reqId, value });
+/** Open an http(s) URL in the default browser (shell plugin, `shell:allow-open`). */
+export const openUrl = (url: string) => invoke<void>("plugin:shell|open", { path: url });
 export const mcpLog = (lines?: number) => invoke<McpLogLine[]>("mcp_log", { lines });
-export interface McpLogLine { ts: string; tool: string; session: string | null; tier: string; decision: string; ok: boolean; exit_code?: number; duration_ms: number }
+export interface McpLogLine { ts: string; tool: string; session: string | null; tier: string; decision: string; ok: boolean; exit_code?: number; duration_ms: number; subject?: string; error?: string }
 export interface McpApprove { req_id: string; tool: string; session: string; command: string }
 export interface McpScrollback { req_id: string; session: string; last_n_commands: number | null; last_n_lines: number | null }
-export interface McpOpenEditor { req_id: string; path: string | null; session: string | null; remote_path: string | null }
+export interface McpOpenEditor { req_id: string; path: string | null; session: string | null; remote_path: string | null; as_root?: boolean }
 export const onMcpApprove = (cb: (p: McpApprove) => void) => listen<McpApprove>("mcp:approve", (e) => cb(e.payload));
 export const onMcpScrollback = (cb: (p: McpScrollback) => void) => listen<McpScrollback>("mcp:scrollback", (e) => cb(e.payload));
 export const onMcpOpenEditor = (cb: (p: McpOpenEditor) => void) => listen<McpOpenEditor>("mcp:open_editor", (e) => cb(e.payload));

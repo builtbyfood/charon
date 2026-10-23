@@ -6,7 +6,8 @@
   import { open as pickOpen, save as pickSave } from "@tauri-apps/plugin-dialog";
   import { readText } from "@tauri-apps/plugin-clipboard-manager";
   import { monaco, languageFor, languageIds, registerEditorExtras } from "./monaco";
-  import { fileRead, fileWrite, isPermissionError, type Encoding, type Eol, type FsVia } from "./api";
+  import { fileRead, fileWrite, isPermissionError, sftpSudoOpen, type Encoding, type Eol, type FsVia } from "./api";
+  import { canRetryAsSudo, ensureSudo } from "./sudoedit";
   import { cleanForCopy } from "./clipboard";
   import { basename } from "./paths";
 
@@ -32,6 +33,8 @@
     eol: Eol;
     dirty: boolean;
     error: string;
+    /** The last save failed with EACCES: offer "Retry as sudo". */
+    retrySudo: boolean;
   }
   let docs = $state<Doc[]>([]);
   let activeId = $state<string | null>(null);
@@ -51,6 +54,10 @@
   let status = $state("");
   const languages = languageIds();
   let untitledN = 1;
+  // Inline sudo password ask (window.prompt is not available in the webview).
+  let sudoAsk = $state<{ session: string; resolve: (pw: string | null) => void } | null>(null);
+  let sudoPw = $state("");
+  let sudoPwEl = $state<HTMLInputElement | null>(null);
 
   onMount(() => {
     registerEditorExtras();
@@ -90,23 +97,41 @@
 
   export function hasUnsaved(): boolean { return docs.some((d) => d.dirty); }
 
-  /** Open (or focus) a file. `fs` null = local disk. */
-  export async function openFile(path: string, fs: string | null, origin: string | null = null, via: FsVia = "sftp"): Promise<void> {
-    const existing = docs.find((d) => d.path === path && d.fs === fs);
-    if (existing) { activate(existing.id); return; }
-    status = `Opening ${basename(path)}…`;
+  /** Root SFTP for `session`: reuse/stored password, else ask here (unless `interactive` is false, e.g. MCP). */
+  function sudoFor(session: string, interactive = true): Promise<void> {
+    return ensureSudo(session, {
+      open: sftpSudoOpen,
+      ask: interactive ? () => new Promise<string | null>((resolve) => { sudoPw = ""; sudoAsk = { session, resolve }; queueMicrotask(() => sudoPwEl?.focus()); }) : undefined,
+    });
+  }
+  function answerSudo(pw: string | null) { const a = sudoAsk; sudoAsk = null; sudoPw = ""; a?.resolve(pw); editor?.focus(); }
+
+  /** Open (or focus) a file. `fs` null = local disk. via "sudo" opens it as root over
+   *  sudo-sftp. `escalate` false (MCP) never falls back to the root shell on EACCES;
+   *  `interactive` false never asks for a sudo password. Throws on failure. */
+  export async function openFile(path: string, fs: string | null, origin: string | null = null, via: FsVia = "sftp",
+    opts: { escalate?: boolean; interactive?: boolean } = {}): Promise<void> {
     try {
+      if (via === "sudo" && fs) await sudoFor(fs, opts.interactive ?? true);
+      const existing = docs.find((d) => d.path === path && d.fs === fs);
+      if (existing) {
+        // Same file asked for as root: rebind the open document to the sudo backend.
+        if (via === "sudo" && existing.via !== "sudo") { existing.via = "sudo"; existing.retrySudo = false; }
+        activate(existing.id); return;
+      }
+      status = `Opening ${basename(path)}${via === "sudo" ? " as root" : ""}…`;
       let f;
       try { f = await fileRead(fs, path, via); }
       catch (e) {
         // SFTP runs as the login user; after sudo -i the shell can read what it cannot.
-        if (fs && via === "sftp" && isPermissionError(e)) { via = "shell"; f = await fileRead(fs, path, via); } else throw e;
+        if (fs && via === "sftp" && opts.escalate !== false && isPermissionError(e)) { via = "shell"; f = await fileRead(fs, path, via); } else throw e;
       }
       const doc = addDoc({ fs, origin, via, path, name: basename(path), encoding: f.encoding, eol: f.eol }, f.text);
-      status = `${f.size.toLocaleString()} bytes`;
+      status = `${f.size.toLocaleString()} bytes${via === "sudo" ? " · root" : ""}`;
       activate(doc.id);
     } catch (e) {
       status = String(e);
+      throw e;
     }
   }
 
@@ -115,7 +140,7 @@
     activate(doc.id);
   }
 
-  function addDoc(d: Omit<Doc, "id" | "language" | "dirty" | "error">, text: string): Doc {
+  function addDoc(d: Omit<Doc, "id" | "language" | "dirty" | "error" | "retrySudo">, text: string): Doc {
     const id = crypto.randomUUID();
     const language = languageFor(d.name);
     const model = monaco.editor.createModel(text, language);
@@ -129,7 +154,7 @@
       if (dirty !== doc.dirty) { doc.dirty = dirty; ondirty?.(hasUnsaved()); }
       if (showAll && id === activeId) scheduleGlyphs();
     });
-    const doc: Doc = { id, language, dirty: false, error: "", ...d };
+    const doc: Doc = { id, language, dirty: false, error: "", retrySudo: false, ...d };
     docs.push(doc);
     return doc;
   }
@@ -172,15 +197,28 @@
       const lang = languageFor(doc.name);
       if (lang !== doc.language) { doc.language = lang; monaco.editor.setModelLanguage(model, lang); }
     }
-    status = `Saving ${doc.name}…`; doc.error = "";
+    status = `Saving ${doc.name}…`; doc.error = ""; doc.retrySudo = false;
     try {
+      // A sudo document re-opens its channel if the pane dropped it (reused when live).
+      if (doc.via === "sudo" && doc.fs) await sudoFor(doc.fs);
       const n = await fileWrite(doc.fs, path, model.getValue(monaco.editor.EndOfLinePreference.LF), doc.encoding, doc.eol, doc.via);
       savedVersion.set(doc.id, model.getAlternativeVersionId());
       doc.dirty = false; ondirty?.(hasUnsaved());
-      status = `Saved ${doc.name} (${n.toLocaleString()} bytes, ${doc.encoding}, ${doc.eol.toUpperCase()})`;
+      status = `Saved ${doc.name} (${n.toLocaleString()} bytes, ${doc.encoding}, ${doc.eol.toUpperCase()})${doc.via === "sudo" ? " as root" : ""}`;
     } catch (e) {
       doc.error = String(e); status = doc.error;
+      doc.retrySudo = canRetryAsSudo(doc, e);
+      if (doc.retrySudo) console.info(`[charon] editor: save EACCES on ${path}; offering retry as sudo`);
     }
+  }
+  /** "Retry as sudo": bind the document to sudo-sftp and save through it (the
+   *  backend's write keeps the original's owner and mode). */
+  async function retryAsSudo(doc = active) {
+    if (!doc?.fs || !doc.retrySudo) return;
+    try { await sudoFor(doc.fs); }
+    catch (e) { doc.error = String(e); status = doc.error; return; }
+    doc.via = "sudo";
+    await save(doc);
   }
 
   async function openLocal() {
@@ -265,7 +303,7 @@
     <div class="strip">
       {#each docs as d (d.id)}
         <div class="dtab" class:active={d.id === activeId} class:dirty={d.dirty} title={d.path ? `${d.fs ? "remote: " : ""}${d.path}` : "untitled"}>
-          <button type="button" class="dmain" onclick={() => activate(d.id)}>{d.fs ? (d.via === "shell" ? "# " : "⇅ ") : ""}{d.name}{d.dirty ? " •" : ""}</button>
+          <button type="button" class="dmain" onclick={() => activate(d.id)}>{#if d.via === "sudo"}<span class="root" title="Opened as root (sudo-sftp)">root</span>{/if}{d.fs ? (d.via === "shell" ? "# " : d.via === "sudo" ? "" : "⇅ ") : ""}{d.name}{d.dirty ? " •" : ""}</button>
           <button type="button" class="x" aria-label="Close" onclick={() => closeDoc(d.id)}>×</button>
         </div>
       {/each}
@@ -278,6 +316,18 @@
   <div class="status">
     {#if active}
       <button type="button" onclick={() => save()} disabled={!active.dirty && !!active.path} title="Save (Ctrl+S)">Save</button>
+      {#if active.retrySudo && !sudoAsk}
+        <button type="button" class="sudo" onclick={() => retryAsSudo()} title="Save again as root over sudo-sftp; the file keeps its owner and mode">Retry as sudo</button>
+      {/if}
+      {#if sudoAsk}
+        <form class="sudo-ask" onsubmit={(e) => { e.preventDefault(); answerSudo(sudoPw); }}>
+          <span>sudo password</span>
+          <input bind:this={sudoPwEl} type="password" bind:value={sudoPw} autocomplete="off" spellcheck="false"
+            onkeydown={(e) => { if (e.key === "Escape") answerSudo(null); }} />
+          <button type="submit" disabled={!sudoPw}>Unlock</button>
+          <button type="button" onclick={() => answerSudo(null)}>Cancel</button>
+        </form>
+      {/if}
       <select value={active.language} onchange={(e) => setLanguage(e.currentTarget.value)} title="Language">
         {#each languages as l (l.id)}<option value={l.id}>{l.label}</option>{/each}
       </select>
@@ -317,6 +367,10 @@
   .cursor { font-variant-numeric: tabular-nums; }
   .msg { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40%; }
   .msg.err { color: var(--danger); }
+  .root { display: inline-block; margin-right: 5px; padding: 0 4px; border-radius: 3px; font-size: 10px; font-weight: 600; line-height: 14px; color: #fff; background: var(--danger); }
+  .status button.sudo { border-color: var(--danger); color: var(--danger); }
+  .sudo-ask { display: flex; align-items: center; gap: 4px; }
+  .sudo-ask input { font-size: 11px; padding: 0 4px; width: 140px; }
   :global(.eol-glyph::after) { color: #5a6275; opacity: .9; }
   :global(.eol-lf::after) { content: "¶"; }
   :global(.eol-crlf::after) { content: "¤¶"; }

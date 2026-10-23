@@ -34,7 +34,7 @@ test("explicit values survive a round trip", () => {
   };
   const r = settingsFromForm(formFromSettings(s), "ssh");
   assert.ok(r.ok);
-  assert.deepEqual(r.settings, { ...s, shell: undefined, cwd: undefined, serial: undefined, mcp_sudo: undefined });
+  assert.deepEqual(r.settings, { ...s, shell: undefined, cwd: undefined, serial: undefined, mcp_sudo: undefined, remote_shell: undefined });
   const on = settingsFromForm(formFromSettings({ shell_integration: true }), "folder");
   assert.ok(on.ok); assert.equal(on.settings.shell_integration, true);
 });
@@ -48,6 +48,17 @@ test("mcp_sudo round-trips and defaults off", () => {
   assert.equal(formFromSettings({ mcp_sudo: true }).mcpSudo, true);
   const on = settingsFromForm(formFromSettings({ mcp_tier: "trusted", mcp_sudo: true }), "ssh");
   assert.ok(on.ok); assert.equal(on.settings.mcp_sudo, true);
+});
+
+test("remote shell: SSH hosts and folders keep it, other kinds drop it", () => {
+  const f = { ...formFromSettings({}), remoteShell: " /usr/bin/zsh " };
+  const ssh = settingsFromForm(f, "ssh");
+  assert.ok(ssh.ok); assert.equal(ssh.settings.remote_shell, "/usr/bin/zsh");
+  const dir = settingsFromForm(f, "folder");
+  assert.ok(dir.ok); assert.equal(dir.settings.remote_shell, "/usr/bin/zsh");
+  const loc = settingsFromForm(f, "local");
+  assert.ok(loc.ok); assert.equal(loc.settings.remote_shell, undefined);
+  assert.equal(formFromSettings(JSON.parse('{"remote_shell":null}')).remoteShell, "");
 });
 
 test("validation", () => {

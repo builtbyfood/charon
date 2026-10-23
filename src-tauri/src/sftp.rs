@@ -16,6 +16,10 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub const CHUNK: usize = 256 * 1024;
+/// Per-request SFTP timeout. russh-sftp's default is 10 s, which a big file's
+/// close (or a read on a congested link) can exceed; dead links are caught by
+/// keepalive instead.
+pub const SFTP_REQUEST_TIMEOUT_SECS: u64 = 120;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Entry {
@@ -143,7 +147,9 @@ impl Transfers {
     }
 }
 
-/// Pump `src` into `dst`, reporting every chunk. Returns bytes copied.
+/// Pump `src` into `dst`, reporting every chunk. Returns bytes copied. Does not
+/// flush: a local file wants `flush`, an SFTP file wants `shutdown` (drain the
+/// writes and close) — flushing one would also fsync it on the server.
 async fn pump<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin>(
     src: &mut R,
     dst: &mut W,
@@ -163,7 +169,6 @@ async fn pump<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin>
         done += n as u64;
         t.report(done, total, "running", None);
     }
-    dst.flush().await?;
     Ok(done)
 }
 
@@ -171,6 +176,13 @@ async fn pump<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin>
 
 pub struct SftpFs {
     pub sftp: Arc<SftpSession>,
+}
+
+impl SftpFs {
+    pub fn new(sftp: SftpSession) -> Self {
+        sftp.set_timeout(SFTP_REQUEST_TIMEOUT_SECS);
+        SftpFs { sftp: Arc::new(sftp) }
+    }
 }
 
 /// Write the sudo password (consumed by `sudo -S -p ''`) then start an SFTP
@@ -185,7 +197,14 @@ where
     let sftp = SftpSession::new(stream)
         .await
         .context("sudo sftp-server did not start (wrong password, or sftp-server missing)")?;
-    Ok(SftpFs { sftp: Arc::new(sftp) })
+    Ok(SftpFs::new(sftp))
+}
+
+/// Just the permission bits of `a`, for a setstat that touches nothing else.
+fn mode_of(a: &FileAttributes) -> FileAttributes {
+    let mut m = FileAttributes::empty();
+    m.permissions = a.permissions.map(|p| p & 0o7777);
+    m
 }
 
 fn kind_of(a: &FileAttributes) -> &'static str {
@@ -212,6 +231,23 @@ fn entry_from(name: String, path: String, a: &FileAttributes) -> Entry {
         user: a.user.clone(),
         group: a.group.clone(),
     }
+}
+
+/// ShellFs atomic replace: stat the original (owner, mode) first, decode into a temp
+/// file given the original mode, `mv` it over, then chown + chmod the result (chown
+/// first: it clears setuid/setgid). A new file keeps the shell's defaults.
+/// Heredoc body follows the command line; the `; printf` end sentinel added by
+/// hidden::wrap runs after the whole line, i.e. after the heredoc is consumed.
+pub fn shell_write_cmd(path: &str, b64_body: &str) -> String {
+    format!(
+        "__o=$(stat -c %u:%g -- {p} 2>/dev/null); __m=$(stat -c %a -- {p} 2>/dev/null); \
+         base64 -d <<'CHARON_B64' > {t} && {{ [ -z \"$__m\" ] || chmod \"$__m\" -- {t}; }} && mv -f -- {t} {p} \
+         && {{ [ -z \"$__o\" ] || {{ chown \"$__o\" -- {p} && chmod \"$__m\" -- {p}; }}; }}; \
+         __rc=$?; unset __o __m; (exit $__rc)\n{body}\nCHARON_B64",
+        t = sq(&format!("{path}.charon-tmp")),
+        p = sq(path),
+        body = b64_body,
+    )
 }
 
 pub fn posix_join(dir: &str, name: &str) -> String {
@@ -304,20 +340,37 @@ impl Fs for SftpFs {
 
     async fn write(&self, path: &str, data: &[u8]) -> Result<()> {
         let tmp = format!("{path}.charon-tmp");
+        // Stat first: the replacement gets the original's owner and mode back.
+        let orig = self.sftp.metadata(path).await.ok();
         let mut f = self
             .sftp
             .open_with_flags(&tmp, OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE)
             .await?;
         f.write_all(data).await?;
         f.shutdown().await?;
-        // Keep the original mode where we can; SFTP rename refuses to clobber on some servers.
-        if let Ok(a) = self.sftp.metadata(path).await {
-            let mut keep = FileAttributes::empty();
-            keep.permissions = a.permissions;
-            let _ = self.sftp.set_metadata(&tmp, keep).await;
+        if let Some(a) = &orig {
+            // Mode on the temp file too, so the new file is never briefly wider open.
+            let _ = self.sftp.set_metadata(&tmp, mode_of(a)).await;
+            // SFTP v3 rename refuses to clobber an existing file.
             let _ = self.sftp.remove_file(path).await;
         }
         self.sftp.rename(&tmp, path).await.with_context(|| format!("rename {tmp} over {path}"))?;
+        if let Some(a) = &orig {
+            // chown before chmod: chown clears setuid/setgid, chmod puts them back.
+            // Only root (sudo-sftp) can give a file away; as the login user the file
+            // is already ours, so restoring the same owner is a no-op that succeeds.
+            if let (Some(uid), Some(gid)) = (a.uid, a.gid) {
+                let mut own = FileAttributes::empty();
+                own.uid = Some(uid);
+                own.gid = Some(gid);
+                if let Err(e) = self.sftp.set_metadata(path, own).await {
+                    tracing::warn!(path, uid, gid, "write: could not restore owner: {e}");
+                }
+            }
+            if let Err(e) = self.sftp.set_metadata(path, mode_of(a)).await {
+                tracing::warn!(path, "write: could not restore mode: {e}");
+            }
+        }
         Ok(())
     }
 
@@ -325,7 +378,10 @@ impl Fs for SftpFs {
         let total = self.sftp.metadata(path).await?.size.unwrap_or(0);
         let mut src = self.sftp.open(path).await?;
         let mut dst = tokio::fs::File::create(local).await.with_context(|| format!("create {}", local.display()))?;
-        let r = pump(&mut src, &mut dst, total, t).await;
+        let r = match pump(&mut src, &mut dst, total, t).await {
+            Ok(_) => dst.flush().await.map_err(Into::into),
+            Err(e) => Err(e),
+        };
         if r.is_err() {
             let _ = tokio::fs::remove_file(local).await;
         }
@@ -339,8 +395,15 @@ impl Fs for SftpFs {
             .sftp
             .open_with_flags(path, OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE)
             .await?;
-        let r = pump(&mut src, &mut dst, total, t).await;
-        let _ = dst.shutdown().await;
+        // shutdown waits for every write ack and closes the handle; its error is the
+        // upload's error (a failed write surfaces here, not in pump).
+        let r = match pump(&mut src, &mut dst, total, t).await {
+            Ok(_) => dst.shutdown().await.context("finish upload"),
+            Err(e) => {
+                let _ = dst.shutdown().await;
+                Err(e)
+            }
+        };
         if r.is_err() {
             let _ = self.sftp.remove_file(path).await;
         }
@@ -487,7 +550,10 @@ impl Fs for LocalFs {
         let mut src = tokio::fs::File::open(path).await?;
         let total = src.metadata().await?.len();
         let mut dst = tokio::fs::File::create(local).await?;
-        let r = pump(&mut src, &mut dst, total, t).await;
+        let r = match pump(&mut src, &mut dst, total, t).await {
+            Ok(_) => dst.flush().await.map_err(Into::into),
+            Err(e) => Err(e),
+        };
         if r.is_err() {
             let _ = tokio::fs::remove_file(local).await;
         }
@@ -676,16 +742,7 @@ impl Fs for ShellFs {
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD.encode(data);
         let body: Vec<&str> = b64.as_bytes().chunks(76).map(|c| std::str::from_utf8(c).unwrap()).collect();
-        let tmp = format!("{path}.charon-tmp");
-        // Heredoc body follows the command line; the `; printf` end sentinel added by
-        // hidden::wrap runs after the whole line, i.e. after the heredoc is consumed.
-        let cmd = format!(
-            "base64 -d <<'CHARON_B64' > {t} && {{ [ ! -e {p} ] || chmod --reference={p} {t}; }} && mv -f -- {t} {p}\n{body}\nCHARON_B64",
-            t = sq(&tmp),
-            p = sq(path),
-            body = body.join("\n"),
-        );
-        self.run(&cmd).await.map(|_| ())
+        self.run(&shell_write_cmd(path, &body.join("\n"))).await.map(|_| ())
     }
 
     async fn download(&self, path: &str, local: &Path, t: &Transfer) -> Result<()> {
@@ -744,9 +801,205 @@ fn strip_verbatim(p: PathBuf) -> PathBuf {
     }
 }
 
+/// An in-memory sftp-server that behaves like Linux running as root: files it
+/// creates are 0:0 0644, chown clears setuid/setgid, rename refuses to clobber
+/// (SFTP v3). Every request is logged so tests can check the order of operations.
+#[cfg(test)]
+mod memsftp {
+    use russh_sftp::protocol::{Attrs, Data, FileAttributes, Handle, OpenFlags, Status, StatusCode, Version};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct MemFile { pub data: Vec<u8>, pub uid: u32, pub gid: u32, pub mode: u32 }
+
+    #[derive(Default)]
+    pub struct State {
+        pub files: HashMap<String, MemFile>,
+        pub log: Vec<String>,
+        handles: HashMap<String, String>,
+        /// Refuse every write at or past this offset (disk full), for error paths.
+        pub fail_writes_from: Option<u64>,
+    }
+
+    impl State {
+        pub fn handles_open(&self) -> usize { self.handles.len() }
+    }
+
+    pub struct Server(pub Arc<Mutex<State>>);
+
+    fn ok(id: u32) -> Status {
+        Status { id, status_code: StatusCode::Ok, error_message: "Ok".into(), language_tag: "en-US".into() }
+    }
+    fn attrs_of(f: &MemFile) -> FileAttributes {
+        let mut a = FileAttributes::empty();
+        a.size = Some(f.data.len() as u64);
+        a.uid = Some(f.uid);
+        a.gid = Some(f.gid);
+        a.permissions = Some(0o100000 | f.mode);
+        a
+    }
+
+    impl russh_sftp::server::Handler for Server {
+        type Error = StatusCode;
+        fn unimplemented(&self) -> Self::Error { StatusCode::OpUnsupported }
+        async fn init(&mut self, _v: u32, _e: HashMap<String, String>) -> Result<Version, Self::Error> { Ok(Version::new()) }
+        async fn open(&mut self, id: u32, path: String, flags: OpenFlags, _a: FileAttributes) -> Result<Handle, Self::Error> {
+            let mut s = self.0.lock().unwrap();
+            s.log.push(format!("open {path}"));
+            if flags.contains(OpenFlags::CREATE) {
+                let f = s.files.entry(path.clone()).or_insert(MemFile { data: vec![], uid: 0, gid: 0, mode: 0o644 });
+                if flags.contains(OpenFlags::TRUNCATE) { f.data.clear(); }
+            } else if !s.files.contains_key(&path) {
+                return Err(StatusCode::NoSuchFile);
+            }
+            let h = format!("h{}", s.handles.len());
+            s.handles.insert(h.clone(), path);
+            Ok(Handle { id, handle: h })
+        }
+        async fn write(&mut self, id: u32, handle: String, offset: u64, data: Vec<u8>) -> Result<Status, Self::Error> {
+            let mut s = self.0.lock().unwrap();
+            let path = s.handles.get(&handle).cloned().ok_or(StatusCode::Failure)?;
+            if s.fail_writes_from.is_some_and(|at| offset >= at) { return Err(StatusCode::Failure); }
+            let f = s.files.get_mut(&path).ok_or(StatusCode::NoSuchFile)?;
+            let end = offset as usize + data.len();
+            if f.data.len() < end { f.data.resize(end, 0); }
+            f.data[offset as usize..end].copy_from_slice(&data);
+            Ok(ok(id))
+        }
+        async fn read(&mut self, id: u32, handle: String, offset: u64, len: u32) -> Result<Data, Self::Error> {
+            let s = self.0.lock().unwrap();
+            let path = s.handles.get(&handle).ok_or(StatusCode::Failure)?;
+            let f = s.files.get(path).ok_or(StatusCode::NoSuchFile)?;
+            let start = (offset as usize).min(f.data.len());
+            if start == f.data.len() { return Err(StatusCode::Eof); }
+            let end = (start + len as usize).min(f.data.len());
+            Ok(Data { id, data: f.data[start..end].to_vec() })
+        }
+        async fn close(&mut self, id: u32, handle: String) -> Result<Status, Self::Error> {
+            self.0.lock().unwrap().handles.remove(&handle);
+            Ok(ok(id))
+        }
+        async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
+            let s = self.0.lock().unwrap();
+            s.files.get(&path).map(|f| Attrs { id, attrs: attrs_of(f) }).ok_or(StatusCode::NoSuchFile)
+        }
+        async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> { self.stat(id, path).await }
+        async fn fstat(&mut self, id: u32, handle: String) -> Result<Attrs, Self::Error> {
+            let path = self.0.lock().unwrap().handles.get(&handle).cloned().ok_or(StatusCode::Failure)?;
+            self.stat(id, path).await
+        }
+        async fn setstat(&mut self, id: u32, path: String, a: FileAttributes) -> Result<Status, Self::Error> {
+            let mut s = self.0.lock().unwrap();
+            let f = s.files.get_mut(&path).ok_or(StatusCode::NoSuchFile)?;
+            let mut what = Vec::new();
+            if let Some(p) = a.permissions { f.mode = p & 0o7777; what.push(format!("chmod {:o}", f.mode)); }
+            if let (Some(u), Some(g)) = (a.uid, a.gid) {
+                f.uid = u; f.gid = g;
+                f.mode &= !0o6000; // like chown(2): setuid/setgid dropped
+                what.push(format!("chown {u}:{g}"));
+            }
+            let line = format!("setstat {path} {}", what.join(" "));
+            s.log.push(line);
+            Ok(ok(id))
+        }
+        async fn remove(&mut self, id: u32, path: String) -> Result<Status, Self::Error> {
+            let mut s = self.0.lock().unwrap();
+            s.log.push(format!("remove {path}"));
+            s.files.remove(&path).map(|_| ok(id)).ok_or(StatusCode::NoSuchFile)
+        }
+        async fn rename(&mut self, id: u32, from: String, to: String) -> Result<Status, Self::Error> {
+            let mut s = self.0.lock().unwrap();
+            s.log.push(format!("rename {from} {to}"));
+            if s.files.contains_key(&to) { return Err(StatusCode::Failure); }
+            let f = s.files.remove(&from).ok_or(StatusCode::NoSuchFile)?;
+            s.files.insert(to, f);
+            Ok(ok(id))
+        }
+    }
+
+    /// An `SftpFs` talking to a fresh in-memory server holding `files`.
+    pub async fn fs_with(files: Vec<(&str, MemFile)>) -> (super::SftpFs, Arc<Mutex<State>>) {
+        let state = Arc::new(Mutex::new(State::default()));
+        for (p, f) in files { state.lock().unwrap().files.insert(p.to_string(), f); }
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        russh_sftp::server::run(server, Server(state.clone())).await;
+        let sftp = russh_sftp::client::SftpSession::new(client).await.expect("handshake");
+        (super::SftpFs::new(sftp), state)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn save_as_sudo_preserves_owner_and_mode() {
+        use memsftp::MemFile;
+        // A root-run sftp-server (sudo-sftp) editing a setuid file owned by 1000:33.
+        let orig = MemFile { data: b"old\n".to_vec(), uid: 1000, gid: 33, mode: 0o4750 };
+        let (fs, state) = memsftp::fs_with(vec![("/etc/app.conf", orig.clone())]).await;
+        fs.write("/etc/app.conf", b"new contents\n").await.expect("write");
+
+        let s = state.lock().unwrap();
+        let f = s.files.get("/etc/app.conf").expect("file still there");
+        assert_eq!(f.data, b"new contents\n");
+        assert_eq!((f.uid, f.gid), (1000, 33), "owner restored (the temp file was created 0:0)");
+        assert_eq!(f.mode, 0o4750, "mode restored, setuid included");
+        assert!(!s.files.contains_key("/etc/app.conf.charon-tmp"), "temp file renamed away");
+        // Written to a temp file first, renamed over, then chown before chmod.
+        let pos = |needle: &str| s.log.iter().position(|l| l.starts_with(needle)).unwrap_or_else(|| panic!("no {needle:?} in {:?}", s.log));
+        assert!(pos("open /etc/app.conf.charon-tmp") < pos("rename /etc/app.conf.charon-tmp /etc/app.conf"));
+        assert!(pos("rename") < pos("setstat /etc/app.conf chown 1000:33"));
+        assert!(pos("setstat /etc/app.conf chown") < pos("setstat /etc/app.conf chmod 4750"));
+    }
+
+    #[tokio::test]
+    async fn save_of_a_new_file_keeps_server_defaults() {
+        let (fs, state) = memsftp::fs_with(vec![]).await;
+        fs.write("/tmp/new.txt", b"x").await.expect("write");
+        let s = state.lock().unwrap();
+        let f = s.files.get("/tmp/new.txt").unwrap();
+        assert_eq!((f.uid, f.gid, f.mode), (0, 0, 0o644));
+        assert!(!s.log.iter().any(|l| l.starts_with("setstat")), "nothing to restore: {:?}", s.log);
+    }
+
+    #[tokio::test]
+    async fn upload_waits_for_every_write_then_closes() {
+        let (fs, state) = memsftp::fs_with(vec![]).await;
+        let dir = std::env::temp_dir().join(format!("charon-up-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("big.bin");
+        let body: Vec<u8> = (0..CHUNK * 3 + 17).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&src, &body).unwrap();
+        let t = Transfer::new("u1".into(), None, Arc::new(AtomicBool::new(false)));
+        fs.upload(&src, "/srv/big.bin", &t).await.expect("upload");
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(s.files.get("/srv/big.bin").unwrap().data, body, "every chunk landed in order");
+            assert_eq!(s.handles_open(), 0, "handle closed");
+        }
+
+        // A write the server refuses mid-file fails the upload (not swallowed by the
+        // close) and the partial remote file is removed.
+        state.lock().unwrap().fail_writes_from = Some(CHUNK as u64);
+        let err = fs.upload(&src, "/srv/part.bin", &t).await.expect_err("server refused a write");
+        assert!(!state.lock().unwrap().files.contains_key("/srv/part.bin"), "partial file removed: {err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shell_write_restores_owner_then_mode_after_the_rename() {
+        let cmd = shell_write_cmd("/etc/it's", "Zm9v");
+        let first = cmd.lines().next().unwrap();
+        let at = |n: &str| first.find(n).unwrap_or_else(|| panic!("no {n:?} in {first}"));
+        // stat before anything is written; mv before chown; chown before the final chmod.
+        assert!(at("stat -c %u:%g -- '/etc/it'\\''s'") < at("base64 -d"));
+        assert!(at("mv -f --") < at("chown \"$__o\" -- '/etc/it'\\''s'"));
+        assert!(at("chown \"$__o\"") < first.rfind("chmod \"$__m\" -- '/etc/it'\\''s'").unwrap());
+        // The heredoc body and terminator follow the one command line.
+        assert_eq!(cmd.lines().skip(1).collect::<Vec<_>>(), vec!["Zm9v", "CHARON_B64"]);
+    }
 
     #[test]
     fn posix_paths() {

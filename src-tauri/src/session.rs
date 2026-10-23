@@ -10,6 +10,9 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{oneshot, Mutex};
 
+/// Output parked for sessions whose tab is moving between windows.
+static HOLDS: std::sync::LazyLock<crate::tabmove::Holds> = std::sync::LazyLock::new(Default::default);
+
 #[async_trait]
 pub trait Session: Send + Sync {
     async fn write(&self, data: &[u8]) -> Result<()>;
@@ -30,6 +33,12 @@ pub trait Session: Send + Sync {
     /// (MCP run_command, tier-gated). Default ignores the flag.
     async fn exec_hidden_sudo(&self, cmd: &str, _allow_sudo: bool) -> Result<(Vec<u8>, i32)> {
         self.exec_hidden(cmd).await
+    }
+    /// Run a non-interactive command on its own exec channel over the same
+    /// connection: no pty, never touches the interactive shell, so it works while
+    /// the terminal is busy (vim, a long build). Returns stdout and exit code. SSH only.
+    async fn exec_channel(&self, _cmd: &str) -> Result<(Vec<u8>, i32)> {
+        Err(anyhow!("this session cannot open exec channels"))
     }
     /// Open a root SFTP channel via `sudo -S <server>` (P6). SSH only.
     async fn sudo_fs(&self, _password: &str, _server: &str) -> Result<Arc<dyn crate::sftp::Fs>> {
@@ -62,11 +71,14 @@ pub struct SessionInfo {
     /// Remote host, for MCP `list_sessions`.
     #[serde(default)]
     pub host: Option<String>,
+    /// SSH: the shell started instead of the login shell, if one was chosen.
+    #[serde(default)]
+    pub remote_shell: Option<String>,
 }
 
 impl SessionInfo {
     pub fn new(id: String, title: String, kind: &str) -> Self {
-        Self { id, title, kind: kind.into(), shell_integration: false, shell: None, cwd: None, node_id: None, host: None }
+        Self { id, title, kind: kind.into(), shell_integration: false, shell: None, cwd: None, node_id: None, host: None, remote_shell: None }
     }
 }
 
@@ -169,7 +181,13 @@ impl SessionManager {
     }
 
     /// Push output bytes to the UI. Base64 so binary-safe through JSON.
+    /// While the session's tab moves between windows the bytes are held instead
+    /// (see `tabmove.rs`).
     pub fn emit_data(app: &AppHandle, id: &str, data: &[u8]) {
+        HOLDS.data(id, data, |b| Self::emit_now(app, id, b));
+    }
+
+    fn emit_now(app: &AppHandle, id: &str, data: &[u8]) {
         let _ = app.emit(
             &format!("term:data:{id}"),
             base64::engine::general_purpose::STANDARD.encode(data),
@@ -177,7 +195,22 @@ impl SessionManager {
     }
 
     pub fn emit_closed(app: &AppHandle, id: &str, reason: &str) {
-        let _ = app.emit(&format!("term:closed:{id}"), reason.to_string());
+        HOLDS.closed(id, reason, |r| { let _ = app.emit(&format!("term:closed:{id}"), r.to_string()); });
+    }
+
+    /// Park `id`'s output. An empty data event marks the point: every byte before
+    /// it reached the UI, everything after waits for `release`.
+    pub fn hold(app: &AppHandle, id: &str) {
+        HOLDS.hold(id, || Self::emit_now(app, id, b""));
+    }
+
+    /// Resume `id`, emitting what was held (and a close that happened meanwhile).
+    pub fn release(app: &AppHandle, id: &str) {
+        HOLDS.release(
+            id,
+            |b| Self::emit_now(app, id, b),
+            |r| { let _ = app.emit(&format!("term:closed:{id}"), r.to_string()); },
+        );
     }
 }
 

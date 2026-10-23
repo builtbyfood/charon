@@ -30,6 +30,51 @@ pub struct SshParams {
     /// Server-alive interval; `None` (profile 0) disables keepalive. Applies to
     /// the whole connection â the shell, SFTP, and sudo channels share it.
     pub keepalive: Option<std::time::Duration>,
+    /// Start this shell instead of the account's login shell (`shell_command`).
+    pub shell: Option<String>,
+}
+
+/// Unix shells that take `-l` (start as a login shell, so profiles load).
+const LOGIN_SHELLS: &[&str] = &["sh", "bash", "zsh", "fish", "ksh", "mksh", "dash", "ash", "tcsh", "csh", "yash", "oksh"];
+
+fn shell_base(s: &str) -> String {
+    let b = s.rsplit(['/', '\\']).next().unwrap_or(s).to_ascii_lowercase();
+    b.strip_suffix(".exe").map(str::to_string).unwrap_or(b)
+}
+
+/// The exec request that starts a chosen shell on the pty. A Unix shell by name or
+/// path runs as a login shell; anything else (pwsh, cmd, or a command with its own
+/// arguments) runs as written.
+pub fn shell_command(shell: &str) -> String {
+    let s = shell.trim();
+    if !s.contains(char::is_whitespace) && LOGIN_SHELLS.contains(&shell_base(s).as_str()) {
+        format!("{s} -l")
+    } else {
+        s.to_string()
+    }
+}
+
+/// Shells a host offers. `etc_shells` = `/etc/shells` (Unix): its paths, one per
+/// shell name (first path wins), without restricted/non-shell entries. Otherwise
+/// `where` output from Windows: the shell names found.
+pub fn parse_shells(out: &str, etc_shells: bool) -> Vec<String> {
+    const SKIP: &[&str] = &["nologin", "false", "git-shell", "rbash", "screen", "tmux", "sync", "true"];
+    let mut seen = std::collections::HashSet::new();
+    let mut shells = Vec::new();
+    for line in out.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if etc_shells && !line.starts_with('/') {
+            continue;
+        }
+        let base = shell_base(line);
+        if SKIP.contains(&base.as_str()) || !seen.insert(base.clone()) {
+            continue;
+        }
+        shells.push(if etc_shells { line.to_string() } else { base });
+    }
+    shells
 }
 
 /// One bastion on the way to the target.
@@ -328,7 +373,14 @@ impl SshSession {
         channel
             .request_pty(false, "xterm-256color", p.cols as u32, p.rows as u32, 0, 0, &[])
             .await?;
-        channel.request_shell(true).await?;
+        match p.shell.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(shell) => {
+                let cmd = shell_command(shell);
+                tracing::info!(session = %id, shell = %cmd, "starting chosen shell");
+                channel.exec(true, cmd).await?;
+            }
+            None => channel.request_shell(true).await?,
+        }
 
         let (tx, mut rx) = mpsc::channel::<Cmd>(256);
         // Password (password-auth only) used to auto-answer the login user's own
@@ -353,6 +405,8 @@ impl SshSession {
             // are held here and flushed once it finishes, so they never interleave with
             // (or get dropped by) the capture window.
             let mut pending_writes: Vec<u8> = Vec::new();
+            // Hidden commands are typed into the shell: only at an empty prompt.
+            let mut prompt = crate::hidden::PromptState::default();
             let finish = |c: Option<(crate::hidden::Capture, oneshot::Sender<Result<(Vec<u8>, i32)>>)>, r: Result<(), String>| {
                 if let Some((cap, reply)) = c {
                     let _ = reply.send(r.map(|_| cap.into_result()).map_err(|e| anyhow!(e)));
@@ -363,6 +417,7 @@ impl SshSession {
                 tokio::select! {
                     msg = channel.wait() => match msg {
                         Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
+                            prompt.output(&data);
                             match capture.as_mut() {
                                 Some((cap, _)) => {
                                     let show = cap.feed(&data);
@@ -393,6 +448,7 @@ impl SshSession {
                     cmd = rx.recv() => match cmd {
                         // Queue input while a hidden command captures; flush after (below).
                         Some(Cmd::Write(b)) => {
+                            prompt.input(&b);
                             if capture.is_some() { pending_writes.extend_from_slice(&b); }
                             else { let _ = channel.data(&b[..]).await; }
                         }
@@ -401,6 +457,9 @@ impl SshSession {
                             out.flush_close(); // don't let buffered output land inside the capture window
                             if capture.is_some() {
                                 let _ = reply.send(Err(anyhow!("another hidden command is still running")));
+                            } else if let Err(why) = prompt.ready() {
+                                tracing::info!(session = %id, "hidden command refused: {why}");
+                                let _ = reply.send(Err(anyhow!("{why}")));
                             } else if channel.data(&line[..]).await.is_err() {
                                 let _ = reply.send(Err(anyhow!("channel gone")));
                             } else {
@@ -445,6 +504,96 @@ impl SshSession {
     }
 }
 
+/// Collects an exec channel's result. stdout only (stderr is dropped, so probe
+/// noise can't masquerade as output), capped; done at Close. ExitStatus usually
+/// arrives after Eof, so Eof alone doesn't end it.
+#[derive(Default)]
+struct ExecOut {
+    stdout: Vec<u8>,
+    code: Option<u32>,
+}
+
+impl ExecOut {
+    const CAP: usize = 64 * 1024;
+
+    /// Take one channel message; true when the channel is finished.
+    fn feed(&mut self, msg: &ChannelMsg) -> bool {
+        match msg {
+            ChannelMsg::Data { data } => {
+                let room = Self::CAP.saturating_sub(self.stdout.len());
+                self.stdout.extend_from_slice(&data[..data.len().min(room)]);
+                false
+            }
+            ChannelMsg::ExitStatus { exit_status } => {
+                self.code = Some(*exit_status);
+                false
+            }
+            ChannelMsg::Close => true,
+            _ => false,
+        }
+    }
+
+    /// (stdout, exit code); -1 when the server never sent one.
+    fn finish(self) -> (Vec<u8>, i32) {
+        (self.stdout, self.code.map(|c| c as i32).unwrap_or(-1))
+    }
+}
+
+#[cfg(test)]
+mod shell_tests {
+    use super::*;
+
+    #[test]
+    fn unix_shells_start_as_login_shells_others_as_written() {
+        assert_eq!(shell_command("zsh"), "zsh -l");
+        assert_eq!(shell_command(" /usr/bin/fish "), "/usr/bin/fish -l");
+        assert_eq!(shell_command("pwsh"), "pwsh");
+        assert_eq!(shell_command("powershell.exe"), "powershell.exe");
+        assert_eq!(shell_command("cmd"), "cmd");
+        assert_eq!(shell_command("bash --norc"), "bash --norc");
+        assert_eq!(shell_command("nu"), "nu");
+    }
+
+    #[test]
+    fn etc_shells_lists_each_shell_once() {
+        let etc = "# /etc/shells: valid login shells\n/bin/sh\n/bin/bash\n/usr/bin/bash\n/bin/rbash\n/usr/bin/zsh\n/usr/sbin/nologin\n\n/usr/bin/tmux\n/usr/bin/fish\n";
+        assert_eq!(parse_shells(etc, true), ["/bin/sh", "/bin/bash", "/usr/bin/zsh", "/usr/bin/fish"]);
+    }
+
+    #[test]
+    fn windows_where_output_gives_shell_names() {
+        let out = "C:\\Program Files\\PowerShell\\7\\pwsh.exe\r\nC:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\r\nC:\\Windows\\System32\\cmd.exe\r\n";
+        assert_eq!(parse_shells(out, false), ["pwsh", "powershell", "cmd"]);
+    }
+}
+
+#[cfg(test)]
+mod exec_out_tests {
+    use super::*;
+    use russh::CryptoVec;
+
+    #[test]
+    fn collects_stdout_and_exit_status_through_eof_until_close() {
+        let mut o = ExecOut::default();
+        assert!(!o.feed(&ChannelMsg::Data { data: CryptoVec::from_slice(b"/usr/lib/openssh/") }));
+        assert!(!o.feed(&ChannelMsg::ExtendedData { data: CryptoVec::from_slice(b"stderr noise"), ext: 1 }));
+        assert!(!o.feed(&ChannelMsg::Data { data: CryptoVec::from_slice(b"sftp-server") }));
+        assert!(!o.feed(&ChannelMsg::Eof));
+        assert!(!o.feed(&ChannelMsg::ExitStatus { exit_status: 0 }), "exit status after EOF is still read");
+        assert!(o.feed(&ChannelMsg::Close));
+        assert_eq!(o.finish(), (b"/usr/lib/openssh/sftp-server".to_vec(), 0));
+    }
+
+    #[test]
+    fn caps_output_and_reports_missing_exit_status() {
+        let mut o = ExecOut::default();
+        o.feed(&ChannelMsg::Data { data: CryptoVec::from_slice(&vec![b'x'; ExecOut::CAP + 10]) });
+        let (out, code) = o.finish();
+        assert_eq!(out.len(), ExecOut::CAP);
+        assert_eq!(code, -1);
+    }
+}
+
 #[async_trait]
 impl Session for SshSession {
     async fn write(&self, data: &[u8]) -> Result<()> {
@@ -472,6 +621,18 @@ impl Session for SshSession {
         self.auth_password.clone()
     }
 
+    async fn exec_channel(&self, cmd: &str) -> Result<(Vec<u8>, i32)> {
+        let mut channel = self.handle.lock().await.channel_open_session().await.context("open exec channel")?;
+        channel.exec(true, cmd).await.context("exec")?;
+        let mut out = ExecOut::default();
+        while let Some(msg) = channel.wait().await {
+            if out.feed(&msg) {
+                break;
+            }
+        }
+        Ok(out.finish())
+    }
+
     async fn sudo_fs(&self, password: &str, server: &str) -> Result<Arc<dyn crate::sftp::Fs>> {
         // New channel; sudo -S reads the password from stdin, -p '' hides the prompt,
         // then execs sftp-server as root on the same channel.
@@ -493,7 +654,7 @@ impl Session for SshSession {
         let channel = self.handle.lock().await.channel_open_session().await.context("open sftp channel")?;
         channel.request_subsystem(true, "sftp").await.context("request sftp subsystem")?;
         let sftp = russh_sftp::client::SftpSession::new(channel.into_stream()).await.context("sftp init")?;
-        let fs = Arc::new(crate::sftp::SftpFs { sftp: Arc::new(sftp) });
+        let fs = Arc::new(crate::sftp::SftpFs::new(sftp));
         *slot = Some(fs.clone());
         Ok(fs)
     }

@@ -19,6 +19,9 @@ export interface CommandMark {
   decoration?: IDecoration;
 }
 
+/** A mark without its xterm objects (exportMarks / importMarks). */
+export type SavedMark = Omit<CommandMark, "marker" | "decoration">;
+
 export interface TrackerOptions {
   /** Session colour for the gutter bar. */
   color: string;
@@ -52,6 +55,34 @@ export class CommandTracker {
     this.flashDeco?.dispose();
     for (const m of this.marks) { m.decoration?.dispose(); m.marker?.dispose(); }
     this.marks.length = 0;
+  }
+
+  /** The marks as plain data with current line numbers, for moving the tab to
+   *  another window (the screen is serialised at the same size, so lines match). */
+  exportMarks(): SavedMark[] {
+    this.prune();
+    return this.marks.map((m) => {
+      const d = this.lineOf(m) - m.promptLine;
+      const { marker: _m, decoration: _d, ...rest } = m;
+      const sh = (n: number | undefined) => (n === undefined ? undefined : n + d);
+      return { ...rest, promptLine: m.promptLine + d, cmdStartLine: sh(m.cmdStartLine), outputStartLine: sh(m.outputStartLine), endLine: sh(m.endLine) };
+    });
+  }
+
+  /** Restore exported marks after the screen was written back. Gutter bars need a
+   *  marker in the normal buffer; with a full-screen program up (alternate
+   *  buffer) the marks keep only their data (queries still work). */
+  importMarks(saved: SavedMark[]): void {
+    const b = this.term.buffer.active;
+    const normal = b.type === "normal";
+    const cursor = b.baseY + b.cursorY;
+    for (const s of saved) {
+      const m: CommandMark = { ...s };
+      if (normal) m.marker = this.term.registerMarker(s.promptLine - cursor);
+      this.marks.push(m);
+      if (m.outputStartLine !== undefined) this.draw(m, m.endLine !== undefined ? m.exitCode : undefined);
+    }
+    if (saved.length) this.seen = true;
   }
 
   /** True once the session has produced any 133 sequence. */

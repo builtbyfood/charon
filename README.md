@@ -1,70 +1,146 @@
-# Charon
+<p align="center">
+  <img src="docs/img/icon-256.png" width="96" alt="Charon">
+</p>
 
-One tool for engineers who live in terminals: connection manager, SSH/serial/local
-terminals, an editor, sanitised copy/paste, and an MCP server so agents can drive
-real sessions. Portable on Windows, `.deb`/`.rpm`/AppImage on Linux, one codebase.
+<h1 align="center">Charon</h1>
 
-Named for the ferryman — it gets you across to the other machine.
+<p align="center">
+  Terminal, connection manager, SFTP, editor and an MCP bridge for AI agents — in one app.<br>
+  Portable on Windows. deb/rpm/AppImage on Linux. dmg on macOS.
+</p>
 
-## Stack
+<p align="center">
+  <a href="https://github.com/builtbyfood/charon/releases/latest">Download</a> ·
+  <a href="docs/TESTING.md">Tester guide</a> ·
+  <a href="docs/BUILDING.md">Build from source</a> ·
+  <a href="CHANGELOG.md">Changelog</a>
+</p>
 
-| Layer      | Choice                                  | Why |
-|------------|------------------------------------------|-----|
-| Shell      | Tauri 2 (Rust)                           | ~10 MB binaries, native bundling for exe/deb/rpm/AppImage |
-| Frontend   | Svelte 5 + Vite + TypeScript             | Small, fast, no runtime bloat |
-| Terminal   | xterm.js + fit/webgl/search addons       | Battle-tested; cell grid makes clean copy trivial |
-| Editor     | Monaco (phase 2)                         | Notepad++ replacement, remote edit over SFTP |
-| SSH/SFTP   | `russh` + `russh-sftp`                   | Pure Rust, no OpenSSL packaging pain |
-| Local PTY  | `portable-pty`                           | cmd / pwsh / WSL / bash / zsh |
-| Serial     | `serialport`                             | Console cables |
-| Secrets    | `keyring` (installed) / `age` (portable) | Never plaintext on disk |
-| Store      | SQLite via `rusqlite` (bundled)          | Connection tree, credentials refs, history |
-| MCP        | `rmcp` (phase 3)                         | Agents call `run_command`, `read_scrollback`, `sftp_*` |
+<!-- screenshot: main window — connection tree on the left with a coloured folder, an SSH tab
+     with a few command marks in the gutter (one red), Files pane on the right showing the
+     "sftp as root (sudo)" badge. ~1600px wide, dark theme. -->
+![Charon main window](docs/img/screenshot-main.png)
 
-## Layout
+---
 
-```
-src-tauri/          Rust backend (Tauri commands, SSH, PTY, profiles, portable mode)
-src/                Svelte frontend (sidebar tree, terminal tabs)
-shell-integration/  OSC 133 hooks for bash/zsh/fish/PowerShell
-profiles/           Example profile + connection tree in TOML
-docs/               Architecture and phase plan
-.github/workflows/  Build matrix: Windows portable exe, Linux deb/rpm/AppImage
-```
+Charon replaces the PuTTY + MobaXterm + Notepad++ stack for people who spend their day on
+other machines. It's built around the things those tools never quite did together: a tree
+of hosts that inherit settings from their folders, a terminal that knows where each command
+starts and ends, a file pane that follows your shell (even after `sudo -i`), an editor that
+saves straight back over SFTP, and a way to let an AI agent work in a real session without
+handing it the keys.
 
-## Build
+Single Rust + Tauri codebase. No Electron, no Java, no bundled Cygwin.
 
-Prereqs: Rust stable, Node 20+, and Tauri 2 platform deps
-(<https://v2.tauri.app/start/prerequisites/>). On Debian/Ubuntu:
+## Highlights
 
-```
-sudo apt install libwebkit2gtk-4.1-dev build-essential curl wget file \
-  libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
-```
+**Connection tree with inheritance.** Folders carry user, credential, jump host, colour,
+tags and startup commands; hosts inside inherit them. Set a bastion on the `prod` folder
+once. Import from `~/.ssh/config`, PuTTY (registry or files) and MobaXterm `.mxtsessions`,
+with a duplicate preview before anything is written. `.ppk` keys are read natively.
 
-Then:
+<!-- screenshot: sidebar with two folders expanded, inherited colour dots, and the host
+     editor open showing greyed "inherit: travis" placeholders. ~900px wide. -->
+![Connection tree and host editor](docs/img/screenshot-tree.png)
 
-```
-npm install
-npm run tauri dev          # dev loop
-npm run tauri build        # bundles for the current OS
-```
+**Command-aware terminal.** A small shell hook (bash, zsh, fish, PowerShell — injected on
+connect, never written to the remote's rc files) marks every prompt, command and exit code.
+You get a gutter bar per command, red on failure; Ctrl+↑/↓ to jump between commands;
+Ctrl+Shift+↑ to select just the output; *Copy last output* on the context menu. `sudo -i`
+re-injects automatically.
 
-Bundles land in `src-tauri/target/release/bundle/`.
+<!-- screenshot: terminal close-up — three commands with gutter bars, the middle one red,
+     status-bar chip reading "bash · 133 on · 3 marks". ~1000px wide. -->
+![Command marks](docs/img/screenshot-marks.png)
 
-## Portable mode
+**Clean copy and paste.** Copying strips zero-width characters, NBSPs, BOMs, trailing
+whitespace and smart quotes. Pasting warns on multi-line or hidden-character content with
+an inline bar (never a modal), and runs bracketed pastes without an extra Enter.
+MobaXterm-style right-click: copy with a selection, paste without.
 
-Drop an empty file named `portable.flag` next to the executable. Charon then keeps
-everything (`charon.db`, `profiles/`, `vault.age`, logs, and on Windows the
-WebView2 profile under `webview/`) in `./data/` beside the binary and never
-touches AppData / `~/.config`. The Windows CI artefact ships
-this way by default, and `npm run portable` builds the same thing locally
-(`dist-portable/charon.exe` + `portable.flag` on Windows, a tarball on Linux).
-The bar at the bottom of the window says which mode is active and where the data
-lives; `npm run tauri dev` is always installed mode.
+**Flag hints and docs.** Type `tar --` and a popup lists tar's options with descriptions,
+from bundled tldr pages plus the host's own `--help`. The Docs panel shows the tldr page for
+whatever you're typing and fetches real man pages over the session.
+
+<!-- screenshot: the flag picker open under "rsync --" with ~8 options visible. ~800px wide. -->
+![Flag picker](docs/img/screenshot-flags.png)
+
+**Files that follow you.** The SFTP pane opens with every tab and tracks the shell's
+directory (or drives it — both directions). After `sudo -i` it notices it can't read `/root`
+and quietly runs a second SFTP server through `sudo` on the same connection, so root
+browsing and transfers are full-speed SFTP. Multi-select, recursive directory transfers
+with per-file progress, drag-drop, preserve-mode.
+
+**Editor with remote save-back.** Monaco (the VS Code engine) with Notepad++ habits:
+inner document tabs, encoding and line-ending conversion in the status bar, show-all
+characters, regex find/replace, snippets, Ctrl+Enter to send a line to the terminal.
+Remote files save atomically over SFTP.
+
+<!-- screenshot: editor tab with a YAML file open, status bar showing "UTF-8 · LF · yaml",
+     inner tabs for two documents. ~1000px wide. -->
+![Editor](docs/img/screenshot-editor.png)
+
+**MCP server for agents.** Enable it and point Claude Code, Cursor or any MCP client at
+Charon. Every host has a tier: `read` (list sessions, read scrollback), `exec-approve`
+(each command pops an Approve/Deny dialog showing it verbatim; 60 s silence = deny),
+or `trusted`. Sudo is a separate explicit grant. The server binds to localhost with a
+per-launch token; the log records decisions, never command text.
+
+<!-- screenshot: the MCP approval dialog over a terminal, showing "sudo systemctl restart
+     nginx" with Approve / Deny and the "allow sudo password" checkbox. ~700px wide. -->
+![MCP approval](docs/img/screenshot-mcp.png)
+
+**Sudo button.** When `[sudo] password for you:` appears and the session has a stored
+credential, a button in the status bar (or Ctrl+Shift+P) sends it — never echoed, never
+logged. Auto-send is opt-in and only ever answers your own user's sudo prompt.
+
+**Portable.** Drop `portable.flag` next to the binary and everything — config, vault,
+known hosts, even the webview profile — lives in a `data/` folder beside it. Nothing
+touches AppData or `~/.config`. Credentials are in an `age`-encrypted vault with a master
+password (installed mode uses the OS keyring instead).
+
+## Install
+
+| Platform | Get it |
+|----------|--------|
+| Windows 10/11 | `charon-windows-portable.zip` (unzip and run) or `Charon_x.y.z_x64-setup.exe` |
+| Debian / Ubuntu 22.04+ | `sudo apt install ./charon_x.y.z_amd64.deb` |
+| Fedora / RHEL 9 family | `sudo dnf install ./charon-x.y.z-1.x86_64.rpm` |
+| Other Linux | `Charon_x.y.z_amd64.AppImage` or `charon-linux-portable.tar.gz` |
+| macOS | `Charon_x.y.z_aarch64.dmg` (Apple Silicon) or `Charon_x.y.z_x64.dmg` (Intel) — unsigned, see below |
+
+All from the [latest release](https://github.com/builtbyfood/charon/releases/latest).
+
+macOS builds are unsigned for now: on first launch right-click → Open, or run
+`xattr -d com.apple.quarantine /Applications/Charon.app`.
+
+One warning that saves an hour on Windows: don't run an elevated Charon alongside a normal
+one. They share a WebView2 profile and the non-elevated copy stops receiving keystrokes.
+Portable mode avoids this; installed mode doesn't.
 
 ## Status
 
-Phase 1 skeleton. See `docs/ARCHITECTURE.md` for the phase plan and what's stubbed.
-Nothing here has been compiled yet against a full Tauri toolchain — expect to fix
-a handful of version/API mismatches on first `cargo build`.
+Charon is a preview. It's in daily use on the maintainer's machines against Ubuntu, Fedora
+and RHEL hosts, and it's ready for other people to break. The [tester guide](docs/TESTING.md)
+walks through every feature with the things worth trying on purpose, and §10 says what to
+include in a report so it's diagnosable (Charon logs its decisions to the devtools console
+with a `[charon]` prefix — Ctrl+Shift+I).
+
+Not yet: RDP/VNC in a tab, editor language servers, signed macOS builds, serial has had
+little real-hardware time. See [ROUND3](docs/ROUND3.md) for what's next.
+
+## Building
+
+Rust stable, Node 22, and Tauri 2's platform deps. `npm install && npm run tauri dev` for
+the dev loop, `npm run tauri build` to bundle for the current OS, `npm run portable` for a
+portable build. Full details, including the Linux package lists and the CI pipeline, in
+[docs/BUILDING.md](docs/BUILDING.md).
+
+## Security
+
+Charon stores credentials and can run commands on your behalf. If you find a vulnerability,
+please read [SECURITY.md](SECURITY.md) rather than opening a public issue.
+
+## License
+
+Apache-2.0. Named for the ferryman — it gets you across to the other machine.

@@ -25,17 +25,23 @@ pub fn tool_specs() -> Value {
           "inputSchema": s(json!({ "session": { "type": "string" }, "remote": { "type": "string" }, "local": { "type": "string" } }), json!(["session", "remote", "local"])) },
         { "name": "sftp_put", "description": "Upload a local file to a remote path. May require in-app approval.",
           "inputSchema": s(json!({ "session": { "type": "string" }, "local": { "type": "string" }, "remote": { "type": "string" } }), json!(["session", "local", "remote"])) },
-        { "name": "open_in_editor", "description": "Open a file in the app's editor (local path, or a session + remote path).",
-          "inputSchema": s(json!({ "path": { "type": "string" }, "session": { "type": "string" }, "remote_path": { "type": "string" } }), json!([])) },
+        { "name": "open_in_editor", "description": "Open a file in the app's editor (local path, or a session + remote path). as_root opens it over sudo-sftp: gated like run_command plus the sudo opt-in.",
+          "inputSchema": s(json!({ "path": { "type": "string" }, "session": { "type": "string" }, "remote_path": { "type": "string" }, "as_root": { "type": "boolean" } }), json!([])) },
     ])
 }
 
-fn kind_of(tool: &str) -> ToolKind {
+fn kind_of(tool: &str, args: &Value) -> ToolKind {
     match tool {
         "run_command" | "sftp_put" => ToolKind::Exec,
+        // Opening a file as root is as privileged as running a command.
+        "open_in_editor" if as_root(args) => ToolKind::Exec,
         "sftp_get" | "open_in_editor" => ToolKind::File,
         _ => ToolKind::Read,
     }
+}
+
+fn as_root(args: &Value) -> bool {
+    args.get("as_root").and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
 fn arg_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -122,30 +128,51 @@ async fn node_mcp_sudo(state: &AppState, session: Option<&str>) -> bool {
     state.store.lock().await.effective(&node).ok().and_then(|s| s.mcp_sudo).unwrap_or(false)
 }
 
+/// What a call asks for, for the log: the command line for `run_command`, the
+/// path(s) for transfers and editor opens; nothing for the read-only listings.
+pub fn subject(tool: &str, args: &Value) -> Option<String> {
+    let s = |k: &str| args.get(k).and_then(|v| v.as_str());
+    match tool {
+        "run_command" => s("command").map(str::to_string),
+        "sftp_get" => Some(format!("{} -> {}", s("remote")?, s("local").unwrap_or("?"))),
+        "sftp_put" => Some(format!("{} -> {}", s("local")?, s("remote").unwrap_or("?"))),
+        "open_in_editor" => {
+            let p = s("remote_path").or_else(|| s("path"))?;
+            Some(if as_root(args) { format!("as root: {p}") } else { p.to_string() })
+        }
+        "get_connection" => s("node_id").map(str::to_string),
+        _ => None,
+    }
+}
+
 /// Run one tool call. Returns the MCP tool result value (never a transport error;
 /// tool failures are surfaced as `isError` content).
 pub async fn call(state: &AppState, mcp: &McpShared, name: &str, args: Value) -> Value {
     let session = args.get("session").and_then(|v| v.as_str()).map(str::to_string);
     let tier = tier_for(state, session.as_deref()).await;
-    let kind = kind_of(name);
+    let kind = kind_of(name, &args);
 
     let started = std::time::Instant::now();
+    let subj = subject(name, &args);
+    let subj = subj.as_deref();
     // Gate. Approval (if any) happens BEFORE run(), so a denied/timed-out command
     // is never sent to the shell.
     let mut approval_sudo = false;
     let mut node_sudo = false;
     match gate(kind, tier) {
         Decision::Deny => {
-            log_call(state, name, session.as_deref(), tier, "deny", false, None, started.elapsed().as_millis()).await;
-            return tool_error(&format!("permission denied: tier '{}' does not allow {name}", tier.as_str()));
+            let why = format!("permission denied: tier '{}' does not allow {name}", tier.as_str());
+            log_call(state, name, session.as_deref(), tier, "deny", false, None, started.elapsed().as_millis(), subj, Some(&why)).await;
+            return tool_error(&why);
         }
         Decision::NeedApproval => {
-            // The command text is shown in the approval dialog but never logged.
-            let cmd = args.get("command").or_else(|| args.get("local")).and_then(|v| v.as_str()).unwrap_or(name);
+            // The approval dialog shows the command; the log records it as `subject`.
+            let root_open = (name == "open_in_editor").then(|| format!("open as root: {}", args.get("remote_path").and_then(|v| v.as_str()).unwrap_or("?")));
+            let cmd = root_open.as_deref().or_else(|| args.get("command").or_else(|| args.get("local")).and_then(|v| v.as_str())).unwrap_or(name);
             let sess = session.clone().unwrap_or_default();
             let (ok, sudo) = approved(state, mcp, name, &sess, cmd).await;
             if !ok {
-                log_call(state, name, session.as_deref(), tier, "denied", false, None, started.elapsed().as_millis()).await;
+                log_call(state, name, session.as_deref(), tier, "denied", false, None, started.elapsed().as_millis(), subj, None).await;
                 return tool_error("denied by the user (or approval timed out — the command was not run)");
             }
             approval_sudo = sudo;
@@ -164,7 +191,8 @@ pub async fn call(state: &AppState, mcp: &McpShared, name: &str, args: Value) ->
         Ok(v) => (true, v.get("exit_code").and_then(|c| c.as_i64()).map(|c| c as i32)),
         Err(_) => (false, None),
     };
-    log_call(state, name, session.as_deref(), tier, decision, ok, exit, started.elapsed().as_millis()).await;
+    let error = result.as_ref().err().map(String::as_str);
+    log_call(state, name, session.as_deref(), tier, decision, ok, exit, started.elapsed().as_millis(), subj, error).await;
     match result {
         Ok(v) => tool_text(&v),
         Err(e) => tool_error(&e),
@@ -253,10 +281,20 @@ async fn run(state: &AppState, mcp: &McpShared, name: &str, args: &Value, sessio
             Ok(json!({ "ok": true, "remote": remote }))
         }
         "open_in_editor" => {
+            // Root needs the same sudo opt-in as run_command's sudo auto-answer, and a
+            // remote path: there is no sudo backend for the local disk.
+            let root = as_root(args);
+            if root && !allow_sudo {
+                return Err("opening as root needs the sudo opt-in (\"allow sudo\" in the approval dialog, or the node's mcp_sudo at trusted)".into());
+            }
+            if root && (session.is_none() || args.get("remote_path").is_none()) {
+                return Err("as_root needs session + remote_path".into());
+            }
             let payload = json!({
                 "path": args.get("path"),
                 "session": args.get("session"),
                 "remote_path": args.get("remote_path"),
+                "as_root": root,
             });
             ask_frontend(state, mcp, "mcp:open_editor", payload).await
         }
@@ -269,6 +307,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn log_subject_is_what_the_agent_asked_for() {
+        let cmd = serde_json::json!({ "session": "s", "command": "grep -n 'CHARON' docker-compose.yml" });
+        assert_eq!(subject("run_command", &cmd).as_deref(), Some("grep -n 'CHARON' docker-compose.yml"));
+        let put = serde_json::json!({ "session": "s", "local": "C:/x.txt", "remote": "/tmp/x.txt" });
+        assert_eq!(subject("sftp_put", &put).as_deref(), Some("C:/x.txt -> /tmp/x.txt"));
+        let root = serde_json::json!({ "session": "s", "remote_path": "/etc/hosts", "as_root": true });
+        assert_eq!(subject("open_in_editor", &root).as_deref(), Some("as root: /etc/hosts"));
+        assert_eq!(subject("list_sessions", &serde_json::json!({})), None);
+    }
+
+    #[test]
     fn sudo_is_tier_gated() {
         // read: never, whatever the inputs.
         assert!(!sudo_allowed(Tier::Read, true, true));
@@ -278,5 +327,19 @@ mod tests {
         // trusted: only the node's Settings.mcp_sudo decides.
         assert!(sudo_allowed(Tier::Trusted, false, true));
         assert!(!sudo_allowed(Tier::Trusted, true, false));
+    }
+
+    #[test]
+    fn open_in_editor_as_root_is_gated_like_exec() {
+        let plain = json!({ "session": "s", "remote_path": "/etc/hosts" });
+        let root = json!({ "session": "s", "remote_path": "/etc/hosts", "as_root": true });
+        assert_eq!(kind_of("open_in_editor", &plain), ToolKind::File);
+        assert_eq!(kind_of("open_in_editor", &root), ToolKind::Exec);
+        // read: denied; exec-approve: needs the approval dialog; trusted: allowed.
+        assert_eq!(gate(kind_of("open_in_editor", &root), Tier::Read), Decision::Deny);
+        assert_eq!(gate(kind_of("open_in_editor", &root), Tier::ExecApprove), Decision::NeedApproval);
+        assert_eq!(gate(kind_of("open_in_editor", &root), Tier::Trusted), Decision::Allow);
+        // A plain open at exec-approve stays prompt-free.
+        assert_eq!(gate(kind_of("open_in_editor", &plain), Tier::ExecApprove), Decision::Allow);
     }
 }

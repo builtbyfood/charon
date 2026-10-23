@@ -59,6 +59,20 @@ pub trait Vault: Send + Sync {
     fn unlock(&self, _master: &str) -> Result<()> {
         Ok(())
     }
+    /// Give a credential a new name. The new entry is written before the old one
+    /// is removed, so a failure part-way leaves the secret under at least one name.
+    fn rename(&self, from: &str, to: &str) -> Result<()> {
+        check_name(to)?;
+        if from == to {
+            return Ok(());
+        }
+        let secret = self.get(from)?.ok_or_else(|| anyhow::anyhow!("no credential named {from:?}"))?;
+        if self.get(to)?.is_some() {
+            bail!("a credential named {to:?} already exists");
+        }
+        self.set(to, &secret)?;
+        self.delete(from)
+    }
 }
 
 fn check_name(name: &str) -> Result<()> {
@@ -314,6 +328,22 @@ mod tests {
         v.delete("prod-root").unwrap();
         assert_eq!(v.get("prod-root").unwrap(), None);
         assert_eq!(v.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rename_moves_the_secret_and_refuses_clashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = FileVault::open(dir.path());
+        v.unlock("m").unwrap();
+        v.set("old", &pw("s")).unwrap();
+        v.set("taken", &pw("t")).unwrap();
+        assert!(v.rename("old", "taken").is_err());
+        assert!(v.rename("old", "bad/name").is_err());
+        assert!(v.rename("nope", "x").is_err());
+        v.rename("old", "new").unwrap();
+        assert_eq!(v.get("new").unwrap().unwrap().value, "s");
+        assert!(v.get("old").unwrap().is_none());
+        assert_eq!(v.get("taken").unwrap().unwrap().value, "t");
     }
 
     #[test]

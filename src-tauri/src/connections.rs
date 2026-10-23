@@ -44,6 +44,9 @@ pub struct Settings {
     pub mcp_sudo: Option<bool>,
     /// Local sessions: program to run (default: platform shell) and start dir.
     pub shell: Option<String>,
+    /// SSH sessions: shell to start instead of the account's login shell
+    /// ("zsh", "/usr/bin/fish", "pwsh"); see `ssh::shell_command`.
+    pub remote_shell: Option<String>,
     pub cwd: Option<String>,
     /// Serial sessions: port + line settings.
     pub serial: Option<crate::serial::SerialSettings>,
@@ -66,6 +69,7 @@ impl Settings {
             mcp_tier: pick!(mcp_tier),
             mcp_sudo: pick!(mcp_sudo),
             shell: pick!(shell),
+            remote_shell: pick!(remote_shell),
             cwd: pick!(cwd),
             serial: pick!(serial),
         }
@@ -166,6 +170,27 @@ impl Store {
             .optional()?)
     }
 
+    /// A credential was renamed in the vault: every node (host or folder) that
+    /// referenced the old name follows. Returns how many changed.
+    pub fn rename_credential(&self, from: &str, to: &str) -> Result<usize> {
+        let mut n = 0;
+        for mut node in self.all()? {
+            if node.settings.credential.as_deref() == Some(from) {
+                node.settings.credential = Some(to.to_string());
+                self.upsert(&node)?;
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    /// Set (or clear, with None / blank) a node's own remote shell.
+    pub fn set_remote_shell(&self, id: &str, shell: Option<&str>) -> Result<()> {
+        let mut node = self.get(id)?.ok_or_else(|| anyhow::anyhow!("no connection {id}"))?;
+        node.settings.remote_shell = shell.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+        self.upsert(&node)
+    }
+
     /// Direct child of `parent` (None = root) with this exact name, if any.
     pub fn find_child(&self, parent: Option<&str>, name: &str) -> Result<Option<Node>> {
         Ok(self.all()?.into_iter().find(|n| n.parent_id.as_deref() == parent && n.name == name))
@@ -206,5 +231,38 @@ mod tests {
         assert_eq!(eff.jump_host.as_deref(), Some("bastion"));
         assert_eq!(eff.user.as_deref(), Some("travis"));
         assert_eq!(eff.host.as_deref(), Some("10.0.0.5"));
+    }
+
+    #[test]
+    fn renaming_a_credential_updates_every_node_that_uses_it() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let node = |id: &str, parent: Option<&str>, cred: Option<&str>| Node {
+            id: id.into(), parent_id: parent.map(Into::into), kind: if parent.is_none() { Kind::Folder } else { Kind::Ssh },
+            name: id.into(), sort: 0, settings: Settings { credential: cred.map(Into::into), ..Default::default() },
+        };
+        store.upsert(&node("f", None, Some("old"))).unwrap();
+        store.upsert(&node("a", Some("f"), Some("old"))).unwrap();
+        store.upsert(&node("b", Some("f"), Some("other"))).unwrap();
+        store.upsert(&node("c", Some("f"), None)).unwrap();
+        assert_eq!(store.rename_credential("old", "new").unwrap(), 2);
+        assert_eq!(store.get("a").unwrap().unwrap().settings.credential.as_deref(), Some("new"));
+        assert_eq!(store.get("f").unwrap().unwrap().settings.credential.as_deref(), Some("new"));
+        assert_eq!(store.get("b").unwrap().unwrap().settings.credential.as_deref(), Some("other"));
+        assert_eq!(store.effective("c").unwrap().credential.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn remote_shell_is_set_cleared_and_inherited() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        store.upsert(&Node { id: "f".into(), parent_id: None, kind: Kind::Folder, name: "f".into(), sort: 0,
+            settings: Settings { remote_shell: Some("zsh".into()), ..Default::default() } }).unwrap();
+        store.upsert(&Node { id: "h".into(), parent_id: Some("f".into()), kind: Kind::Ssh, name: "h".into(), sort: 0,
+            settings: Default::default() }).unwrap();
+        assert_eq!(store.effective("h").unwrap().remote_shell.as_deref(), Some("zsh"));
+        store.set_remote_shell("h", Some(" fish ")).unwrap();
+        assert_eq!(store.effective("h").unwrap().remote_shell.as_deref(), Some("fish"));
+        store.set_remote_shell("h", Some("  ")).unwrap();
+        assert_eq!(store.get("h").unwrap().unwrap().settings.remote_shell, None);
+        assert_eq!(store.effective("h").unwrap().remote_shell.as_deref(), Some("zsh"));
     }
 }

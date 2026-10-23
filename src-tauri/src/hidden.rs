@@ -71,10 +71,92 @@ pub fn strip_escapes(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// The keystrokes for one hidden command. Ctrl+U first clears anything the user
-/// had half-typed at the prompt; the leading space keeps it out of history.
+/// The keystrokes for one hidden command. Ctrl+U first clears the prompt line
+/// (normally empty: `PromptState` refuses a half-typed one); the leading space keeps
+/// it out of history. A multi-line command (a heredoc) goes inside `{ …\n}` so the
+/// end sentinel sits on a line of its own after the heredoc terminator — appended to
+/// the terminator line it would stop it matching, and the heredoc would swallow
+/// whatever is typed next.
 pub fn wrap(cmd: &str) -> String {
-    format!("\x15 printf '\\033]7771;s\\a'; {cmd}; printf '\\033]7771;e;%s\\a' \"$?\"\n")
+    let end = "printf '\\033]7771;e;%s\\a' \"$?\"";
+    if cmd.contains('\n') {
+        format!("\x15 printf '\\033]7771;s\\a'; {{ {cmd}\n}}; {end}\n")
+    } else {
+        format!("\x15 printf '\\033]7771;s\\a'; {cmd}; {end}\n")
+    }
+}
+
+/// Whether the interactive shell can take a hidden command right now, from the
+/// OSC 133 marks in its output and the user's own keystrokes. A hidden command is
+/// typed into the terminal, so it is only safe at a prompt with an empty line: with
+/// vim or nano in the foreground it would be typed into the file being edited, and
+/// a half-typed command line would be erased by the leading Ctrl+U.
+#[derive(Default)]
+pub struct PromptState {
+    /// Any 133 mark seen. Without shell integration there is nothing to go on, so
+    /// hidden commands are allowed as before.
+    seen: bool,
+    at_prompt: bool,
+    /// The user typed since the prompt was drawn.
+    typed: bool,
+    /// Tail of the previous chunk, for a mark split across chunks.
+    tail: Vec<u8>,
+}
+
+impl PromptState {
+    const MARK: &'static [u8] = b"\x1b]133;";
+
+    /// Session output (everything the shell prints, captured or not).
+    pub fn output(&mut self, data: &[u8]) {
+        let mut buf = std::mem::take(&mut self.tail);
+        buf.extend_from_slice(data);
+        let mut i = 0;
+        while let Some(at) = find(&buf[i..], Self::MARK) {
+            let k = i + at + Self::MARK.len();
+            let Some(&kind) = buf.get(k) else {
+                // Mark cut off right before its letter: keep it for the next chunk.
+                self.tail = buf[i + at..].to_vec();
+                return;
+            };
+            match kind {
+                b'A' | b'B' => {
+                    self.seen = true;
+                    self.at_prompt = true;
+                    self.typed = false;
+                }
+                b'C' | b'D' => {
+                    self.seen = true;
+                    self.at_prompt = false;
+                }
+                _ => {}
+            }
+            i = k + 1;
+        }
+        // Keep enough to finish a mark cut off inside its prefix.
+        let keep = (Self::MARK.len() - 1).min(buf.len() - i);
+        self.tail = buf[buf.len() - keep..].to_vec();
+    }
+
+    /// The user's keystrokes or paste going to the shell.
+    pub fn input(&mut self, data: &[u8]) {
+        if !data.is_empty() && self.at_prompt {
+            self.typed = true;
+        }
+    }
+
+    /// `Ok` when a hidden command may be typed now; otherwise why not.
+    pub fn ready(&self) -> Result<(), &'static str> {
+        if !self.seen {
+            return Ok(());
+        }
+        if !self.at_prompt {
+            return Err("the terminal is busy (a program is running in it); finish it first, or use SFTP");
+        }
+        if self.typed {
+            return Err("there is text on the terminal's command line; run or clear it first");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -263,6 +345,47 @@ mod tests {
         let w = wrap("ls");
         assert!(w.starts_with("\x15 printf"));
         assert!(w.ends_with("\"$?\"\n"));
+    }
+
+    #[test]
+    fn multi_line_command_puts_the_end_sentinel_after_the_heredoc() {
+        let w = wrap("base64 -d <<'X' > f\naGkK\nX");
+        let lines: Vec<&str> = w.lines().collect();
+        assert!(lines[0].starts_with("\x15 printf '\\033]7771;s\\a'; { base64 -d"), "{w:?}");
+        // The terminator stands alone; the end sentinel follows on its own line.
+        assert_eq!(lines[2], "X");
+        assert!(lines[3].starts_with("}; printf '\\033]7771;e;"), "{w:?}");
+    }
+
+    #[test]
+    fn prompt_state_allows_hidden_commands_only_at_an_empty_prompt() {
+        let mut p = PromptState::default();
+        assert!(p.ready().is_ok(), "no shell integration: nothing to go on, allowed");
+        p.output(b"\x1b]133;A\x07user@h:~$ \x1b]133;B\x07");
+        assert!(p.ready().is_ok(), "idle prompt");
+        p.input(b"df -");
+        assert!(p.ready().unwrap_err().contains("command line"), "a half-typed line would be erased");
+        p.input(b"h\r");
+        p.output(b"df -h\r\n\x1b]133;C\x07Filesystem ...\r\n");
+        assert!(p.ready().unwrap_err().contains("busy"), "command running");
+        p.output(b"\x1b]133;D;0\x07\x1b]133;A\x07user@h:~$ \x1b]133;B\x07");
+        assert!(p.ready().is_ok(), "back at an empty prompt");
+        // vim owns the terminal from its 133;C until it exits.
+        p.input(b"vim notes\r");
+        p.output(b"\x1b]133;C\x07\x1b[?1049h");
+        p.input(b"ihello");
+        assert!(p.ready().is_err(), "never type into vim");
+    }
+
+    #[test]
+    fn prompt_state_finds_a_mark_split_across_chunks() {
+        let mut p = PromptState::default();
+        p.output(b"out\x1b]13");
+        p.output(b"3;C\x07more");
+        assert!(p.ready().unwrap_err().contains("busy"));
+        p.output(b"\x1b]133;");
+        p.output(b"B\x07");
+        assert!(p.ready().is_ok());
     }
 
     #[test]

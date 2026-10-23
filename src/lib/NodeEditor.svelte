@@ -138,6 +138,11 @@
       </select>
     </label>
 
+    <label hidden={!isSsh && !isFolder}>Shell <span class="dim">blank = the account's login shell; the tab's shell menu lists what the host has</span>
+      <input bind:value={f.remoteShell} list="charon-shells" placeholder={inherited.remote_shell ?? "login shell"} spellcheck="false" class="mono" />
+      <datalist id="charon-shells">{#each ["bash", "zsh", "fish", "sh", "ksh", "pwsh", "powershell", "cmd"] as s (s)}<option value={s}></option>{/each}</datalist>
+    </label>
+
     <label hidden={!isSsh && !isFolder}>Jump host
       <input bind:value={f.jump} placeholder={inherited.jump_host ?? "saved host name, or user@bastion:port"} spellcheck="false" class="mono" />
     </label>

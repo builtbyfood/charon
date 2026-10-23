@@ -26,6 +26,8 @@ export interface Prefs {
   sudoAutoSend: boolean;
   /** Max files transferring at once during a recursive / multi-item transfer. */
   filesParallel: number;
+  /** Gutter with the time each line was printed. */
+  timestamps: boolean;
 }
 
 // xterm needs a literal font list; it cannot resolve CSS variables. The
@@ -48,6 +50,7 @@ export const DEFAULTS: Prefs = {
   filesAutoOpen: true,
   filesParallel: 4,
   sudoAutoSend: false,
+  timestamps: false,
 };
 
 export function prefsFromProfile(p: Profile): Prefs {
@@ -68,6 +71,7 @@ export function prefsFromProfile(p: Profile): Prefs {
     filesAutoOpen: p.files?.auto_open !== false,
     filesParallel: clamp(p.files?.parallel_transfers ?? 4, 1, 64, DEFAULTS.filesParallel),
     sudoAutoSend: p.sudo?.auto_send === true,
+    timestamps: p.terminal.timestamps === true,
   };
 }
 

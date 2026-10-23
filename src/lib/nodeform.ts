@@ -8,7 +8,7 @@ export interface NodeForm {
   host: string; port: string; user: string; credential: string; jump: string;
   color: string; tags: string; startup: string;
   shellInt: "" | "true" | "false"; mcp: string; mcpSudo: boolean;
-  shell: string; cwd: string;
+  shell: string; cwd: string; remoteShell: string;
   serialPort: string; baud: string; dataBits: string; parity: string; stopBits: string;
 }
 
@@ -28,6 +28,7 @@ export function formFromSettings(s: Settings): NodeForm {
     mcpSudo: s.mcp_sudo === true,
     shell: s.shell ?? "",
     cwd: s.cwd ?? "",
+    remoteShell: s.remote_shell ?? "",
     serialPort: s.serial?.port ?? "",
     baud: String(s.serial?.baud ?? 9600),
     dataBits: String(s.serial?.data_bits ?? 8),
@@ -64,6 +65,7 @@ export function settingsFromForm(f: NodeForm, kind: Kind): FormResult {
     host: isSsh ? f.host.trim() || undefined : undefined,
     shell: isLocal ? f.shell.trim() || undefined : undefined,
     cwd: isLocal ? f.cwd.trim() || undefined : undefined,
+    remote_shell: isSsh || isFolder ? f.remoteShell.trim() || undefined : undefined,
     serial,
     port: p,
     user: f.user.trim() || undefined,

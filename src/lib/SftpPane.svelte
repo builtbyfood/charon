@@ -15,6 +15,7 @@
   import { joinPath, crumbsOf, osc7ToLocal, humanSize, modeString } from "./paths";
   import { followTarget, pushTarget } from "./panecwd";
   import { isPermissionError, sftpSudoOpen, sftpSudoHasPassword, sftpSudoClear, type FsVia } from "./api";
+  import { ensureSudo } from "./sudoedit";
 
   let { session, cwd, color, sshUser, shellUser, isIdle, parallel, onopen, onchdir, onclose }: {
     /** Session id; null = local disk. */
@@ -58,6 +59,11 @@
   let sudoBusy = $state(false);
   let sudoPwEl = $state<HTMLInputElement | null>(null);
   let sudoReason = $state("");  // why the last escalation fell back to the shell backend
+  // "browse as root (sudo)" was chosen by hand: keep it when the shell user changes.
+  let sudoOnDemand = false;
+  // Set while the password form answers an ensureSudo() ask (Edit as root) rather
+  // than switching the pane itself.
+  let sudoResolve = $state<((pw: string | null) => void) | null>(null);
   let sortKey = $state<"name" | "size" | "mtime" | "mode">("name");
   let sortDir = $state<1 | -1>(1);
   // Multi-select: a set of entry paths, with an anchor path for Shift ranges.
@@ -168,7 +174,9 @@
     lastCwd = dir;
     if (target === null) return;
     untrack(() => {
-      if (Date.now() < suppressUntil || !listing || target === listing.path) return;
+      const skip = Date.now() < suppressUntil ? "suppressed" : !listing ? "no-listing" : target === listing.path ? "already-there" : "";
+      console.info(`[charon] files: follow cwd=${JSON.stringify(target)} ${skip || "go"}`);
+      if (skip) return;
       suppressUntil = Date.now() + 500;
       go(target);
     });
@@ -181,17 +189,25 @@
     lastPushed = dir;
     if (target === null) return;
     untrack(() => {
-      if (Date.now() < suppressUntil) return;
-      if (isIdle && !isIdle()) return;
-      if (isLocal ? osc7ToLocal(cwd ?? "") === target : cwd === target) return;
+      const skip = Date.now() < suppressUntil ? "suppressed" : isIdle && !isIdle() ? "shell-busy-or-no-133"
+        : (isLocal ? osc7ToLocal(cwd ?? "") === target : cwd === target) ? "already-there" : "";
+      console.info(`[charon] files: push cd=${JSON.stringify(target)} ${skip || "go"}`);
+      if (skip) return;
       suppressUntil = Date.now() + 500;
       onchdir(target);
     });
   });
   // Backend follows the shell user, un-latched: back to the login user → SFTP again (B2).
+  // Only on an actual change of shell user (exit from sudo -i): reading `via` here
+  // would undo an on-demand root browse the moment it starts.
+  let lastShellUser: string | undefined;
   $effect(() => {
     const su = shellUser;
-    if (su && sshUser && su === sshUser && via !== "sftp") untrack(() => {
+    const was = lastShellUser;
+    lastShellUser = su;
+    if (!su || !sshUser || su !== sshUser || was === undefined || was === su) return;
+    untrack(() => {
+      if (via === "sftp" || sudoOnDemand) return;
       const wasSudo = via === "sudo";
       via = "sftp"; askSudo = false;
       if (wasSudo && session) sftpSudoClear(session).catch(() => {});
@@ -235,9 +251,12 @@
 
   // ---- root escalation
   let pendingPath: string | null = null;
-  async function escalate() {
+  /** Switch the pane to root. `onDemand` = the user picked "browse as root (sudo)" /
+   *  "Open as root" (not an EACCES while the shell is root). */
+  async function escalate(onDemand = false) {
     if (!session) return;
-    console.info(`[charon] sudo-sftp: escalating (EACCES as ${sshUser}, shell is ${shellUser})`);
+    sudoOnDemand = onDemand;
+    console.info(`[charon] sudo-sftp: escalating (${onDemand ? "on demand" : "EACCES"} as ${sshUser}, shell is ${shellUser})`);
     if (sudoHasSaved === null) { try { sudoHasSaved = await sftpSudoHasPassword(session); } catch { sudoHasSaved = false; } }
     if (sudoHasSaved) await openSudo(undefined);
     else { askSudo = true; queueMicrotask(() => { sudoPwEl?.focus(); }); }
@@ -263,21 +282,68 @@
           await go(target);
         }
       } else {
-        // sftp-server missing or sudo refused/timeout → shell backend (base64 over the pty).
-        via = "shell"; askSudo = false; sudoReason = o.reason;
-        error = `sudo SFTP: ${o.sudo} — ${o.reason}. Using the shell backend.`;
-        await go(pendingPath ?? listing?.path ?? await homeFor());
+        // sftp-server missing or sudo refused/timeout → shell backend (base64 over the
+        // pty) when the shell is root; otherwise there is nothing to fall back to.
+        askSudo = false; sudoReason = o.reason;
+        if (differentUser) {
+          via = "shell";
+          error = `sudo SFTP: ${o.sudo} — ${o.reason}. Using the shell backend.`;
+          await go(pendingPath ?? listing?.path ?? await homeFor());
+        } else {
+          sudoOnDemand = false;
+          error = `sudo SFTP: ${o.sudo} — ${o.reason}`;
+        }
       }
     } catch (e) {
-      via = "shell"; askSudo = false; sudoReason = String(e);
+      askSudo = false; sudoReason = String(e);
       console.info(`[charon] sudo-sftp: call failed reason=${String(e)}`);
-      error = `sudo SFTP failed (${String(e)}); using the shell backend`;
-      await go(pendingPath ?? listing?.path ?? await homeFor());
+      if (differentUser) {
+        via = "shell";
+        error = `sudo SFTP failed (${String(e)}); using the shell backend`;
+        await go(pendingPath ?? listing?.path ?? await homeFor());
+      } else {
+        sudoOnDemand = false;
+        error = `sudo SFTP failed: ${String(e)}`;
+      }
     } finally {
       sudoBusy = false; pendingPath = null;
     }
   }
   const homeFor = () => sftpHome(session, via);
+
+  /** "Edit as root": make sure a root SFTP channel exists (asking for the password in
+   *  this pane's form if nothing is stored), then open the file bound to it. The pane
+   *  itself keeps its backend. */
+  async function editAsRoot(e: FsEntry) {
+    if (!session || !onopen) return;
+    sudoBusy = true; error = "";
+    try {
+      await ensureSudo(session, {
+        open: sftpSudoOpen,
+        ask: () => new Promise<string | null>((resolve) => {
+          sudoResolve = resolve; askSudo = true; sudoBusy = false;
+          queueMicrotask(() => sudoPwEl?.focus());
+        }),
+      });
+      console.info(`[charon] sudo-sftp: edit as root ${e.path}`);
+      onopen(e.path, "sudo");
+    } catch (err) {
+      error = String(err);
+    } finally {
+      sudoBusy = false; askSudo = false; sudoResolve = null; sudoPassword = "";
+    }
+  }
+  /** "Open as root" on a directory: browse it over sudo-sftp. */
+  function openDirAsRoot(e: FsEntry) { pendingPath = e.path; escalate(true); }
+  function submitSudo() {
+    if (sudoResolve) { const r = sudoResolve; sudoResolve = null; sudoBusy = true; r(sudoPassword); }
+    else openSudo(sudoPassword);
+  }
+  function skipSudo() {
+    if (sudoResolve) { const r = sudoResolve; sudoResolve = null; r(null); return; }
+    askSudo = false;
+    if (differentUser) { via = "shell"; refresh(); } else sudoOnDemand = false;
+  }
 
   // ---- transfers
   function optsFor(conflict: Conflict): TreeOpts {
@@ -410,6 +476,9 @@
     const isDir = only ? isDirEntry(only) : false;
     menu = { x: ev.clientX, y: ev.clientY, items: [
       { label: isDir ? "Open" : "Open in editor", action: () => only && activate(only), disabled: many || (!isDir && !onopen) },
+      ...(!isLocal && via !== "sudo" ? [isDir
+        ? { label: "Open as root", action: () => only && openDirAsRoot(only), disabled: many || !only || sudoBusy }
+        : { label: "Edit as root", action: () => only && editAsRoot(only), disabled: many || !only || !onopen || sudoBusy }] : []),
       { label: many ? `Download ${selected.size} items…` : "Download…", action: downloadSelection },
       { separator: true, label: "" },
       { label: "Rename…", action: () => only && startAsk("rename", only), disabled: many || !only },
@@ -460,24 +529,24 @@
     <div class="backend" class:root={rootBackend}>
       {#if via === "sudo"}
         sftp as {shellUser ?? "root"} (sudo){#if differentUser} · SFTP is {sshUser}{/if}
-        <button type="button" class="link" title="Back to plain SFTP as the login user" onclick={() => { via = "sftp"; if (session) sftpSudoClear(session); refresh(); }}>use SFTP</button>
+        <button type="button" class="link" title="Back to plain SFTP as the login user" onclick={() => { via = "sftp"; sudoOnDemand = false; if (session) sftpSudoClear(session); refresh(); }}>use SFTP</button>
       {:else if via === "shell"}
         <span title={sudoReason ? `sudo-sftp fell back: ${sudoReason}` : "browsing via the terminal (base64 over the pty)"}>shell as {shellUser ?? "?"}{#if differentUser} · SFTP is {sshUser}{/if}</span>
-        <button type="button" class="link" title={sudoReason ? `Retry sudo-sftp (last: ${sudoReason})` : "Retry root over sudo-sftp (faster)"} onclick={escalate} disabled={sudoBusy}>{sudoBusy ? "…" : "try sudo"}</button>
+        <button type="button" class="link" title={sudoReason ? `Retry sudo-sftp (last: ${sudoReason})` : "Retry root over sudo-sftp (faster)"} onclick={() => escalate()} disabled={sudoBusy}>{sudoBusy ? "…" : "try sudo"}</button>
         <button type="button" class="link" title="Back to plain SFTP as the login user" onclick={() => { via = "sftp"; refresh(); }}>use SFTP</button>
       {:else}
         sftp as {sshUser ?? "login user"}
-        {#if differentUser}<button type="button" class="link" title="Browse as {shellUser} — sudo SFTP, or the terminal as a fallback" onclick={escalate} disabled={sudoBusy}>browse as {shellUser}</button>{:else}<span class="dim" title="The shell is the same user as SFTP; nothing to switch to">login user</span>{/if}
+        {#if differentUser}<button type="button" class="link" title="Browse as {shellUser} — sudo SFTP, or the terminal as a fallback" onclick={() => escalate()} disabled={sudoBusy}>browse as {shellUser}</button>{:else}<button type="button" class="link" title="Browse as root over sudo-sftp (asks for the sudo password once, or uses the stored credential)" onclick={() => escalate(true)} disabled={sudoBusy}>{sudoBusy ? "…" : "browse as root (sudo)"}</button>{/if}
       {/if}
     </div>
   {/if}
   {#if askSudo}
-    <form class="ask" onsubmit={(e) => { e.preventDefault(); openSudo(sudoPassword); }}>
-      <span>sudo password for {shellUser ?? "root"}</span>
+    <form class="ask" onsubmit={(e) => { e.preventDefault(); submitSudo(); }}>
+      <span>sudo password for {sshUser ?? "the login user"}</span>
       <input bind:this={sudoPwEl} type="password" bind:value={sudoPassword} autocomplete="off" spellcheck="false"
-        onkeydown={(e) => { if (e.key === "Escape") askSudo = false; }} />
+        onkeydown={(e) => { if (e.key === "Escape") skipSudo(); }} />
       <button type="submit" disabled={sudoBusy || !sudoPassword}>{sudoBusy ? "…" : "Unlock"}</button>
-      <button type="button" onclick={() => { askSudo = false; via = "shell"; refresh(); }} title="Skip sudo, browse via the terminal">use shell</button>
+      <button type="button" onclick={skipSudo} title={differentUser && !sudoResolve ? "Skip sudo, browse via the terminal" : "Cancel"}>{differentUser && !sudoResolve ? "use shell" : "cancel"}</button>
     </form>
   {/if}
   {#if conflictAsk}

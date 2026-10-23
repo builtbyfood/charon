@@ -36,6 +36,8 @@ section!(Appearance {
 });
 
 section!(TerminalPrefs {
+    /// Gutter with the time each line was printed (status-bar switch).
+    timestamps: bool = false,
     copy_on_select: bool = false,
     ctrl_c_copies_when_selected: bool = true,
     middle_click_paste: bool = true,

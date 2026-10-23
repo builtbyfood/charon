@@ -11,6 +11,7 @@ scrollback = 50000
 renderer = "webgl"              # "dom" if the WebGL renderer glitches on your GPU
 
 [terminal]
+timestamps = false              # gutter with the time each line was printed ("time" switch in the status bar)
 copy_on_select = false          # Linux folks may want true
 ctrl_c_copies_when_selected = true
 middle_click_paste = true
