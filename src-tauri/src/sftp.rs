@@ -76,6 +76,44 @@ pub trait Fs: Send + Sync {
     async fn download_dir_tar(&self, _remote: &str, _limit: u64) -> Result<Option<Vec<u8>>> {
         Ok(None)
     }
+    /// Copy one file to another path on this same filesystem (file pane copy/paste).
+    /// Default: out to a local temp file and back in; backends override with a
+    /// direct stream or a server-side `cp`.
+    async fn copy_file(&self, from: &str, to: &str, t: &Transfer) -> Result<()> {
+        let tmp = std::env::temp_dir().join(format!("charon-copy-{}", uuid::Uuid::new_v4()));
+        let r = async {
+            self.download(from, &tmp, t).await?;
+            self.upload(&tmp, to, t).await
+        }
+        .await;
+        let _ = tokio::fs::remove_file(&tmp).await;
+        r
+    }
+    /// Delete a file, symlink or whole directory tree. Symlinks are removed, never
+    /// followed. Default: walk with `list` and delete children before parents.
+    async fn remove_tree(&self, path: &str) -> Result<()> {
+        let root = self.stat(path).await?;
+        if root.kind != "dir" {
+            return self.delete(path, false).await;
+        }
+        // Pre-order walk; reversed, every directory comes after everything inside it.
+        let mut stack = vec![path.to_string()];
+        let mut dirs = Vec::new();
+        while let Some(d) = stack.pop() {
+            for e in self.list(&d).await?.entries {
+                if e.kind == "dir" {
+                    stack.push(e.path);
+                } else {
+                    self.delete(&e.path, false).await.with_context(|| format!("delete {}", e.path))?;
+                }
+            }
+            dirs.push(d);
+        }
+        for d in dirs.iter().rev() {
+            self.delete(d, true).await.with_context(|| format!("delete {d}"))?;
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------- transfers
@@ -410,6 +448,26 @@ impl Fs for SftpFs {
         r.map(|_| ())
     }
 
+    async fn copy_file(&self, from: &str, to: &str, t: &Transfer) -> Result<()> {
+        let total = self.sftp.metadata(from).await?.size.unwrap_or(0);
+        let mut src = self.sftp.open(from).await?;
+        let mut dst = self
+            .sftp
+            .open_with_flags(to, OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE)
+            .await?;
+        let r = match pump(&mut src, &mut dst, total, t).await {
+            Ok(_) => dst.shutdown().await.context("finish copy"),
+            Err(e) => {
+                let _ = dst.shutdown().await;
+                Err(e)
+            }
+        };
+        if r.is_err() {
+            let _ = self.sftp.remove_file(to).await;
+        }
+        r.map(|_| ())
+    }
+
     async fn set_times(&self, path: &str, mtime: u64) -> Result<()> {
         let mut a = FileAttributes::empty();
         a.mtime = Some(mtime as u32);
@@ -503,7 +561,20 @@ impl Fs for LocalFs {
     }
 
     async fn rename(&self, from: &str, to: &str) -> Result<()> {
-        Ok(tokio::fs::rename(from, to).await?)
+        match tokio::fs::rename(from, to).await {
+            Ok(()) => Ok(()),
+            // Another drive / filesystem (Windows ERROR_NOT_SAME_DEVICE, Unix EXDEV):
+            // copy, then remove the original.
+            Err(e) if matches!(e.raw_os_error(), Some(17) if cfg!(windows)) || matches!(e.raw_os_error(), Some(18) if cfg!(unix)) => {
+                let (from, to) = (PathBuf::from(from), PathBuf::from(to));
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    copy_local_tree(&from, &to)?;
+                    remove_local_tree(&from)
+                })
+                .await?
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     async fn delete(&self, path: &str, is_dir: bool) -> Result<()> {
@@ -564,6 +635,15 @@ impl Fs for LocalFs {
         self.download(&local.to_string_lossy(), Path::new(path), t).await
     }
 
+    async fn copy_file(&self, from: &str, to: &str, t: &Transfer) -> Result<()> {
+        self.download(from, Path::new(to), t).await
+    }
+
+    async fn remove_tree(&self, path: &str) -> Result<()> {
+        let p = PathBuf::from(path);
+        tokio::task::spawn_blocking(move || remove_local_tree(&p)).await?
+    }
+
     async fn set_times(&self, path: &str, mtime: u64) -> Result<()> {
         let p = path.to_string();
         tokio::task::spawn_blocking(move || {
@@ -576,6 +656,30 @@ impl Fs for LocalFs {
     fn join(&self, dir: &str, name: &str) -> String {
         Path::new(dir).join(name).to_string_lossy().into_owned()
     }
+}
+
+/// Delete a local file, symlink or directory tree (symlinks are not followed).
+fn remove_local_tree(p: &Path) -> Result<()> {
+    let m = std::fs::symlink_metadata(p).with_context(|| format!("stat {}", p.display()))?;
+    if m.is_dir() {
+        std::fs::remove_dir_all(p).with_context(|| format!("delete {}", p.display()))
+    } else {
+        std::fs::remove_file(p).with_context(|| format!("delete {}", p.display()))
+    }
+}
+
+/// Copy a local file or directory tree to `to` (which must not exist yet).
+fn copy_local_tree(from: &Path, to: &Path) -> Result<()> {
+    if std::fs::symlink_metadata(from)?.is_dir() {
+        std::fs::create_dir(to).with_context(|| format!("create {}", to.display()))?;
+        for e in std::fs::read_dir(from)? {
+            let e = e?;
+            copy_local_tree(&e.path(), &to.join(e.file_name()))?;
+        }
+    } else {
+        std::fs::copy(from, to).with_context(|| format!("copy {} to {}", from.display(), to.display()))?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- shell (after sudo)
@@ -765,6 +869,15 @@ impl Fs for ShellFs {
 
     async fn set_times(&self, path: &str, mtime: u64) -> Result<()> {
         self.run(&format!("touch -d @{mtime} -- {}", sq(path))).await.map(|_| ())
+    }
+
+    async fn copy_file(&self, from: &str, to: &str, t: &Transfer) -> Result<()> {
+        t.report(0, 0, "running", None);
+        self.run(&format!("cp -f -- {} {}", sq(from), sq(to))).await.map(|_| ())
+    }
+
+    async fn remove_tree(&self, path: &str) -> Result<()> {
+        self.run(&format!("rm -rf -- {}", sq(path))).await.map(|_| ())
     }
 
     async fn download_dir_tar(&self, remote: &str, limit: u64) -> Result<Option<Vec<u8>>> {

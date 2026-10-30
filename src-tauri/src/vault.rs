@@ -75,6 +75,38 @@ pub trait Vault: Send + Sync {
     }
 }
 
+/// An edit to a stored credential from the UI, which never sees the current values:
+/// `None` (or empty) keeps what is stored.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SecretEdit {
+    pub kind: Option<SecretKind>,
+    pub value: Option<String>,
+    pub key_passphrase: Option<String>,
+    /// Drop a stored key passphrase.
+    #[serde(default)]
+    pub clear_passphrase: bool,
+}
+
+/// Apply `e` to `old`. Changing the kind needs a new value (a password is not a key
+/// path); a password never carries a passphrase.
+pub fn apply_edit(old: &Secret, e: &SecretEdit) -> Result<Secret> {
+    let kind = e.kind.unwrap_or(old.kind);
+    let value = match e.value.as_deref().filter(|v| !v.is_empty()) {
+        Some(v) => v.to_string(),
+        None if kind == old.kind => old.value.clone(),
+        None => bail!("changing the kind needs a new {}", if kind == SecretKind::Key { "key path" } else { "password" }),
+    };
+    let key_passphrase = match kind {
+        SecretKind::Password => None,
+        SecretKind::Key => match e.key_passphrase.as_deref().filter(|p| !p.is_empty()) {
+            Some(p) => Some(p.to_string()),
+            None if e.clear_passphrase => None,
+            None => old.key_passphrase.clone().filter(|_| old.kind == SecretKind::Key),
+        },
+    };
+    Ok(Secret { kind, value, key_passphrase })
+}
+
 fn check_name(name: &str) -> Result<()> {
     if name.trim().is_empty() || name.len() > 200 || name.contains(['/', '\\', '\0']) {
         bail!("invalid credential name {name:?}");
@@ -375,5 +407,28 @@ mod tests {
         let v = KeyringVault::open(dir.path()).unwrap();
         assert_eq!(v.list().unwrap(), vec![SecretMeta { name: "a".into(), kind: SecretKind::Key }]);
         assert!(!v.status().locked);
+    }
+
+    #[test]
+    fn edits_keep_what_is_left_blank() {
+        let key = Secret { kind: SecretKind::Key, value: "/k/id".into(), key_passphrase: Some("pp".into()) };
+        // nothing given: unchanged
+        assert_eq!(apply_edit(&key, &SecretEdit::default()).unwrap(), key);
+        // new path, passphrase kept
+        let e = SecretEdit { value: Some("/k/other".into()), ..Default::default() };
+        assert_eq!(apply_edit(&key, &e).unwrap(), Secret { value: "/k/other".into(), ..key.clone() });
+        // new passphrase / cleared passphrase
+        let e = SecretEdit { key_passphrase: Some("new".into()), ..Default::default() };
+        assert_eq!(apply_edit(&key, &e).unwrap().key_passphrase.as_deref(), Some("new"));
+        let e = SecretEdit { clear_passphrase: true, ..Default::default() };
+        assert_eq!(apply_edit(&key, &e).unwrap().key_passphrase, None);
+        // switching kind needs a value, and a password drops the passphrase
+        let e = SecretEdit { kind: Some(SecretKind::Password), ..Default::default() };
+        assert!(apply_edit(&key, &e).is_err());
+        let e = SecretEdit { kind: Some(SecretKind::Password), value: Some("hunter2".into()), ..Default::default() };
+        assert_eq!(apply_edit(&key, &e).unwrap(), pw("hunter2"));
+        // password → key does not invent a passphrase
+        let e = SecretEdit { kind: Some(SecretKind::Key), value: Some("/k/id".into()), ..Default::default() };
+        assert_eq!(apply_edit(&pw("x"), &e).unwrap().key_passphrase, None);
     }
 }

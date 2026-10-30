@@ -26,6 +26,9 @@ pub struct ImportedHost {
     pub jump_host: Option<String>,
     /// Folder path inside the import folder (MobaXterm `SubRep`).
     pub folder: Vec<String>,
+    /// Terminal font family and size in px (PuTTY `Font` / `FontHeight`).
+    pub font: Option<String>,
+    pub font_size: Option<u16>,
 }
 
 #[derive(Debug, Default)]
@@ -205,7 +208,16 @@ pub fn apply(store: &Store, vault: &dyn Vault, source: Source, parsed: Parsed, p
             None => None,
         };
 
-        let imported = Settings { host: Some(h.host), port: h.port, user: h.user, credential, jump_host: h.jump_host, ..Default::default() };
+        let imported = Settings {
+            host: Some(h.host),
+            port: h.port,
+            user: h.user,
+            credential,
+            jump_host: h.jump_host,
+            font: h.font,
+            font_size: h.font_size,
+            ..Default::default()
+        };
         if let (Some(n), DupPolicy::Overwrite) = (dup, policy) {
             // Keep id, place, name, colour, tags…; imported fields win where the import has them.
             store.upsert(&Node { settings: n.settings.merged_with(&imported), ..n })?;
@@ -307,7 +319,7 @@ mod tests {
         let parsed = Parsed {
             hosts: vec![
                 ImportedHost { name: "web".into(), host: "10.0.0.1".into(), user: Some("ops".into()), identity_file: Some("/k/id_ed25519".into()), ..Default::default() },
-                ImportedHost { name: "db".into(), host: "10.0.0.2".into(), folder: vec!["prod".into(), "eu".into()], ..Default::default() },
+                ImportedHost { name: "db".into(), host: "10.0.0.2".into(), folder: vec!["prod".into(), "eu".into()], font: Some("Hack".into()), font_size: Some(15), ..Default::default() },
             ],
             warnings: vec!["w".into()],
         };
@@ -324,6 +336,7 @@ mod tests {
         let eu = all.iter().find(|n| n.name == "eu" && n.kind == Kind::Folder).unwrap();
         let db = all.iter().find(|n| n.name == "db").unwrap();
         assert_eq!(db.parent_id.as_deref(), Some(eu.id.as_str()));
+        assert_eq!((db.settings.font.as_deref(), db.settings.font_size), (Some("Hack"), Some(15)));
 
         // Second import of the same thing: nothing added, folder reused.
         let again = || Parsed {

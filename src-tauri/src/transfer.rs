@@ -230,35 +230,12 @@ pub async fn upload_tree(
     let root_is_dir = meta.is_dir();
     let top = base_name(&local_root.to_string_lossy());
 
-    // Conflict against the remote destination (async stat, so resolved here
-    // rather than through the sync `resolve_conflict`).
-    let remote_exists = |n: &str| {
-        let fs = fs.clone();
-        let p = fs.join(dest_remote_dir, n);
-        async move { fs.stat(&p).await.is_ok() }
-    };
-    let dest_top = if !remote_exists(&top).await {
-        top.clone()
-    } else {
-        match opts.conflict {
-            Conflict::Overwrite => top.clone(),
-            Conflict::Skip => {
-                report(TreeEvent::Warn { message: format!("{top}: exists on the remote, skipped") });
-                report(TreeEvent::Done { files_done: 0, files_total: 0, bytes_done: 0, bytes_total: 0, failed: vec![], cancelled: false });
-                return Ok(());
-            }
-            Conflict::Rename => {
-                let mut chosen = top.clone();
-                let (stem, ext) = split_ext(&top);
-                for i in 2.. {
-                    let cand = format!("{stem} ({i}){ext}");
-                    if !remote_exists(&cand).await {
-                        chosen = cand;
-                        break;
-                    }
-                }
-                chosen
-            }
+    let dest_top = match resolve_remote(fs.as_ref(), dest_remote_dir, &top, opts.conflict).await {
+        Some(name) => name,
+        None => {
+            report(TreeEvent::Warn { message: format!("{top}: exists on the remote, skipped") });
+            report(TreeEvent::Done { files_done: 0, files_total: 0, bytes_done: 0, bytes_total: 0, failed: vec![], cancelled: false });
+            return Ok(());
         }
     };
 
@@ -326,7 +303,151 @@ pub async fn upload_tree(
     Ok(())
 }
 
+// ---------------------------------------------------------------- copy / move (same filesystem)
+
+/// `inner` is `outer` or lies under it (both spelled by the same fs; `/` or `\`).
+pub fn is_within(outer: &str, inner: &str) -> bool {
+    let norm = |p: &str| p.replace('\\', "/").trim_end_matches('/').to_string();
+    let (o, i) = (norm(outer), norm(inner));
+    !o.is_empty() && (i == o || i.starts_with(&format!("{o}/")))
+}
+
+/// Copy `src` (file or dir) into `dest_dir` on the same filesystem. Copying into
+/// the item's own directory always keeps both ("name (2)").
+pub async fn copy_tree(
+    fs: Arc<dyn Fs>,
+    src: &str,
+    dest_dir: &str,
+    opts: &TreeOpts,
+    cancel: Arc<AtomicBool>,
+    report: Reporter,
+    only: Option<&HashSet<String>>,
+) -> Result<()> {
+    let root = fs.stat(src).await.with_context(|| format!("stat {src}"))?;
+    let root_is_dir = root.kind == "dir" || (root.kind == "symlink" && root.target_kind == Some("dir"));
+    if root_is_dir && is_within(src, dest_dir) {
+        anyhow::bail!("cannot copy a folder into itself");
+    }
+    let top = base_name(src);
+    let policy = if fs.join(dest_dir, &top) == src { Conflict::Rename } else { opts.conflict };
+    let dest_top = match resolve_remote(fs.as_ref(), dest_dir, &top, policy).await {
+        Some(name) => name,
+        None => {
+            report(TreeEvent::Warn { message: format!("{top}: exists, skipped") });
+            report(TreeEvent::Done { files_done: 0, files_total: 0, bytes_done: 0, bytes_total: 0, failed: vec![], cancelled: false });
+            return Ok(());
+        }
+    };
+
+    let mut files = Vec::new();
+    let mut dirs = Vec::new();
+    walk_remote(fs.as_ref(), &root, src, &dest_top, opts, &report, &mut files, &mut dirs).await;
+    if let Some(only) = only {
+        files.retain(|f| only.contains(&f.rel));
+    }
+    let bytes_total: u64 = files.iter().map(|f| f.size).sum();
+    report(TreeEvent::Plan {
+        files: files.iter().map(|f| PlanFile { rel: f.rel.clone(), size: f.size }).collect(),
+        bytes_total,
+        dest: dest_top.clone(),
+    });
+    if root_is_dir {
+        let _ = fs.mkdir(&fs.join(dest_dir, &dest_top)).await;
+    }
+    // walk_remote pops a stack, so order dirs by depth: parents are made first.
+    dirs.sort_by_key(|d| d.rel.matches('/').count());
+    for d in &dirs {
+        let p = remote_join(fs.as_ref(), dest_dir, &d.rel);
+        let _ = fs.mkdir(&p).await;
+        if opts.preserve_mode && d.mode != 0 {
+            let _ = fs.chmod(&p, d.mode).await;
+        }
+    }
+
+    let counts = Arc::new(Counts { files_done: AtomicU64::new(0), bytes_done: AtomicU64::new(0) });
+    let failed = run_pool(opts.parallel, cancel.clone(), files, |f| {
+        let (fs, report, counts, cancel, dest_dir) = (fs.clone(), report.clone(), counts.clone(), cancel.clone(), dest_dir.to_string());
+        async move {
+            let to = remote_join(fs.as_ref(), &dest_dir, &f.rel);
+            let t = file_transfer(&f.rel, report.clone(), cancel.clone());
+            match fs.copy_file(&f.src, &to, &t).await {
+                Ok(()) => {
+                    if opts.preserve_mode && f.mode != 0 {
+                        let _ = fs.chmod(&to, f.mode).await;
+                    }
+                    if opts.preserve_mtime && f.mtime != 0 {
+                        let _ = fs.set_times(&to, f.mtime).await;
+                    }
+                    counts.files_done.fetch_add(1, Ordering::Relaxed);
+                    counts.bytes_done.fetch_add(f.size, Ordering::Relaxed);
+                    report(TreeEvent::File { rel: f.rel.clone(), done: f.size, total: f.size, state: "done", error: None });
+                    None
+                }
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    report(TreeEvent::File { rel: f.rel.clone(), done: 0, total: f.size, state: "failed", error: Some(msg.clone()) });
+                    report(TreeEvent::Warn { message: format!("{}: {msg}", f.rel) });
+                    Some(f.rel.clone())
+                }
+            }
+        }
+    })
+    .await;
+
+    report(TreeEvent::Done {
+        files_done: counts.files_done.load(Ordering::Relaxed),
+        files_total: counts.files_done.load(Ordering::Relaxed) + failed.len() as u64,
+        bytes_done: counts.bytes_done.load(Ordering::Relaxed),
+        bytes_total,
+        failed,
+        cancelled: cancel.load(Ordering::Relaxed),
+    });
+    Ok(())
+}
+
+/// Move `src` into `dest_dir` (a rename on the same filesystem). Returns the new
+/// path, or None when the conflict policy skipped it. Overwrite replaces whatever
+/// is at the target, folder or file.
+pub async fn move_item(fs: &dyn Fs, src: &str, dest_dir: &str, conflict: Conflict) -> Result<Option<String>> {
+    let top = base_name(src);
+    if fs.join(dest_dir, &top) == src {
+        return Ok(Some(src.to_string())); // already there
+    }
+    let root = fs.stat(src).await.with_context(|| format!("stat {src}"))?;
+    if root.kind == "dir" && is_within(src, dest_dir) {
+        anyhow::bail!("cannot move {top} into itself");
+    }
+    let Some(name) = resolve_remote(fs, dest_dir, &top, conflict).await else { return Ok(None) };
+    let target = fs.join(dest_dir, &name);
+    if fs.stat(&target).await.is_ok() {
+        fs.remove_tree(&target).await.with_context(|| format!("replace {target}"))?;
+    }
+    fs.rename(src, &target).await.with_context(|| format!("move {src} to {target}"))?;
+    Ok(Some(target))
+}
+
 // ---------------------------------------------------------------- helpers
+
+/// `resolve_conflict` against a directory on `fs` (async stat per candidate).
+async fn resolve_remote(fs: &dyn Fs, dir: &str, name: &str, policy: Conflict) -> Option<String> {
+    if fs.stat(&fs.join(dir, name)).await.is_err() {
+        return Some(name.to_string());
+    }
+    match policy {
+        Conflict::Overwrite => Some(name.to_string()),
+        Conflict::Skip => None,
+        Conflict::Rename => {
+            let (stem, ext) = split_ext(name);
+            for i in 2.. {
+                let cand = format!("{stem} ({i}){ext}");
+                if fs.stat(&fs.join(dir, &cand)).await.is_err() {
+                    return Some(cand);
+                }
+            }
+            unreachable!()
+        }
+    }
+}
 
 fn resolve_conflict(name: &str, policy: Conflict, exists: impl Fn(&str) -> bool) -> Option<String> {
     if !exists(name) {

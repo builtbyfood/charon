@@ -33,7 +33,7 @@
 </div>
 
 <style>
-  .menu { position: fixed; z-index: 20; min-width: 180px; background: var(--bg-raised); border: 1px solid var(--line); border-radius: 4px; padding: 4px; box-shadow: 0 6px 20px #0008; display: flex; flex-direction: column; }
+  .menu { position: fixed; z-index: 20; min-width: 180px; background: var(--bg-raised); border: 1px solid var(--line); border-radius: 4px; padding: 4px; box-shadow: 0 6px 20px var(--shadow); display: flex; flex-direction: column; }
   .menu button { text-align: left; border: 0; background: transparent; padding: 5px 10px; border-radius: 3px; }
   .menu button:hover:not(:disabled) { background: var(--bg); }
   .menu button:disabled { opacity: .4; cursor: default; }

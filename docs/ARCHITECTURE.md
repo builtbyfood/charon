@@ -12,8 +12,11 @@
 ```
 
 Every session is an `id` + a byte channel. The frontend never cares what's behind it.
-Output goes to the UI as `term:data:{id}` events carrying raw bytes (base64 in JSON),
-input comes back through `session_write(id, data)`.
+The Terminal attaches a `tauri::ipc::Channel` per session (`session_attach`); output
+goes down it as `OutMsg::Data { seq, t, b64 }` (raw bytes in base64, emit time for
+the output trace) and ends with `OutMsg::Closed`. Before any channel is attached the
+backend falls back to `term:data:{id}` / `term:closed:{id}` events, which nothing
+listens to. Input comes back through `session_write(id, data)`.
 
 ## Windows and moving tabs
 
@@ -41,7 +44,8 @@ lives in the backend (`tabmove.rs`):
    was held (and a close that happened meanwhile). Then it fits its own size; the
    resize reaches the remote, so full-screen programs redraw.
 
-The source tab's `onDestroy` skips `session_close` once it has handed off. If the
+The target's `session_attach` replaces the source's channel before the release,
+so held output goes to the new window. The source tab's `onDestroy` skips `session_close` once it has handed off. If the
 move fails, `undetach` releases the hold and the tab stays. Dragging uses pointer
 events, not HTML5 drag-and-drop: the native file-drop handler turns that off in
 the webview on Windows.
@@ -54,6 +58,12 @@ the webview on Windows.
   wraps `requestAnimationFrame` on Linux (`rafguard.ts`) so each request also arms
   a 50 ms timer; the first of the two runs the callback. xterm's render debouncer,
   Monaco and everything else get frames without input.
+- `session::wake_ui()` calls `glib::MainContext::default().wakeup()` after every
+  message to the UI from a background thread (output, SFTP progress, MCP and
+  host-key prompts).
+- Diagnostics for release builds (`diag.ts`): `[charon]` console lines go to stdout
+  via `log_frontend`; the output trace (`trace_output`, `CHARON_TRACE_OUTPUT=1`)
+  logs `out: emit` in Rust and `out: recv/parsed/painted` in JS per chunk.
 - Clipboard text goes through `clipboard_read` / `clipboard_write`
   (`clipboard.rs`): GTK's clipboard on the main thread on Linux, the clipboard
   plugin elsewhere. The plugin's Wayland path needs wlr-data-control, which GNOME
@@ -107,7 +117,9 @@ mode only — installed builds use the OS keyring).
 
 Renaming a credential (`vault_rename`) writes the new vault entry before deleting
 the old one. Then every node whose own `credential` named it is updated, so
-inheriting hosts follow through their folder.
+inheriting hosts follow through their folder. Editing one (`vault_edit`) sends
+only the fields the user typed. The backend merges them into the stored secret
+(`vault::apply_edit`), so the UI never needs the current value.
 
 ## Phases
 

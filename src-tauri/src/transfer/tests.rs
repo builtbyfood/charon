@@ -303,3 +303,122 @@ async fn symlinks_skipped_when_not_following() {
     assert_eq!(rels, vec!["proj/a.txt"]); // the symlink is not in the plan
     assert!(log.iter().any(|e| matches!(e, TreeEvent::Warn { message } if message.contains("symlink skipped"))));
 }
+
+// ---------------------------------------------------------------- copy / move / delete (LocalFs)
+
+fn local_tree() -> (tempfile::TempDir, Arc<dyn Fs>, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src/proj/deep")).unwrap();
+    std::fs::write(root.join("src/proj/a.txt"), "alpha").unwrap();
+    std::fs::write(root.join("src/proj/deep/b.txt"), "beta").unwrap();
+    std::fs::create_dir_all(root.join("dest")).unwrap();
+    let base = root.to_string_lossy().into_owned();
+    (dir, Arc::new(crate::sftp::LocalFs), base)
+}
+
+#[test]
+fn is_within_matches_self_and_descendants_only() {
+    assert!(is_within("/a/b", "/a/b"));
+    assert!(is_within("/a/b", "/a/b/c"));
+    assert!(is_within("/a/b/", "/a/b/c"));
+    assert!(is_within(r"C:\x\y", r"C:\x\y\z"));
+    assert!(!is_within("/a/b", "/a/bc"));
+    assert!(!is_within("/a/b", "/a"));
+}
+
+#[tokio::test]
+async fn copy_tree_copies_a_folder_and_keeps_both_in_place() {
+    let (dir, fs, base) = local_tree();
+    let src = fs.join(&fs.join(&base, "src"), "proj");
+    let dest = fs.join(&base, "dest");
+    let (report, log) = collector();
+    copy_tree(fs.clone(), &src, &dest, &TreeOpts::default(), Arc::new(AtomicBool::new(false)), report, None).await.unwrap();
+    assert_eq!(std::fs::read_to_string(dir.path().join("dest/proj/a.txt")).unwrap(), "alpha");
+    assert_eq!(std::fs::read_to_string(dir.path().join("dest/proj/deep/b.txt")).unwrap(), "beta");
+    assert!(dir.path().join("src/proj/a.txt").exists(), "source untouched");
+    assert_eq!(done_of(&log.lock().unwrap()).0, 2);
+
+    // Same directory: a duplicate beside it, whatever the policy says.
+    let (report, _) = collector();
+    let opts = TreeOpts { conflict: Conflict::Overwrite, ..TreeOpts::default() };
+    copy_tree(fs.clone(), &src, &fs.join(&base, "src"), &opts, Arc::new(AtomicBool::new(false)), report, None).await.unwrap();
+    assert_eq!(std::fs::read_to_string(dir.path().join("src/proj (2)/deep/b.txt")).unwrap(), "beta");
+}
+
+#[tokio::test]
+async fn copy_tree_refuses_a_folder_into_itself() {
+    let (_dir, fs, base) = local_tree();
+    let src = fs.join(&fs.join(&base, "src"), "proj");
+    let (report, _) = collector();
+    let r = copy_tree(fs.clone(), &src, &fs.join(&src, "deep"), &TreeOpts::default(), Arc::new(AtomicBool::new(false)), report, None).await;
+    assert!(r.is_err());
+}
+
+#[tokio::test]
+async fn move_item_renames_and_honours_conflicts() {
+    let (dir, fs, base) = local_tree();
+    let a = fs.join(&fs.join(&fs.join(&base, "src"), "proj"), "a.txt");
+    let dest = fs.join(&base, "dest");
+    std::fs::write(dir.path().join("dest/a.txt"), "old").unwrap();
+
+    // skip leaves both alone
+    assert_eq!(move_item(fs.as_ref(), &a, &dest, Conflict::Skip).await.unwrap(), None);
+    assert!(dir.path().join("src/proj/a.txt").exists());
+    // keep both
+    let to = move_item(fs.as_ref(), &a, &dest, Conflict::Rename).await.unwrap().unwrap();
+    assert!(to.ends_with("a (2).txt"));
+    assert!(!dir.path().join("src/proj/a.txt").exists());
+    // overwrite replaces the target
+    let to2 = move_item(fs.as_ref(), &to, &fs.join(&base, "src"), Conflict::Overwrite).await.unwrap().unwrap();
+    std::fs::write(dir.path().join("src/a.txt"), "new").unwrap();
+    let back = move_item(fs.as_ref(), &to2, &dest, Conflict::Overwrite).await.unwrap().unwrap();
+    assert!(back.ends_with("a (2).txt"));
+
+    // a folder never moves into itself; moving to where it already is is a no-op
+    let proj = fs.join(&fs.join(&base, "src"), "proj");
+    assert!(move_item(fs.as_ref(), &proj, &fs.join(&proj, "deep"), Conflict::Overwrite).await.is_err());
+    assert_eq!(move_item(fs.as_ref(), &proj, &fs.join(&base, "src"), Conflict::Overwrite).await.unwrap(), Some(proj.clone()));
+    // a whole folder moves
+    move_item(fs.as_ref(), &proj, &dest, Conflict::Overwrite).await.unwrap();
+    assert_eq!(std::fs::read_to_string(dir.path().join("dest/proj/deep/b.txt")).unwrap(), "beta");
+}
+
+#[tokio::test]
+async fn remove_tree_deletes_a_whole_folder() {
+    let (dir, fs, base) = local_tree();
+    fs.remove_tree(&fs.join(&base, "src")).await.unwrap();
+    assert!(!dir.path().join("src").exists());
+    assert!(dir.path().join("dest").exists());
+}
+
+#[tokio::test]
+async fn default_remove_tree_walks_children_first() {
+    // The trait default (used by SFTP) is exercised through a wrapper that only
+    // forwards the primitives, so LocalFs's remove_dir_all is not what runs.
+    struct Prim(crate::sftp::LocalFs);
+    #[async_trait]
+    impl Fs for Prim {
+        async fn home(&self) -> anyhow::Result<String> { self.0.home().await }
+        async fn list(&self, p: &str) -> anyhow::Result<Listing> { self.0.list(p).await }
+        async fn stat(&self, p: &str) -> anyhow::Result<Entry> { self.0.stat(p).await }
+        async fn mkdir(&self, p: &str) -> anyhow::Result<()> { self.0.mkdir(p).await }
+        async fn rename(&self, a: &str, b: &str) -> anyhow::Result<()> { self.0.rename(a, b).await }
+        async fn delete(&self, p: &str, d: bool) -> anyhow::Result<()> { self.0.delete(p, d).await }
+        async fn chmod(&self, p: &str, m: u32) -> anyhow::Result<()> { self.0.chmod(p, m).await }
+        async fn read(&self, p: &str, l: u64) -> anyhow::Result<Vec<u8>> { self.0.read(p, l).await }
+        async fn write(&self, p: &str, d: &[u8]) -> anyhow::Result<()> { self.0.write(p, d).await }
+        async fn download(&self, p: &str, l: &Path, t: &Transfer) -> anyhow::Result<()> { self.0.download(p, l, t).await }
+        async fn upload(&self, l: &Path, p: &str, t: &Transfer) -> anyhow::Result<()> { self.0.upload(l, p, t).await }
+        fn join(&self, d: &str, n: &str) -> String { self.0.join(d, n) }
+    }
+    let (dir, _, base) = local_tree();
+    let fs = Prim(crate::sftp::LocalFs);
+    // and the default copy_file (through a temp file)
+    let t = Transfer::new("t".into(), None, Arc::new(AtomicBool::new(false)));
+    let a = fs.join(&fs.join(&fs.join(&base, "src"), "proj"), "a.txt");
+    fs.copy_file(&a, &fs.join(&fs.join(&base, "dest"), "a.txt"), &t).await.unwrap();
+    assert_eq!(std::fs::read_to_string(dir.path().join("dest/a.txt")).unwrap(), "alpha");
+    fs.remove_tree(&fs.join(&base, "src")).await.unwrap();
+    assert!(!dir.path().join("src").exists());
+}

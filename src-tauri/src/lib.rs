@@ -2,12 +2,14 @@
 //! so it can be unit-tested and later reused by the MCP server without the UI.
 
 pub mod clipboard;
+pub mod fonts;
 pub mod commands;
 pub mod connections;
 pub mod docs;
 pub mod hidden;
 pub mod hostkeys;
 pub mod mcp;
+pub mod opentabs;
 pub mod import;
 pub mod local;
 pub mod serial;
@@ -38,6 +40,8 @@ pub struct AppState {
     pub mcp: mcp::McpShared,
     /// Tabs in flight between windows (`tabmove.rs`).
     pub tab_stash: tabmove::Stash,
+    /// What reopens at the next start (`opentabs.rs`).
+    pub open_tabs: opentabs::OpenTabs,
 }
 
 pub fn run() {
@@ -94,9 +98,30 @@ pub fn run() {
         })
         // Detached tab windows need the main one (sidebar, MCP approvals, editor):
         // closing the main window ends the app, closing its tab windows too.
+        // Open tabs: closing the main window is quitting (every window's tabs are
+        // kept for next time); closing a tab window on its own closes its tabs.
         .on_window_event(|w, e| {
-            if w.label() == "main" && matches!(e, tauri::WindowEvent::Destroyed) {
-                w.app_handle().exit(0);
+            let state = w.try_state::<AppState>();
+            match (w.label() == "main", e) {
+                (true, tauri::WindowEvent::CloseRequested { .. }) => {
+                    if let Some(s) = state {
+                        s.open_tabs.quitting();
+                    }
+                }
+                (true, tauri::WindowEvent::Destroyed) => {
+                    if let Some(s) = state {
+                        s.open_tabs.quitting();
+                    }
+                    w.app_handle().exit(0);
+                }
+                (false, tauri::WindowEvent::Destroyed) => {
+                    if let Some(s) = state {
+                        if let Err(e) = s.open_tabs.closed(w.label()) {
+                            tracing::warn!("open tabs: {e:#}");
+                        }
+                    }
+                }
+                _ => {}
             }
         })
         .setup(move |app| {
@@ -104,7 +129,9 @@ pub fn run() {
             let vault: Arc<dyn vault::Vault> = Arc::from(vault::open(&paths.data_dir, paths.portable)?);
             let hostkeys = Arc::new(hostkeys::HostKeys::new(&paths.data_dir));
             let profile = Arc::new(std::sync::RwLock::new(profile::load_default(&paths.data_dir)));
+            let open_tabs = opentabs::OpenTabs::new(&paths.data_dir);
             app.manage(AppState {
+                open_tabs,
                 hostkeys,
                 profile,
                 paths,
@@ -144,6 +171,8 @@ pub fn run() {
             commands::vault_set,
             commands::vault_delete,
             commands::vault_rename,
+            commands::vault_edit,
+            commands::font_families,
             commands::connection_set_remote_shell,
             commands::session_shells,
             commands::import_connections,
@@ -163,6 +192,9 @@ pub fn run() {
             commands::sftp_put,
             commands::sftp_get_tree,
             commands::sftp_put_tree,
+            commands::sftp_copy_tree,
+            commands::sftp_move,
+            commands::sftp_delete_tree,
             commands::sftp_cancel,
             commands::sftp_sudo_open,
             commands::sftp_sudo_has_password,
@@ -194,10 +226,23 @@ pub fn run() {
             commands::tab_drop_target,
             commands::tab_window_open,
             commands::tab_send,
+            commands::tabs_saved,
+            commands::tabs_save,
             commands::window_close_self,
             commands::clipboard_read,
+            commands::session_attach,
+            commands::trace_output,
+            commands::log_frontend,
             commands::clipboard_write,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Charon");
+        .build(tauri::generate_context!())
+        .expect("error while building Charon")
+        .run(|app, e| {
+            // Quit from the app menu / Cmd+Q: no window close comes first.
+            if let tauri::RunEvent::ExitRequested { .. } = e {
+                if let Some(s) = app.try_state::<AppState>() {
+                    s.open_tabs.quitting();
+                }
+            }
+        });
 }

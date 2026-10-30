@@ -31,13 +31,15 @@ section!(Appearance {
     font_size: u16 = 13,
     theme: String = "charon-dark".into(),
     scrollback: u32 = 50_000,
-    /// "webgl" or "dom".
+    /// "webgl", "canvas" or "dom" (Settings → Terminal).
     renderer: String = "webgl".into(),
 });
 
 section!(TerminalPrefs {
     /// Gutter with the time each line was printed (status-bar switch).
     timestamps: bool = false,
+    /// Log each output chunk's emit/receive/paint times (diagnostics).
+    trace_output: bool = false,
     copy_on_select: bool = false,
     ctrl_c_copies_when_selected: bool = true,
     middle_click_paste: bool = true,
@@ -65,6 +67,8 @@ section!(Commands {
 
 section!(Ui {
     sidebar_width: u32 = 260,
+    /// Reopen the tabs that were open at quit.
+    restore_tabs: bool = true,
 });
 
 section!(Ssh {

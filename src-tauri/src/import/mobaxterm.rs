@@ -69,6 +69,7 @@ fn parse_session(name: &str, value: &str, folder: &[String]) -> Result<Option<Im
         identity_file,
         jump_host: None,
         folder: folder.to_vec(),
+        ..Default::default()
     }))
 }
 
@@ -109,9 +110,9 @@ mod tests {
 
     #[test]
     fn cleans_auto_generated_names() {
-        assert_eq!(clean_name("192.168.200.20 (admin)", "192.168.200.20", Some("admin")), "192.168.200.20");
-        assert_eq!(clean_name("quasar - 192.168.200.6 (travis)", "192.168.200.6", Some("travis")), "quasar");
-        assert_eq!(clean_name("quasar - 192.168.200.6", "192.168.200.6", None), "quasar");
+        assert_eq!(clean_name("10.20.0.20 (admin)", "10.20.0.20", Some("admin")), "10.20.0.20");
+        assert_eq!(clean_name("buildbox - 10.20.0.6 (travis)", "10.20.0.6", Some("travis")), "buildbox");
+        assert_eq!(clean_name("buildbox - 10.20.0.6", "10.20.0.6", None), "buildbox");
         // Different user/host in the decoration is information: keep it.
         assert_eq!(clean_name("db (root)", "10.0.0.1", Some("dbadmin")), "db (root)");
         assert_eq!(clean_name("db - other.host", "10.0.0.1", None), "db - other.host");

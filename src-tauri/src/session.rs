@@ -13,6 +13,37 @@ use tokio::sync::{oneshot, Mutex};
 /// Output parked for sessions whose tab is moving between windows.
 static HOLDS: std::sync::LazyLock<crate::tabmove::Holds> = std::sync::LazyLock::new(Default::default);
 
+/// One message on a session's output channel (`session_attach`).
+#[derive(Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum OutMsg {
+    /// `seq` and `t` (ms since the epoch, at emit) let the UI log delivery lag.
+    Data { seq: u64, t: f64, b64: String },
+    Closed { reason: String },
+}
+
+/// The channel each session's output goes to: the Terminal that owns the tab
+/// attaches one, and a tab moving windows replaces it. A per-session channel,
+/// not a global event, so delivery doesn't depend on event routing.
+static SINKS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, tauri::ipc::Channel<OutMsg>>>> =
+    std::sync::LazyLock::new(Default::default);
+static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Log every output emit with a timestamp (`trace_output`, or CHARON_TRACE_OUTPUT=1).
+pub static TRACE: std::sync::LazyLock<std::sync::atomic::AtomicBool> = std::sync::LazyLock::new(|| {
+    std::sync::atomic::AtomicBool::new(std::env::var("CHARON_TRACE_OUTPUT").is_ok_and(|v| v == "1"))
+});
+
+fn now_ms() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0)
+}
+
+/// After sending to the UI from a background thread: on Linux, poke GTK's main
+/// loop so the message is dispatched now rather than at the next input event.
+pub fn wake_ui() {
+    #[cfg(target_os = "linux")]
+    gtk::glib::MainContext::default().wakeup();
+}
+
 #[async_trait]
 pub trait Session: Send + Sync {
     async fn write(&self, data: &[u8]) -> Result<()>;
@@ -188,14 +219,35 @@ impl SessionManager {
     }
 
     fn emit_now(app: &AppHandle, id: &str, data: &[u8]) {
-        let _ = app.emit(
-            &format!("term:data:{id}"),
-            base64::engine::general_purpose::STANDARD.encode(data),
-        );
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let t = now_ms();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(data);
+        let sink = SINKS.lock().unwrap().get(id).cloned();
+        let via = match sink {
+            Some(ch) => { let _ = ch.send(OutMsg::Data { seq, t, b64 }); "channel" }
+            None => { let _ = app.emit(&format!("term:data:{id}"), b64); "event" }
+        };
+        wake_ui();
+        if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+            tracing::info!("[charon] out: emit session={id} seq={seq} bytes={} via={via} t={t:.1}", data.len());
+        }
+    }
+
+    fn closed_now(app: &AppHandle, id: &str, reason: &str) {
+        match SINKS.lock().unwrap().remove(id) {
+            Some(ch) => { let _ = ch.send(OutMsg::Closed { reason: reason.to_string() }); }
+            None => { let _ = app.emit(&format!("term:closed:{id}"), reason.to_string()); }
+        }
+        wake_ui();
+    }
+
+    /// Route `id`'s output to `ch` from now on (replacing a previous window's).
+    pub fn attach(id: &str, ch: tauri::ipc::Channel<OutMsg>) {
+        SINKS.lock().unwrap().insert(id.to_string(), ch);
     }
 
     pub fn emit_closed(app: &AppHandle, id: &str, reason: &str) {
-        HOLDS.closed(id, reason, |r| { let _ = app.emit(&format!("term:closed:{id}"), r.to_string()); });
+        HOLDS.closed(id, reason, |r| Self::closed_now(app, id, r));
     }
 
     /// Park `id`'s output. An empty data event marks the point: every byte before
@@ -209,7 +261,7 @@ impl SessionManager {
         HOLDS.release(
             id,
             |b| Self::emit_now(app, id, b),
-            |r| { let _ = app.emit(&format!("term:closed:{id}"), r.to_string()); },
+            |r| Self::closed_now(app, id, r),
         );
     }
 }

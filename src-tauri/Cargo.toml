@@ -1,6 +1,6 @@
 [package]
 name = "charon"
-version = "0.2.7"
+version = "0.3.1"
 description = "Connection manager, terminal, editor and MCP bridge for engineers"
 authors = ["Travis DeLuca"]
 license = "Apache-2.0"

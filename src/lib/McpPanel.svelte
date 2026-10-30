@@ -95,14 +95,14 @@
 </div>
 
 <style>
-  .backdrop { position: fixed; inset: 0; background: #0009; display: grid; place-content: center; z-index: 10; }
+  .backdrop { position: fixed; inset: 0; background: var(--overlay); display: grid; place-content: center; z-index: 10; }
   .dialog { background: var(--bg-raised); border: 1px solid var(--line); border-radius: 6px; padding: 14px 16px; width: 560px; max-width: 92vw; max-height: 90vh; overflow: auto; display: flex; flex-direction: column; gap: 10px; }
   h2 { margin: 0; font-size: 15px; font-weight: 600; }
   p { margin: 0; color: var(--fg-dim); font-size: 12px; }
   .row { display: flex; align-items: center; gap: 10px; }
   .sw { display: flex; align-items: center; gap: 6px; }
   .state { color: var(--fg-dim); font-size: 12px; }
-  .state.on { color: #5fd38a; }
+  .state.on { color: var(--ok); }
   .field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--fg-dim); }
   .tokrow { display: flex; gap: 6px; align-items: center; }
   .tokrow input { flex: 1; min-width: 0; }
@@ -112,7 +112,7 @@
   .ll { display: grid; grid-template-columns: 62px 110px 72px auto 1fr; gap: 6px; align-items: baseline; }
   .ll.err { color: var(--danger); }
   .ll .tool { color: var(--fg); }
-  .dec-allow, .dec-approved { color: #5fd38a; }
+  .dec-allow, .dec-approved { color: var(--ok); }
   .dec-deny, .dec-denied { color: var(--danger); }
   .det { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg-dim); }
   .subj { grid-column: 2 / -1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg); }

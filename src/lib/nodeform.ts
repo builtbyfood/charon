@@ -10,6 +10,8 @@ export interface NodeForm {
   shellInt: "" | "true" | "false"; mcp: string; mcpSudo: boolean;
   shell: string; cwd: string; remoteShell: string;
   serialPort: string; baud: string; dataBits: string; parity: string; stopBits: string;
+  /** Terminal font for this connection; "" / undefined = inherit (folder, then profile). */
+  font: string; fontSize: number | undefined;
 }
 
 export function formFromSettings(s: Settings): NodeForm {
@@ -34,6 +36,8 @@ export function formFromSettings(s: Settings): NodeForm {
     dataBits: String(s.serial?.data_bits ?? 8),
     parity: s.serial?.parity ?? "none",
     stopBits: String(s.serial?.stop_bits ?? 1),
+    font: s.font ?? "",
+    fontSize: s.font_size ?? undefined,
   };
 }
 
@@ -78,6 +82,8 @@ export function settingsFromForm(f: NodeForm, kind: Kind): FormResult {
     mcp_tier: (f.mcp || undefined) as Settings["mcp_tier"],
     // Only meaningful at the trusted tier; store true, else inherit/unset.
     mcp_sudo: f.mcpSudo ? true : undefined,
+    font: f.font.trim() || undefined,
+    font_size: f.fontSize && f.fontSize >= 6 && f.fontSize <= 40 ? Math.round(f.fontSize) : undefined,
   };
   return { ok: true, settings };
 }

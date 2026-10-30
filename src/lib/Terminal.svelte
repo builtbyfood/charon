@@ -28,17 +28,20 @@
   import { Terminal, type IMarker } from "@xterm/xterm";
   import { FitAddon } from "@xterm/addon-fit";
   import { WebglAddon } from "@xterm/addon-webgl";
+  import { CanvasAddon } from "@xterm/addon-canvas";
+  import { diag, epochMs } from "./diag";
   import { SearchAddon } from "@xterm/addon-search";
   import { SerializeAddon } from "@xterm/addon-serialize";
   import {
-    openSsh, openLocal, openSerial, sessionWrite, sessionSetShell, sessionSetCwd, sessionResize, sessionClose, onSessionData, onSessionClosed,
+    openSsh, openLocal, openSerial, sessionWrite, sessionSetShell, sessionSetCwd, sessionResize, sessionClose, attachSession,
     sessionHold, sessionRelease, isOpenError, vaultSet, linkCredential, notifyChanged, onHostKeyPrompt, sshHostKeyAnswer, hostkeyForget, sshKeygenRemove,
     type HostKeyPrompt, type HostKeyChanged,
   } from "./api";
   import { cleanForCopy, pasteWarnings } from "./clipboard";
   import type { FsVia } from "./api";
   import { sq } from "./paths";
-  import type { Prefs } from "./prefs";
+  import { fontStack, type Prefs, type SessionFont } from "./prefs";
+  import { currentTheme, termTheme, watchTheme, type Theme } from "./themes";
   import ContextMenu, { type MenuItem } from "./ContextMenu.svelte";
   import SftpPane from "./SftpPane.svelte";
   import { attachOsc7 } from "./cwdtrack";
@@ -52,11 +55,13 @@
   import { sudoHasPassword, sudoSendPassword, sessionShells, connectionSetRemoteShell, type HostShells } from "./api";
   import { gutterRows, type GutterRow } from "./stamps";
 
-  let { open, adopt, color, prefs, active = true, os, osUser, onfontsize, ontimestamps, onclosed, onabort, oncwd, onopenfile, onfiles, oncommand }: {
+  let { open, adopt, color, font, prefs, active = true, os, osUser, onfontsize, ontimestamps, onclosed, onabort, oncwd, onopenfile, onfiles, oncommand }: {
     open: OpenTarget;
     /** Arrived from another window: restore this instead of connecting. */
     adopt?: TabSnapshot;
     color?: string;
+    /** The connection's own terminal font (PuTTY-style per session); unset parts follow the profile. */
+    font?: SessionFont;
     prefs: Prefs;
     /** This tab is the visible one. Inactive tabs buffer output and drop their
      *  WebGL context (browsers lose contexts past ~16 live), flushing on show. */
@@ -66,7 +71,8 @@
      *  as the login user for a local sudo prompt. */
     os?: string;
     osUser?: string;
-    /** Ctrl+= / Ctrl+- changed the size; the owner persists it to the profile. */
+    /** Ctrl+= / Ctrl+- changed the size; the owner persists it to the profile (tabs
+     *  whose connection sets its own size zoom on their own instead). */
     onfontsize: (size: number) => void;
     /** The timestamps switch was flipped; the owner persists it (all tabs follow prefs). */
     ontimestamps?: (on: boolean) => void;
@@ -94,6 +100,9 @@
   // the hold has been received, everything after waits in the backend.
   let holdSeen: (() => void) | null = null;
   let webgl: WebglAddon | null = null;
+  let canvas: CanvasAddon | null = null;
+  // Output trace (diag.trace): the newest parsed chunk waiting for its paint.
+  let tracePaint: { seq: number; t: number } | null = null;
   let tracker: CommandTracker;
   // Hidden-tab buffering: while inactive we don't touch xterm's parser/renderer;
   // incoming bytes queue here and flush on activation. Capped so a runaway hidden
@@ -168,7 +177,7 @@
   let searchOpen = $state(false);
   let query = $state("");
   let searchEl = $state<HTMLInputElement | null>(null);
-  const SEARCH_OPTS = { decorations: { matchBackground: "#ffb45455", activeMatchBackground: "#ffb454aa", matchOverviewRuler: "#ffb454", activeMatchColorOverviewRuler: "#ffb454" } };
+  const searchOpts = (t: Theme = currentTheme()) => ({ decorations: { matchBackground: t.search.match, activeMatchBackground: t.search.active, matchOverviewRuler: t.search.ruler, activeMatchColorOverviewRuler: t.search.ruler } });
 
   // Line timestamps: one marker per second in which a line started (see stamps.ts).
   // Always recorded, so switching the gutter on shows times for earlier output too.
@@ -242,8 +251,8 @@
 
   onMount(async () => {
     term = new Terminal({
-      fontFamily: prefs.fontFamily,
-      fontSize: prefs.fontSize,
+      fontFamily: fontFamily(),
+      fontSize: fontSize(),
       scrollback: prefs.scrollback,
       allowProposedApi: true,
       // macOS: Option+drag selects even when a program has the mouse (Shift does elsewhere).
@@ -255,7 +264,7 @@
         leave: () => (linkTip = null),
         allowNonHttpProtocols: false,
       },
-      theme: { background: "#101215", foreground: "#d7dae0", cursor: color ?? "#6aa2ff", selectionBackground: "#2f4f8a80" },
+      theme: termTheme(currentTheme(), color),
       // A moved tab restores its screen at the size it was serialised at, then fits.
       ...(adopt ? { cols: adopt.cols, rows: adopt.rows } : {}),
     });
@@ -283,7 +292,7 @@
     preloadTldr();
     term.onCursorMove(() => { clearTimeout(flagEvalTimer); flagEvalTimer = setTimeout(() => { evalFlagPicker(); reportCommand(); }, 60); });
     tracker = new CommandTracker(term, {
-      color: color ?? "#6aa2ff",
+      color: color ?? currentTheme().ui.accent,
       onchange: () => { osc133 = true; markCount = tracker.marks.length; },
       // Re-evaluate who the shell is on every prompt (sudo -i / su - / exit), un-latched.
       onprompt: (line) => { pickerGate.prompt(); const u = promptUserOf(line); if (u) promptUser = u; },
@@ -308,6 +317,11 @@
     term.onScroll(() => { if (copyBtn) copyBtn = null; }); // stale position once scrolled
     term.onLineFeed(recordStamp);
     term.onRender(scheduleGutter);
+    term.onRender(() => {
+      if (!tracePaint) return;
+      console.info(`[charon] out: painted session=${sessionId} seq=${tracePaint.seq} lag=${(epochMs() - tracePaint.t).toFixed(1)}ms renderer=${rendererName()}`);
+      tracePaint = null;
+    });
     term.onScroll(scheduleGutter);
     if (!adopt) recordStamp();
     // No cursor while connecting/authenticating; the remote shell shows it once up.
@@ -521,7 +535,10 @@
 
   /** Output, close and MCP scrollback requests for session `id`. */
   async function listenSession(id: string) {
-    unlisteners.push(await onSessionData(id, (raw) => {
+    unlisteners.push(await attachSession(id, { closed: (r) => { status = "closed"; sudoPrompt = null; clearTimeout(sudoAutoTimer); term.write(`
+[2m[${r}][0m
+${HIDE_CURSOR}`); onclosed(r); }, data: (raw, m) => {
+      if (diag.trace) console.info(`[charon] out: recv session=${id} seq=${m.seq} bytes=${raw.length} lag=${(epochMs() - m.t).toFixed(1)}ms active=${active}`);
       if (!raw.length) { holdSeen?.(); return; } // hold marker (tab moving windows)
       evCount++; byteCount += raw.length;
       // While the injected hook is being echoed back, show nothing until its end sentinel.
@@ -538,12 +555,12 @@
       term.write(b, () => {
         if (leftAlt) { webgl?.clearTextureAtlas(); term.refresh(0, term.rows - 1); }
         maybeSudoPrompt(b);
+        if (diag.trace) { console.info(`[charon] out: parsed session=${id} seq=${m.seq} lag=${(epochMs() - m.t).toFixed(1)}ms`); tracePaint = { seq: m.seq, t: m.t }; }
       });
       // An injected/hidden command just stopped being swallowed: release queued pastes.
       if (pendingPaste.length && !swallower.swallowing) flushPendingPaste();
       if (integrationEnabled) scheduleQuietCheck(id);
-    }));
-    unlisteners.push(await onSessionClosed(id, (r) => { status = "closed"; sudoPrompt = null; clearTimeout(sudoAutoTimer); term.write(`\r\n\x1b[2m[${r}]\x1b[0m\r\n${HIDE_CURSOR}`); onclosed(r); }));
+    } }));
     // MCP read_scrollback: only the Terminal that owns this session answers.
     unlisteners.push(await onMcpScrollback((p) => {
       if (p.session !== sessionId || handedOff) return;
@@ -604,7 +621,10 @@
     connect(password);
   }
 
+  // Follow Settings → Appearance → Theme live.
+  const unwatchTheme = watchTheme((t) => { if (term) term.options.theme = termTheme(t, color); });
   onDestroy(() => {
+    unwatchTheme();
     clearTimeout(injectTimer);
     clearTimeout(flagEvalTimer);
     clearTimeout(selTimer);
@@ -824,17 +844,26 @@
     return false;
   }
 
+  // The connection's own font wins over the profile's; a connection with its own
+  // size zooms this tab only (not saved), others zoom every tab via the profile.
+  let zoomedSize = $state<number | null>(null);
+  const fontFamily = () => (font?.family ? fontStack(font.family) : prefs.fontFamily);
+  const fontSize = () => zoomedSize ?? font?.size ?? prefs.fontSize;
   function zoom(dir: -1 | 0 | 1) {
+    if (font?.size) {
+      zoomedSize = dir === 0 ? null : Math.max(6, Math.min(40, term.options.fontSize! + dir));
+      return;
+    }
     const size = dir === 0 ? 13 : Math.max(6, Math.min(40, term.options.fontSize! + dir));
     onfontsize(size); // flows back in through prefs
   }
   // Live-apply font changes from the profile (zoom in any tab, or an edit on disk).
   $effect(() => {
-    const { fontSize, fontFamily } = prefs;
+    const fontSize_ = fontSize(), fontFamily_ = fontFamily();
     if (!term) return;
     let changed = false;
-    if (term.options.fontSize !== fontSize) { term.options.fontSize = fontSize; changed = true; }
-    if (term.options.fontFamily !== fontFamily) { term.options.fontFamily = fontFamily; changed = true; }
+    if (term.options.fontSize !== fontSize_) { term.options.fontSize = fontSize_; changed = true; }
+    if (term.options.fontFamily !== fontFamily_) { term.options.fontFamily = fontFamily_; changed = true; }
     if (changed) fit.fit();
   });
 
@@ -849,10 +878,10 @@
   }
   function onSearchKey(e: KeyboardEvent) {
     if (e.key === "Escape") { closeSearch(); return; }
-    if (e.key === "Enter") { e.preventDefault(); if (e.shiftKey) search.findPrevious(query, SEARCH_OPTS); else search.findNext(query, SEARCH_OPTS); }
+    if (e.key === "Enter") { e.preventDefault(); if (e.shiftKey) search.findPrevious(query, searchOpts()); else search.findNext(query, searchOpts()); }
   }
   function onSearchInput() {
-    if (query) search.findNext(query, { ...SEARCH_OPTS, incremental: true }); else search.clearDecorations();
+    if (query) search.findNext(query, { ...searchOpts(), incremental: true }); else search.clearDecorations();
   }
 
   // ---- links
@@ -1062,7 +1091,12 @@
     sudoPrompt = null;
   }
 
+  /** Load the renderer prefs.renderer names (Settings → Terminal); none = DOM. */
   function enableWebgl() {
+    if (prefs.renderer === "canvas" && !canvas) {
+      try { canvas = new CanvasAddon(); term.loadAddon(canvas); } catch { canvas?.dispose(); canvas = null; }
+      return;
+    }
     if (webgl || prefs.renderer !== "webgl" || !webglUsable()) return;
     try {
       webgl = new WebglAddon();
@@ -1072,7 +1106,21 @@
       term.loadAddon(webgl);
     } catch { webgl?.dispose(); webgl = null; } // no GL here → DOM renderer
   }
-  function disableWebgl() { if (webgl) { webgl.dispose(); webgl = null; } }
+  function disableWebgl() {
+    if (webgl) { webgl.dispose(); webgl = null; }
+    if (canvas) { canvas.dispose(); canvas = null; }
+  }
+  const rendererName = () => (webgl ? "webgl" : canvas ? "canvas" : "dom");
+  // The renderer setting changed: swap the addon on a shown tab.
+  $effect(() => {
+    const want = prefs.renderer;
+    untrack(() => {
+      // Hidden tabs pick it up when shown (enableWebgl on activation).
+      if (!term || !active || rendererName() === want) return;
+      disableWebgl(); enableWebgl(); term.refresh(0, term.rows - 1);
+      console.info(`[charon] renderer: ${rendererName()} (setting ${want})`);
+    });
+  });
 
   /** Buffer output for a hidden tab; drop oldest whole chunks past the cap. */
   function bufferHidden(b: Uint8Array) {
@@ -1182,7 +1230,7 @@
     const evs = evCount, bs = byteCount; evCount = 0; byteCount = 0;
     // Stay quiet when the tab is idle; only interesting under load.
     if (evs === 0 && bs === 0 && pendingBytes === 0) return;
-    const renderer = !active ? "buffered" : webgl ? "webgl" : "dom";
+    const renderer = !active ? "buffered" : rendererName();
     const tab = sessionId ?? open.host ?? open.kind;
     console.info(`[charon] perf tab=${tab} events/s=${(evs / 5).toFixed(1)} bytes/s=${(bs / 5).toFixed(0)} wq=${writeQueueDepth()} pending=${pendingBytes} renderer=${renderer}`);
   }
@@ -1215,8 +1263,8 @@
       <div class="search">
         <input bind:this={searchEl} bind:value={query} placeholder="Find" spellcheck="false"
           onkeydown={onSearchKey} oninput={onSearchInput} />
-        <button type="button" title="Previous (Shift+Enter)" onclick={() => search.findPrevious(query, SEARCH_OPTS)}>▲</button>
-        <button type="button" title="Next (Enter)" onclick={() => search.findNext(query, SEARCH_OPTS)}>▼</button>
+        <button type="button" title="Previous (Shift+Enter)" onclick={() => search.findPrevious(query, searchOpts())}>▲</button>
+        <button type="button" title="Next (Enter)" onclick={() => search.findNext(query, searchOpts())}>▼</button>
         <button type="button" title="Close (Esc)" onclick={closeSearch}>×</button>
       </div>
     {/if}
@@ -1339,16 +1387,16 @@
   .vsplit:hover, .vsplit:active { background: var(--session-color); }
   .files { flex: none; min-height: 0; }
   /* Left padding is the command-mark gutter (osc133.ts draws bars at -8px). */
-  .term { flex: 1; min-height: 0; min-width: 0; padding: 4px 4px 4px 12px; background: #101215; }
-  .stamps { flex: none; padding: 4px 0 0 6px; background: #101215; color: var(--fg-dim); font-family: var(--font-mono); font-size: max(9px, calc(var(--cell-h) * 0.62)); overflow: hidden; user-select: none; border-right: 1px solid var(--line); }
+  .term { flex: 1; min-height: 0; min-width: 0; padding: 4px 4px 4px 12px; background: var(--term-bg); }
+  .stamps { flex: none; padding: 4px 0 0 6px; background: var(--term-bg); color: var(--fg-dim); font-family: var(--font-mono); font-size: max(9px, calc(var(--cell-h) * 0.62)); overflow: hidden; user-select: none; border-right: 1px solid var(--line); }
   .stamps div { height: var(--cell-h); line-height: var(--cell-h); white-space: pre; padding-right: 6px; min-width: 8ch; }
   .stamps div.rep { opacity: .4; }
-  .search { position: absolute; top: 6px; right: 18px; display: flex; gap: 2px; padding: 4px; background: var(--bg-raised); border: 1px solid var(--line); border-radius: 4px; box-shadow: 0 4px 14px #0008; }
+  .search { position: absolute; top: 6px; right: 18px; display: flex; gap: 2px; padding: 4px; background: var(--bg-raised); border: 1px solid var(--line); border-radius: 4px; box-shadow: 0 4px 14px var(--shadow); }
   .search input { width: 220px; font-family: var(--font-mono); }
   .search button { padding: 2px 7px; }
   /* Prominent, obviously-modal-looking bar so a held paste can't be missed. */
-  .pasteguard { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 10px; background: #ffb45422; border-top: 2px solid #ffb454; font-size: 12px; color: var(--fg); }
-  .pasteguard .pg-icon { color: #ffb454; font-size: 14px; }
+  .pasteguard { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 10px; background: color-mix(in srgb, var(--warn) 14%, transparent); border-top: 2px solid var(--warn); font-size: 12px; color: var(--fg); }
+  .pasteguard .pg-icon { color: var(--warn); font-size: 14px; }
   .pasteguard .pg-msg { font-weight: 600; }
   .pasteguard .pg-hint { margin-right: auto; color: var(--fg-dim); }
   .auth { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 6px 8px; background: var(--bg-raised); border-top: 1px solid var(--line); }
@@ -1360,7 +1408,7 @@
   .auth .err { color: var(--danger); }
   .hostkey { padding: 8px 10px; background: var(--bg-raised); border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
   .hk-title { color: var(--fg); font-weight: 600; }
-  .hk-fp { color: #ffb454; font-size: 13px; }
+  .hk-fp { color: var(--warn); font-size: 13px; }
   .cmd { font-family: var(--font-mono); background: var(--bg-sunken); border: 1px solid var(--line); border-radius: 3px; padding: 3px 8px; user-select: all; margin-right: auto; }
   .hk-note { color: var(--fg-dim); }
   .hk-btns { display: flex; gap: 6px; justify-content: flex-end; align-items: center; }
@@ -1380,12 +1428,12 @@
   .cwd + .chip { margin-left: 0; }
   .chip { margin-left: auto; font: inherit; font-family: var(--font-mono); color: inherit; background: transparent; padding: 0 6px; border: 1px solid var(--line); border-radius: 8px; cursor: pointer; }
   .reconnect { margin-left: 6px; border-color: var(--accent); color: var(--fg); }
-  .sudo { margin-left: 6px; border-color: #ffb454; color: #ffb454; }
-  .sel-copy { position: fixed; z-index: 25; padding: 2px 10px; font: inherit; font-size: 12px; color: var(--fg); background: var(--bg-raised); border: 1px solid var(--accent); border-radius: 4px; box-shadow: 0 3px 10px #0008; cursor: pointer; }
-  .sel-copy:hover { background: var(--accent); color: #06101f; }
-  .link-tip { position: fixed; z-index: 26; max-width: 520px; padding: 3px 8px; font-size: 11px; color: var(--fg); background: var(--bg-raised); border: 1px solid var(--line); border-radius: 4px; box-shadow: 0 3px 10px #0008; pointer-events: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sudo { margin-left: 6px; border-color: var(--warn); color: var(--warn); }
+  .sel-copy { position: fixed; z-index: 25; padding: 2px 10px; font: inherit; font-size: 12px; color: var(--fg); background: var(--bg-raised); border: 1px solid var(--accent); border-radius: 4px; box-shadow: 0 3px 10px var(--shadow); cursor: pointer; }
+  .sel-copy:hover { background: var(--accent); color: var(--on-accent); }
+  .link-tip { position: fixed; z-index: 26; max-width: 520px; padding: 3px 8px; font-size: 11px; color: var(--fg); background: var(--bg-raised); border: 1px solid var(--line); border-radius: 4px; box-shadow: 0 3px 10px var(--shadow); pointer-events: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .link-tip span { margin-left: 8px; color: var(--fg-dim); }
-  .mouse-hint { position: absolute; z-index: 24; left: 50%; bottom: 14px; transform: translateX(-50%); padding: 5px 12px; font-size: 12px; color: var(--fg); background: var(--bg-raised); border: 1px solid var(--accent); border-radius: 4px; box-shadow: 0 3px 10px #0008; pointer-events: none; }
+  .mouse-hint { position: absolute; z-index: 24; left: 50%; bottom: 14px; transform: translateX(-50%); padding: 5px 12px; font-size: 12px; color: var(--fg); background: var(--bg-raised); border: 1px solid var(--accent); border-radius: 4px; box-shadow: 0 3px 10px var(--shadow); pointer-events: none; }
   .chip:hover { border-color: var(--fg-dim); color: var(--fg); }
-  .up .dot { background: #5fd38a; } .closed .dot { background: var(--danger); }
+  .up .dot { background: var(--ok); } .closed .dot { background: var(--danger); }
 </style>

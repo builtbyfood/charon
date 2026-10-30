@@ -428,7 +428,7 @@ mod tests {
         assert!(c.feed(b"\x1b]133;C\x07/home/admin\r\n").is_empty()); // preexec + output inside
         assert!(c.feed(b"\x1b]133;C\x07").is_empty()); // preexec before end printf
         assert!(c.feed(b"\x1b]7771;e;0\x07").is_empty());
-        let shown = c.feed(b"\x1b]133;D;0\x07\x1b]133;A\x07admin@super-earth:~$ \x1b]133;B\x07next");
+        let shown = c.feed(b"\x1b]133;D;0\x07\x1b]133;A\x07admin@devbox:~$ \x1b]133;B\x07next");
         assert_eq!(shown, b"next");
         let (payload, code) = c.into_result();
         assert_eq!(code, 0);

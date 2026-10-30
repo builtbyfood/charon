@@ -30,7 +30,7 @@ test("null tri-states are not stringified into the select values", () => {
 test("explicit values survive a round trip", () => {
   const s: Settings = {
     host: "h", port: 2222, user: "u", credential: "c", jump_host: "j", color: "#abcdef",
-    tags: ["a", "b"], startup: ["uptime", "ls"], shell_integration: false, mcp_tier: "trusted",
+    tags: ["a", "b"], startup: ["uptime", "ls"], shell_integration: false, mcp_tier: "trusted", font: "Hack", font_size: 15,
   };
   const r = settingsFromForm(formFromSettings(s), "ssh");
   assert.ok(r.ok);
@@ -68,4 +68,14 @@ test("validation", () => {
   const ser = settingsFromForm({ ...f, serialPort: "COM3", baud: "115200" }, "serial");
   assert.ok(ser.ok);
   assert.deepEqual(ser.settings.serial, { port: "COM3", baud: 115200, data_bits: 8, parity: "none", stop_bits: 1 });
+});
+
+test("terminal font: inherits when blank, round-trips when set", () => {
+  const blank = settingsFromForm(formFromSettings(JSON.parse('{"font":null,"font_size":null}')), "ssh");
+  assert.ok(blank.ok); assert.equal(blank.settings.font, undefined); assert.equal(blank.settings.font_size, undefined);
+  const set = settingsFromForm({ ...formFromSettings({}), font: " Hack ", fontSize: 15 }, "folder");
+  assert.ok(set.ok); assert.equal(set.settings.font, "Hack"); assert.equal(set.settings.font_size, 15);
+  assert.equal(formFromSettings({ font: "Hack", font_size: 15 }).fontSize, 15);
+  const bad = settingsFromForm({ ...formFromSettings({}), fontSize: 99 }, "ssh");
+  assert.ok(bad.ok); assert.equal(bad.settings.font_size, undefined);
 });

@@ -7,3 +7,6 @@ CloseOnExit=1
 UserName=ops
 PublicKeyFile=
 TerminalType=xterm
+Font=Consolas
+FontHeight=11
+FontIsBold=0

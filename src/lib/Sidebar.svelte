@@ -1,20 +1,22 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import {
-    listConnections, saveConnection, deleteConnection, vaultList, vaultSet, vaultDelete, vaultRename, CHANGED,
+    listConnections, saveConnection, deleteConnection, vaultList, vaultSet, vaultDelete, vaultEdit, CHANGED,
     type Node, type SecretKind, type SecretMeta, type VaultStatus,
   } from "./api";
-  import { inheritedSettings } from "./tree";
+  import { inheritedSettings, colorOf, fontOf } from "./tree";
+  import type { SessionFont } from "./prefs";
   import NodeEditor from "./NodeEditor.svelte";
   import ImportPanel from "./ImportPanel.svelte";
   import DocsPanel from "./DocsPanel.svelte";
 
-  let { onopen, onquick, onlocal, oneditor, onmcp, docsView = $bindable(false), docsCommand, docsSession, vault, onunlock }: {
-    onopen: (n: Node, color?: string) => void;
+  let { onopen, onquick, onlocal, oneditor, onmcp, onsettings, docsView = $bindable(false), docsCommand, docsSession, vault, onunlock }: {
+    onopen: (n: Node, color?: string, font?: SessionFont) => void;
     onquick: (t: string) => void;
     onlocal: (admin?: boolean) => void;
     oneditor: () => void;
     onmcp: () => void;
+    onsettings: () => void;
     docsView: boolean;
     docsCommand: string | null;
     docsSession: string | null;
@@ -60,24 +62,28 @@
       await refreshCreds();
     } catch (err) { credError = String(err); }
   }
-  // Rename in place: double-click the name or the pencil; Enter saves, Esc cancels.
-  let renaming = $state<{ from: string; to: string } | null>(null);
-  async function renameCred() {
-    if (!renaming) return;
-    const { from, to } = renaming;
-    if (!to.trim() || to.trim() === from) { renaming = null; return; }
+  // Edit a credential in place: stored values are never shown, so blank fields keep them.
+  let editingCred = $state<{ from: string; to: string; kind: SecretKind; was: SecretKind; value: string; passphrase: string; clearPass: boolean } | null>(null);
+  function startCredEdit(m: SecretMeta) {
+    editingCred = { from: m.name, to: m.name, kind: m.kind, was: m.kind, value: "", passphrase: "", clearPass: false };
+  }
+  async function saveCred(e: SubmitEvent) {
+    e.preventDefault();
+    if (!editingCred) return;
+    const c = editingCred;
     try {
-      const n = await vaultRename(from, to.trim());
-      renaming = null;
+      const n = await vaultEdit(c.from, c.to.trim(), {
+        kind: c.kind,
+        value: c.value || undefined,
+        key_passphrase: c.kind === "key" && c.passphrase ? c.passphrase : undefined,
+        clear_passphrase: c.kind === "key" && c.clearPass,
+      });
+      editingCred = null;
       credError = "";
       await refreshCreds();
       if (n) await refresh(); // connections now reference the new name
-      console.info(`[charon] vault: renamed credential, ${n} connection(s) updated`);
+      console.info(`[charon] vault: edited credential${c.to.trim() !== c.from ? `, renamed, ${n} connection(s) updated` : ""}`);
     } catch (err) { credError = String(err); }
-  }
-  function renameKey(e: KeyboardEvent) {
-    if (e.key === "Enter") { e.preventDefault(); renameCred(); }
-    else if (e.key === "Escape") { renaming = null; }
   }
   async function removeCred(m: SecretMeta) {
     if (!confirm(`Delete credential ${m.name}? Hosts using it will ask for a password.`)) return;
@@ -92,7 +98,7 @@
       || n.settings.tags?.some((t) => t.toLowerCase().includes(f)) || children(n.id).length > 0;
   };
   // Effective colour (own or nearest folder's) for the tab dot and row stripe.
-  const inheritedColor = (n: Node): string | undefined => n.settings.color ?? inheritedFor(n).color;
+  const inheritedColor = (n: Node): string | undefined => colorOf(nodes, n);
   function toggle(id: string) {
     collapsed.has(id) ? collapsed.delete(id) : collapsed.add(id);
     collapsed = new Set(collapsed);
@@ -136,7 +142,7 @@
           : n.kind === "serial"
           ? `${eff.serial?.port ?? "?"} ${eff.serial?.baud ?? 9600}`
           : `${eff.user ? eff.user + "@" : ""}${eff.host ?? ""}${eff.port && eff.port !== 22 ? ":" + eff.port : ""}`}
-        <button class="name host" title="{n.name}  {target}" onclick={() => onopen(n, inheritedColor(n))}>
+        <button class="name host" title="{n.name}  {target}" onclick={() => onopen(n, inheritedColor(n), fontOf(nodes, n))}>
           <span class="swatch"></span><span class="label">{n.name}</span>
           <span class="dim">{target}</span>
         </button>
@@ -176,6 +182,7 @@
     <button onclick={() => onlocal(false)} title="Open a local shell tab">Local</button>
     <button onclick={() => onlocal(true)} title="Elevated local shell: Windows sudo (inline mode) or sudo -i">Local (admin)</button>
     <button onclick={oneditor} title="Open the editor tab">Editor</button>
+    <button onclick={onsettings} title="Terminal renderer and diagnostics">Settings</button>
     <button onclick={onmcp} title="MCP server settings (let an agent drive your sessions)">MCP</button>
     <button onclick={() => (importing = true)}>Import…</button>
   </div>
@@ -208,13 +215,36 @@
     <ul>
       {#each creds as c (c.name)}
         <li><span class="kind">{c.kind === "key" ? "key" : "pw"}</span>
-          {#if renaming?.from === c.name}
-            <!-- svelte-ignore a11y_autofocus -->
-            <input class="rename" bind:value={renaming.to} onkeydown={renameKey} onblur={renameCred} spellcheck="false" autofocus aria-label="New credential name" />
+          {#if editingCred?.from === c.name}
+            <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+            <form class="edit" onsubmit={saveCred} onkeydown={(k) => { if (k.key === "Escape") editingCred = null; }}>
+              <!-- svelte-ignore a11y_autofocus -->
+              <input bind:value={editingCred.to} placeholder="name" spellcheck="false" autofocus aria-label="Credential name" />
+              <select bind:value={editingCred.kind} aria-label="Kind">
+                <option value="password">password</option>
+                <option value="key">private key</option>
+              </select>
+              {#if editingCred.kind === "password"}
+                <input type="password" bind:value={editingCred.value} autocomplete="off"
+                  placeholder={editingCred.was === "password" ? "new password (blank = keep)" : "password"} />
+              {:else}
+                <input bind:value={editingCred.value} spellcheck="false"
+                  placeholder={editingCred.was === "key" ? "new key path (blank = keep)" : "path to private key (OpenSSH or PuTTY .ppk)"} />
+                <input type="password" bind:value={editingCred.passphrase} autocomplete="off" disabled={editingCred.clearPass}
+                  placeholder={editingCred.was === "key" ? "new passphrase (blank = keep)" : "key passphrase (optional)"} />
+                {#if editingCred.was === "key"}
+                  <label class="sw"><input type="checkbox" bind:checked={editingCred.clearPass} /> remove the passphrase</label>
+                {/if}
+              {/if}
+              <div class="row">
+                <button type="submit" disabled={!editingCred.to.trim() || (editingCred.kind !== editingCred.was && !editingCred.value)}>Save</button>
+                <button type="button" onclick={() => (editingCred = null)}>Cancel</button>
+              </div>
+            </form>
           {:else}
             <!-- svelte-ignore a11y_no_static_element_interactions -->
-            <span class="cname" title="Double-click to rename" ondblclick={() => (renaming = { from: c.name, to: c.name })}>{c.name}</span>
-            <button title="Rename (connections using it follow)" onclick={() => (renaming = { from: c.name, to: c.name })}>✎</button>
+            <span class="cname" title="Double-click to edit" ondblclick={() => startCredEdit(c)}>{c.name}</span>
+            <button title="Edit (name, password / key, passphrase)" onclick={() => startCredEdit(c)}>✎</button>
             <button title="Delete" onclick={() => removeCred(c)}>×</button>
           {/if}</li>
       {/each}
@@ -268,7 +298,11 @@
   .creds li:hover button { visibility: visible; }
   .creds .kind { font-family: var(--font-mono); font-size: 10px; color: var(--fg-dim); width: 22px; }
   .creds .cname { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .creds .rename { flex: 1; min-width: 0; font-family: var(--font-mono); font-size: 12px; padding: 1px 4px; }
+  .creds .edit { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; padding: 2px 0 4px; }
+  .creds .edit input:not([type="checkbox"]), .creds .edit select { width: 100%; font-family: var(--font-mono); font-size: 12px; padding: 1px 4px; }
+  .creds .edit .sw { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--fg-dim); }
+  .creds .edit .row { display: flex; gap: 4px; }
+  .creds .edit button { visibility: visible; border: 1px solid var(--line); padding: 1px 8px; color: var(--fg); }
   .creds .hint, .creds .err { color: var(--fg-dim); font-size: 12px; padding: 2px 10px; margin: 0; }
   .creds .err { color: var(--danger); }
 </style>

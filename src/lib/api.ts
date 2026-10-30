@@ -1,5 +1,5 @@
 // Typed wrappers around Tauri commands so the rest of the UI never spells command names.
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, Channel } from "@tauri-apps/api/core";
 import { listen, emit, emitTo, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 
@@ -17,6 +17,8 @@ export interface Settings {
   remote_shell?: string;
   /** Serial sessions only. */
   serial?: SerialSettings;
+  /** Terminal font for this connection (inherits through folders; unset = the profile's). */
+  font?: string; font_size?: number;
 }
 
 export interface SerialSettings {
@@ -42,8 +44,8 @@ export const appInfo = () => invoke<AppInfo>("app_info");
 // the object as-is and written back unchanged.
 export interface Profile {
   name: string;
-  appearance: { font: string; font_size: number; theme: string; scrollback: number; renderer: "webgl" | "dom" | string; [k: string]: unknown };
-  terminal: { timestamps?: boolean; copy_on_select: boolean; ctrl_c_copies_when_selected: boolean; middle_click_paste: boolean; right_click?: "moba" | "menu" | string; bracketed_paste: boolean; paste_guard_lines: number; paste_run?: "auto" | "wait" | string; [k: string]: unknown };
+  appearance: { font: string; font_size: number; theme: string; scrollback: number; renderer: "webgl" | "canvas" | "dom" | string; [k: string]: unknown };
+  terminal: { timestamps?: boolean; trace_output?: boolean; copy_on_select: boolean; ctrl_c_copies_when_selected: boolean; middle_click_paste: boolean; right_click?: "moba" | "menu" | string; bracketed_paste: boolean; paste_guard_lines: number; paste_run?: "auto" | "wait" | string; [k: string]: unknown };
   files?: { auto_open?: boolean; parallel_transfers?: number; [k: string]: unknown };
   sudo?: { auto_send?: boolean; [k: string]: unknown };
   local?: { credential?: string; [k: string]: unknown };
@@ -51,7 +53,7 @@ export interface Profile {
   commands: { mark_gutter: boolean; tint_failed_commands: boolean; jump_keys: string[]; [k: string]: unknown };
   ssh: { keepalive_seconds: number; [k: string]: unknown };
   mcp: { enabled: boolean; port: number; default_tier: "read" | "exec-approve" | "trusted" | string; [k: string]: unknown };
-  ui: { sidebar_width: number; [k: string]: unknown };
+  ui: { sidebar_width: number; restore_tabs?: boolean; [k: string]: unknown };
   [k: string]: unknown;
 }
 export const getProfile = () => invoke<Profile>("get_profile");
@@ -98,6 +100,12 @@ export const vaultUnlock = (master: string) => invoke<VaultStatus>("vault_unlock
 export const vaultList = () => invoke<SecretMeta[]>("vault_list");
 export const vaultSet = (name: string, secret: Secret) => invoke<void>("vault_set", { name, secret });
 export const vaultDelete = (name: string) => invoke<void>("vault_delete", { name });
+/** Change a stored credential without reading it back: omitted fields keep their
+ *  stored value. `to` renames it too (connections follow); resolves to how many changed. */
+export interface SecretEdit { kind?: SecretKind; value?: string; key_passphrase?: string; clear_passphrase?: boolean }
+/** Installed monospace font families the OS can list (Linux fontconfig); [] elsewhere. */
+export const fontFamilies = () => invoke<string[]>("font_families");
+export const vaultEdit = (name: string, to: string, edit: SecretEdit) => invoke<number>("vault_edit", { name, to, edit });
 /** Rename a credential; connections using it follow. Resolves to how many changed. */
 export const vaultRename = (from: string, to: string) => invoke<number>("vault_rename", { from, to });
 /** Save the shell a saved connection starts (null = its login shell). */
@@ -163,12 +171,26 @@ export function onHostKeyPrompt(id: string, cb: (p: HostKeyPrompt) => void): Pro
 export const sshHostKeyAnswer = (id: string, accept: boolean) =>
   invoke<void>("ssh_hostkey_answer", { id, accept });
 
-export function onSessionData(id: string, cb: (bytes: Uint8Array) => void): Promise<UnlistenFn> {
-  return listen<string>(`term:data:${id}`, (e) => cb(unb64(e.payload)));
+// A session's output arrives on its own channel (session.rs `OutMsg`). Attaching
+// again (a tab moved windows) takes the stream over; the returned fn mutes this one.
+export interface OutData { kind: "data"; seq: number; t: number; b64: string }
+type OutMsg = OutData | { kind: "closed"; reason: string };
+export async function attachSession(
+  id: string,
+  on: { data: (bytes: Uint8Array, m: OutData) => void; closed: (reason: string) => void },
+): Promise<UnlistenFn> {
+  let live = true;
+  const channel = new Channel<OutMsg>();
+  channel.onmessage = (m) => {
+    if (!live) return;
+    if (m.kind === "data") on.data(unb64(m.b64), m); else on.closed(m.reason);
+  };
+  await invoke<void>("session_attach", { id, channel });
+  return () => { live = false; };
 }
-export function onSessionClosed(id: string, cb: (reason: string) => void): Promise<UnlistenFn> {
-  return listen<string>(`term:closed:${id}`, (e) => cb(e.payload));
-}
+/** Output timing trace: pass true/false to switch it, null to just read it. */
+export const traceOutput = (on: boolean | null) => invoke<boolean>("trace_output", { on });
+export const logFrontend = (level: string, msg: string) => invoke<void>("log_frontend", { level, msg });
 
 // Moving a tab between windows (src-tauri/src/tabmove.rs). The source holds the
 // session's output, stashes the serialised tab and hands the token to a new or
@@ -184,6 +206,10 @@ export const tabWindowOpen = (token: string, x: number, y: number, width: number
   invoke<string>("tab_window_open", { token, x, y, width, height });
 export const tabSend = (label: string, token: string, x: number, y: number) => invoke<void>("tab_send", { label, token, x, y });
 export const windowCloseSelf = () => invoke<void>("window_close_self");
+// Tabs reopened at the next start (src-tauri/src/opentabs.rs, src/lib/opentabs.ts).
+export const tabsSaved = () => invoke<Record<string, unknown>>("tabs_saved");
+/** This window's tabs as they are now (a `SavedWindow`). */
+export const tabsSave = (tabs: unknown) => invoke<void>("tabs_save", { tabs });
 // Clipboard text goes through the backend: GTK on Linux (works on Wayland), the
 // clipboard plugin elsewhere — see clipboard.rs.
 export const readText = () => invoke<string>("clipboard_read");
@@ -246,6 +272,15 @@ export const sftpGetTree = (session: S, transfer: string, remote: string, destDi
 /** Recursively upload local file/dir `local` into remote dir `destDir`. */
 export const sftpPutTree = (session: S, transfer: string, local: string, destDir: string, opts: TreeOpts, via?: FsVia, only?: string[]) =>
   invoke<void>("sftp_put_tree", { session, transfer, local, destDir, opts, via, only });
+/** Copy `src` (file or dir) into `destDir` on the same filesystem; progress on `sftp:tree`. */
+export const sftpCopyTree = (session: S, transfer: string, src: string, destDir: string, opts: TreeOpts, via?: FsVia, only?: string[]) =>
+  invoke<void>("sftp_copy_tree", { session, transfer, src, destDir, opts, via, only });
+/** `to` null = skipped (conflict "skip") or failed (`error`). */
+export interface Moved { from: string; to: string | null; error: string | null }
+export const sftpMove = (session: S, paths: string[], destDir: string, conflict: Conflict, via?: FsVia) =>
+  invoke<Moved[]>("sftp_move", { session, paths, destDir, conflict, via });
+/** Delete a file, symlink or whole folder tree. */
+export const sftpDeleteTree = (session: S, path: string, via?: FsVia) => invoke<void>("sftp_delete_tree", { session, path, via });
 export function onTreeEvent(cb: (e: TreeEvent) => void): Promise<UnlistenFn> {
   return listen<TreeEvent>("sftp:tree", (e) => cb(e.payload));
 }

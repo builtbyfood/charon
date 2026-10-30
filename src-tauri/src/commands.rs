@@ -145,6 +145,33 @@ pub async fn vault_rename(state: State<'_, AppState>, from: String, to: String) 
     state.store.lock().await.rename_credential(&from, &to).map_err(err)
 }
 
+/// Change a credential's kind / secret / passphrase and optionally its name; fields
+/// left out keep their stored values, so nothing is ever read back to the UI.
+/// Returns how many connections followed a rename.
+#[tauri::command]
+pub async fn vault_edit(state: State<'_, AppState>, name: String, to: String, edit: crate::vault::SecretEdit) -> CmdResult<usize> {
+    let old = state.vault.get(&name).map_err(err)?.ok_or_else(|| format!("no credential named {name:?}"))?;
+    let new = crate::vault::apply_edit(&old, &edit).map_err(err)?;
+    let to = to.trim().to_string();
+    if !to.is_empty() && to != name && state.vault.get(&to).map_err(err)?.is_some() {
+        return Err(format!("a credential named {to:?} already exists"));
+    }
+    if new != old {
+        state.vault.set(&name, &new).map_err(err)?;
+    }
+    if to.is_empty() || to == name {
+        return Ok(0);
+    }
+    state.vault.rename(&name, &to).map_err(err)?;
+    state.store.lock().await.rename_credential(&name, &to).map_err(err)
+}
+
+/// Installed monospace families (Linux: fontconfig; elsewhere empty, the UI probes).
+#[tauri::command]
+pub async fn font_families() -> Vec<String> {
+    tokio::task::spawn_blocking(crate::fonts::mono_families).await.unwrap_or_default()
+}
+
 /// Save the shell a connection starts (None/blank = the login shell).
 #[tauri::command]
 pub async fn connection_set_remote_shell(state: State<'_, AppState>, id: String, shell: Option<String>) -> CmdResult<()> {
@@ -574,16 +601,55 @@ struct AdoptMsg { token: String, x: f64, y: f64 }
 pub fn tab_send(app: tauri::AppHandle, label: String, token: String, x: f64, y: f64) -> CmdResult<()> {
     use tauri::{Emitter, Manager};
     app.emit_to(label.as_str(), "tab:adopt", AdoptMsg { token, x, y }).map_err(err)?;
+    crate::session::wake_ui();
     if let Some(w) = app.get_webview_window(&label) {
         let _ = w.set_focus();
     }
     Ok(())
 }
 
+/// The tabs the previous run left open, window label → that window's list.
+#[tauri::command]
+pub fn tabs_saved(state: State<'_, AppState>) -> std::collections::BTreeMap<String, serde_json::Value> {
+    state.open_tabs.saved()
+}
+
+/// The calling window's current tabs, kept for the next start.
+#[tauri::command]
+pub fn tabs_save(state: State<'_, AppState>, window: tauri::WebviewWindow, tabs: serde_json::Value) -> CmdResult<()> {
+    state.open_tabs.set(window.label(), tabs).map_err(err)
+}
+
 /// A tab window whose last tab left closes itself.
 #[tauri::command]
 pub fn window_close_self(window: tauri::WebviewWindow) -> CmdResult<()> {
     window.close().map_err(err)
+}
+
+/// Send session `id`'s output (and its close) to this channel.
+#[tauri::command]
+pub fn session_attach(id: String, channel: tauri::ipc::Channel<crate::session::OutMsg>) {
+    crate::session::SessionManager::attach(&id, channel);
+}
+
+/// Output timing trace: `on` switches it, the result is the current state.
+#[tauri::command]
+pub fn trace_output(on: Option<bool>) -> bool {
+    use std::sync::atomic::Ordering;
+    if let Some(on) = on { crate::session::TRACE.store(on, Ordering::Relaxed); }
+    crate::session::TRACE.load(Ordering::Relaxed)
+}
+
+/// A `[charon]` console line from a window, copied to stdout so release builds
+/// (no devtools) can be diagnosed from a terminal.
+#[tauri::command]
+pub fn log_frontend(window: tauri::WebviewWindow, level: String, msg: String) {
+    let w = window.label();
+    match level.as_str() {
+        "error" => tracing::error!(target: "charon::ui", "{w}: {msg}"),
+        "warn" => tracing::warn!(target: "charon::ui", "{w}: {msg}"),
+        _ => tracing::info!(target: "charon::ui", "{w}: {msg}"),
+    }
 }
 
 #[tauri::command]
@@ -840,7 +906,7 @@ where
 {
     let flag = state.transfers.start(transfer);
     let app = state.sessions.app().clone();
-    let emit = move |p: crate::sftp::Progress| { let _ = tauri::Emitter::emit(&app, "sftp:progress", p); };
+    let emit = move |p: crate::sftp::Progress| { let _ = tauri::Emitter::emit(&app, "sftp:progress", p); crate::session::wake_ui(); };
     let t = crate::sftp::Transfer::new(transfer.to_string(), Some(Box::new(emit)), flag);
     let (t, r) = f(t).await;
     state.transfers.finish(transfer);
@@ -916,6 +982,7 @@ fn tree_setup(state: &AppState, transfer: &str, args: TreeArgs) -> (std::sync::A
     let tid = transfer.to_string();
     let report: crate::transfer::Reporter = std::sync::Arc::new(move |event| {
         let _ = tauri::Emitter::emit(&app, "sftp:tree", TreeMsg { transfer: tid.clone(), event });
+        crate::session::wake_ui();
     });
     (flag, opts, report)
 }
@@ -959,6 +1026,68 @@ pub async fn sftp_put_tree(
     let r = crate::transfer::upload_tree(fs, std::path::Path::new(&local), &dest_dir, &topts, flag, report, only.as_ref()).await;
     state.transfers.finish(&transfer);
     r.map_err(err)
+}
+
+/// Copy `src` (file or directory) into `dest_dir` on the same filesystem, as a
+/// tracked tree transfer (`sftp:tree` events).
+#[tauri::command]
+pub async fn sftp_copy_tree(
+    state: State<'_, AppState>,
+    session: Option<String>,
+    via: Option<String>,
+    transfer: String,
+    src: String,
+    dest_dir: String,
+    opts: TreeArgs,
+    only: Option<Vec<String>>,
+) -> CmdResult<()> {
+    let fs = fs_for(&state, session.as_deref(), via.as_deref()).await?;
+    let (flag, topts, report) = tree_setup(&state, &transfer, opts);
+    let only = only.map(|v| v.into_iter().collect::<std::collections::HashSet<_>>());
+    let r = crate::transfer::copy_tree(fs, &src, &dest_dir, &topts, flag, report, only.as_ref()).await;
+    state.transfers.finish(&transfer);
+    r.map_err(err)
+}
+
+/// One item of `sftp_move`: the new path, or why it did not move.
+#[derive(Serialize)]
+pub struct Moved {
+    pub from: String,
+    /// None = skipped (exists, conflict "skip") or failed (`error`).
+    pub to: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Move items into `dest_dir` on the same filesystem; each item succeeds or fails
+/// on its own.
+#[tauri::command]
+pub async fn sftp_move(
+    state: State<'_, AppState>,
+    session: Option<String>,
+    via: Option<String>,
+    paths: Vec<String>,
+    dest_dir: String,
+    conflict: crate::transfer::Conflict,
+) -> CmdResult<Vec<Moved>> {
+    let fs = fs_for(&state, session.as_deref(), via.as_deref()).await?;
+    let mut out = Vec::new();
+    for from in paths {
+        match crate::transfer::move_item(fs.as_ref(), &from, &dest_dir, conflict).await {
+            Ok(to) => out.push(Moved { from, to, error: None }),
+            Err(e) => out.push(Moved { from, to: None, error: Some(format!("{e:#}")) }),
+        }
+    }
+    Ok(out)
+}
+
+/// Delete a file, symlink or whole directory tree.
+#[tauri::command]
+pub async fn sftp_delete_tree(state: State<'_, AppState>, session: Option<String>, via: Option<String>, path: String) -> CmdResult<()> {
+    let p = path.trim_end_matches(['/', '\\']);
+    if p.is_empty() || p.ends_with(':') {
+        return Err(format!("refusing to delete {path:?}"));
+    }
+    fs_for(&state, session.as_deref(), via.as_deref()).await?.remove_tree(&path).await.map_err(err)
 }
 
 // ---------------------------------------------------------------- editor

@@ -4,20 +4,24 @@
   import Terminal from "./lib/Terminal.svelte";
   import EditorPane from "./lib/EditorPane.svelte";
   import McpPanel from "./lib/McpPanel.svelte";
+  import SettingsPanel from "./lib/SettingsPanel.svelte";
+  import { diag } from "./lib/diag";
   import VaultUnlock from "./lib/VaultUnlock.svelte";
   import ContextMenu, { type MenuItem } from "./lib/ContextMenu.svelte";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { appInfo, vaultStatus, getProfile, saveProfile, announceProfile, onProfileSaved, sessionWrite, mcpAnswer, onMcpApprove, onMcpOpenEditor,
-    tabStash, tabTake, tabDropTarget, tabWindowOpen, tabSend, windowCloseSelf, onTabAdopt, editorOpenInMain, onEditorOpenReq,
+    tabStash, tabTake, tabDropTarget, tabWindowOpen, tabSend, windowCloseSelf, tabsSaved, tabsSave, listConnections, onTabAdopt, editorOpenInMain, onEditorOpenReq, traceOutput,
     type AppInfo, type Node, type VaultStatus, type Profile, type FsVia, type McpApprove } from "./lib/api";
-  import { prefsFromProfile, DEFAULTS, type Prefs } from "./lib/prefs";
+  import { prefsFromProfile, DEFAULTS, type Prefs, type SessionFont } from "./lib/prefs";
+  import { applyTheme, resolveTheme, rememberTheme, type ThemePref } from "./lib/themes";
   import { dropIndex, reorder } from "./lib/tabdrag";
+import { restorePlan, toSaved } from "./lib/opentabs";
 
   import type { OpenTarget, TabSnapshot } from "./lib/Terminal.svelte";
   /** Terminal tabs carry an OpenTarget; the single editor tab has none.
    *  `adopt` = the tab came from another window (see moveTab). */
-  interface Tab { id: string; title: string; color?: string; open?: OpenTarget; editor?: true; adopt?: TabSnapshot }
+  interface Tab { id: string; title: string; color?: string; font?: SessionFont; open?: OpenTarget; editor?: true; adopt?: TabSnapshot }
 
   // Every window runs this component. "main" has the sidebar, the editor and the
   // MCP prompts; tab windows ("tab-<token>", torn off the tab bar) hold terminals only.
@@ -73,6 +77,71 @@
     prefs = prefsFromProfile(profile);
     persistProfile();
   }
+  function setRenderer(r: "webgl" | "canvas" | "dom") {
+    if (!profile) return;
+    profile.appearance.renderer = r;
+    prefs = prefsFromProfile(profile);
+    persistProfile();
+  }
+  function setTrace(on: boolean) {
+    if (!profile) return;
+    profile.terminal.trace_output = on;
+    persistProfile();
+    traceOutput(on).then((v) => { diag.trace = v; console.info(`[charon] trace: output ${v ? "on" : "off"}`); }).catch(() => {});
+  }
+  // Theme: the profile's choice, or the OS's light/dark when it says "system".
+  const darkMq = window.matchMedia("(prefers-color-scheme: dark)");
+  function syncTheme() {
+    const t = resolveTheme(profile?.appearance.theme, darkMq.matches);
+    applyTheme(t);
+    rememberTheme(t.id); // so the next start paints in it before the profile loads
+  }
+  darkMq.addEventListener("change", syncTheme);
+  function setTheme(pref: ThemePref) {
+    if (!profile) return;
+    profile.appearance.theme = pref;
+    syncTheme();
+    persistProfile();
+  }
+  function setFont(family: string, size: number | undefined) {
+    if (!profile) return;
+    profile.appearance.font = family || "JetBrains Mono";
+    if (size) profile.appearance.font_size = size;
+    prefs = prefsFromProfile(profile);
+    persistProfile();
+  }
+  function setRestoreTabs(on: boolean) {
+    if (!profile) return;
+    profile.ui.restore_tabs = on;
+    persistProfile();
+  }
+
+  // Open tabs survive a restart: every window reports its tabs as they change
+  // (once its own start-up tabs are in), the main window reopens them all at start.
+  let tabsReady = $state(false);
+  let tabsTimer: ReturnType<typeof setTimeout> | undefined;
+  $effect(() => {
+    if (!tabsReady) return;
+    const w = JSON.parse(JSON.stringify(toSaved(tabs, active)));
+    clearTimeout(tabsTimer);
+    tabsTimer = setTimeout(() => tabsSave(w).catch((e) => console.warn("[charon] tabs: save failed", e)), 300);
+  });
+  async function restoreTabs() {
+    try {
+      const plan = restorePlan(await tabsSaved(), await listConnections());
+      const opened: Tab[] = plan.tabs.map((t) => ({ id: crypto.randomUUID(), ...t }));
+      if (opened.length) {
+        tabs = [...opened, ...tabs];
+        active = opened[plan.active]?.id ?? active;
+        console.info(`[charon] tabs: reopened ${opened.length}`);
+      }
+    } catch (e) {
+      console.warn("[charon] tabs: restore failed", e);
+    } finally {
+      tabsReady = true;
+    }
+  }
+
   function setFontSize(size: number) {
     if (!profile) return;
     profile.appearance.font_size = size;
@@ -97,6 +166,7 @@
   }
   let askMaster = $state(false);
   let mcpOpen = $state(false);
+  let settingsOpen = $state(false);
   // Docs sidebar view (Ctrl+Shift+D) + the command being typed in the active tab.
   let docsView = $state(false);
   let docsCommand = $state<string | null>(null);
@@ -110,22 +180,32 @@
     info = await appInfo();
     profile = await getProfile();
     prefs = prefsFromProfile(profile);
+    syncTheme();
     if (profile.ui.sidebar_width >= 200) sidebarWidth = profile.ui.sidebar_width;
+    // Off in the profile leaves CHARON_TRACE_OUTPUT=1 alone.
+    traceOutput(profile.terminal.trace_output === true ? true : null).then((v) => (diag.trace = v)).catch(() => {});
     // Another window saved the profile (zoom, timestamps): pick it up so this
     // window's copy is not stale when it saves next.
     await onProfileSaved(async (from) => {
       if (from === appWindow.label) return;
       profile = await getProfile();
       prefs = prefsFromProfile(profile);
+      syncTheme();
+      diag.trace = await traceOutput(null).catch(() => diag.trace);
     });
     vault = await vaultStatus();
     // Tabs arriving from other windows; a new tab window starts with the one it was made for.
     await onTabAdopt((p) => adoptTab(p.token, p.x));
     if (!isMain) {
       await adoptTab(appWindow.label.slice("tab-".length), -1);
+      tabsReady = true;
       return;
     }
     askMaster = vault.locked; // file vault in portable mode: ask once at startup
+    // Reopen last run's tabs; with a locked vault, after the unlock prompt so
+    // their connections can find their credentials.
+    if (profile.ui.restore_tabs === false) tabsReady = true;
+    else if (!askMaster) await restoreTabs();
     await onEditorOpenReq((r) => { openFromUi(r.path, r.fs, r.origin, r.via); getCurrentWindow().setFocus().catch(() => {}); });
     // MCP: exec-approval prompts, and open-in-editor requests from an agent.
     await onMcpApprove((p) => { approve = p; allowSudo = false; });
@@ -151,10 +231,10 @@
     });
   });
 
-  function openNode(n: Node, effColor?: string) {
+  function openNode(n: Node, effColor?: string, font?: SessionFont) {
     const id = crypto.randomUUID();
     const kind = n.kind === "local" || n.kind === "serial" ? n.kind : "ssh";
-    tabs.push({ id, title: n.name, color: effColor ?? n.settings.color, open: { kind, nodeId: n.id } });
+    tabs.push({ id, title: n.name, color: effColor ?? n.settings.color, font, open: { kind, nodeId: n.id } });
     active = id;
   }
   function openLocal(admin = false) {
@@ -240,7 +320,7 @@
     let snap: TabSnapshot;
     try { snap = await term.detach(); }
     catch (e) { moveError = String(e instanceof Error ? e.message : e); setTimeout(() => (moveError = ""), 4000); return; }
-    const token = await tabStash(JSON.stringify({ id: t.id, title: t.title, color: t.color, open: t.open, adopt: snap } satisfies Tab));
+    const token = await tabStash(JSON.stringify({ id: t.id, title: t.title, color: t.color, font: t.font, open: t.open, adopt: snap } satisfies Tab));
     try {
       const tgt = await tabDropTarget(appWindow.label);
       const target = where === "main" ? "main" : where === "drop" ? tgt.window : null;
@@ -288,7 +368,7 @@
 <svelte:window onkeydown={onWindowKey} />
 <div class="shell" class:detached={!isMain} style:--sidebar="{sidebarWidth}px">
   {#if isMain}
-    <Sidebar onopen={openNode} onquick={quickConnect} onlocal={openLocal} oneditor={newInEditor} onmcp={() => (mcpOpen = true)}
+    <Sidebar onopen={openNode} onquick={quickConnect} onlocal={openLocal} oneditor={newInEditor} onmcp={() => (mcpOpen = true)} onsettings={() => (settingsOpen = true)}
       bind:docsView {docsCommand} {docsSession} {vault} onunlock={() => (askMaster = true)} />
     <div class="splitter" role="separator" aria-orientation="vertical" aria-label="Resize sidebar" onpointerdown={startDrag}></div>
   {/if}
@@ -327,7 +407,7 @@
           {#if t.editor}
             <EditorPane bind:this={editorPane} onsend={sendToSession} ondirty={(d) => (editorDirty = d)} />
           {:else if t.open}
-            <Terminal bind:this={terms[t.id]} open={t.open} adopt={t.adopt} color={t.color} {prefs} active={active === t.id} os={info?.os} osUser={info?.user} onfontsize={setFontSize} ontimestamps={setTimestamps} onclosed={() => {}} onabort={() => closeTab(t.id)}
+            <Terminal bind:this={terms[t.id]} open={t.open} adopt={t.adopt} color={t.color} font={t.font} {prefs} active={active === t.id} os={info?.os} osUser={info?.user} onfontsize={setFontSize} ontimestamps={setTimestamps} onclosed={() => {}} onabort={() => closeTab(t.id)}
               onopenfile={openFromUi} onfiles={(o) => (filesOpen[t.id] = o)}
               oncommand={(cmd, sess) => { if (isMain && active === t.id) { docsCommand = cmd; docsSession = sess; } }} />
           {/if}
@@ -350,7 +430,12 @@
   <div class="tear-hint">Release outside the window to open the tab in its own window, or over another Charon window to move it there</div>
 {/if}
 {#if askMaster && vault}
-  <VaultUnlock status={vault} ondone={(s) => { if (s) vault = s; askMaster = false; }} />
+  <VaultUnlock status={vault} ondone={(s) => { if (s) vault = s; askMaster = false; if (!tabsReady && profile?.ui.restore_tabs !== false) restoreTabs(); }} />
+{/if}
+{#if settingsOpen && profile}
+  <SettingsPanel theme={(profile.appearance.theme || "charon-dark") as ThemePref} font={profile.appearance.font} fontSize={profile.appearance.font_size}
+    renderer={prefs.renderer} trace={profile.terminal.trace_output === true} restoreTabs={profile.ui.restore_tabs !== false}
+    ontheme={setTheme} onfont={setFont} onrenderer={setRenderer} ontrace={setTrace} onrestoretabs={setRestoreTabs} onclose={() => (settingsOpen = false)} />
 {/if}
 {#if mcpOpen}
   <McpPanel onclose={() => (mcpOpen = false)} />
@@ -395,7 +480,7 @@
   .tear-hint { position: fixed; left: 50%; bottom: 40px; transform: translateX(-50%); background: var(--bg-raised); border: 1px solid var(--accent); border-radius: 4px; padding: 6px 12px; font-size: 12px; z-index: 30; pointer-events: none; }
   .tab .x:hover { opacity: 1; color: var(--danger); }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--tab-color); }
-  .unsaved { color: #ffb454; margin-left: -2px; }
+  .unsaved { color: var(--warn); margin-left: -2px; }
   .badge { font-size: 10px; font-weight: 600; letter-spacing: .03em; color: #fff; background: var(--danger); border-radius: 3px; padding: 0 4px; }
   .panes { flex: 1; position: relative; min-height: 0; }
   .pane { position: absolute; inset: 0; }
@@ -403,17 +488,17 @@
   .meta { font-size: 12px; }
   .appbar { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--fg-dim); padding: 2px 8px; border-top: 1px solid var(--line); background: var(--bg-raised); }
   .appbar .mode { text-transform: uppercase; letter-spacing: .05em; font-weight: 600; }
-  .appbar .mode.portable { color: #ffb454; }
+  .appbar .mode.portable { color: var(--warn); }
   .appbar .mono { font-family: var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .appbar .ver { margin-left: auto; }
   code { font-family: var(--font-mono); color: var(--fg); }
-  .backdrop { position: fixed; inset: 0; background: #0009; display: grid; place-content: center; z-index: 20; }
+  .backdrop { position: fixed; inset: 0; background: var(--overlay); display: grid; place-content: center; z-index: 20; }
   .approve { background: var(--bg-raised); border: 1px solid var(--line); border-radius: 6px; padding: 14px 16px; width: 460px; max-width: 92vw; display: flex; flex-direction: column; gap: 8px; }
   .approve h3 { margin: 0; font-size: 14px; }
   .approve .who { margin: 0; color: var(--fg-dim); font-size: 12px; }
   .approve .cmd { margin: 0; background: var(--bg-sunken); border: 1px solid var(--line); border-radius: 4px; padding: 8px; font-family: var(--font-mono); font-size: 12px; white-space: pre-wrap; word-break: break-all; max-height: 160px; overflow: auto; }
   .approve .row { display: flex; justify-content: flex-end; gap: 6px; }
-  .approve .sudo-opt { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #ffb454; }
+  .approve .sudo-opt { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--warn); }
   .approve .mono { font-family: var(--font-mono); }
   .approve .primary { border-color: var(--accent); }
 </style>

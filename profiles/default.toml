@@ -4,14 +4,15 @@
 name = "default"
 
 [appearance]
-font = "JetBrains Mono"
+font = "JetBrains Mono"         # default terminal font; a connection can set its own (font / font_size)
 font_size = 13                  # Ctrl+= / Ctrl+- write back here
-theme = "charon-dark"
+theme = "charon-dark"           # "charon-light", or "system" to follow the OS (Settings → Appearance)
 scrollback = 50000
-renderer = "webgl"              # "dom" if the WebGL renderer glitches on your GPU
+renderer = "webgl"              # "canvas" or "dom" if WebGL glitches on your GPU (Settings → Terminal)
 
 [terminal]
 timestamps = false              # gutter with the time each line was printed ("time" switch in the status bar)
+trace_output = false            # diagnostics: log output emit/receive/paint times (also CHARON_TRACE_OUTPUT=1)
 copy_on_select = false          # Linux folks may want true
 ctrl_c_copies_when_selected = true
 middle_click_paste = true
@@ -47,6 +48,7 @@ jump_keys = ["Ctrl+Up", "Ctrl+Down"]
 
 [ui]
 sidebar_width = 260             # dragged splitter writes back here
+restore_tabs = true             # reopen the tabs that were open at quit
 
 [docs]
 tldr_offline = true

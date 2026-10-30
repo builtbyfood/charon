@@ -4,3 +4,5 @@ Protocol=ssh
 PortNumber=22
 UserName=
 PublicKeyFile=C:\keys\lab.ppk
+Font=Courier New
+FontHeight=10

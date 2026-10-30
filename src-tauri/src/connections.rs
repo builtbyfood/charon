@@ -50,6 +50,11 @@ pub struct Settings {
     pub cwd: Option<String>,
     /// Serial sessions: port + line settings.
     pub serial: Option<crate::serial::SerialSettings>,
+    /// Terminal font for this connection (PuTTY-style per session); None = the profile's.
+    #[serde(default)]
+    pub font: Option<String>,
+    #[serde(default)]
+    pub font_size: Option<u16>,
 }
 
 impl Settings {
@@ -72,6 +77,8 @@ impl Settings {
             remote_shell: pick!(remote_shell),
             cwd: pick!(cwd),
             serial: pick!(serial),
+            font: pick!(font),
+            font_size: pick!(font_size),
         }
     }
 }
@@ -231,6 +238,18 @@ mod tests {
         assert_eq!(eff.jump_host.as_deref(), Some("bastion"));
         assert_eq!(eff.user.as_deref(), Some("travis"));
         assert_eq!(eff.host.as_deref(), Some("10.0.0.5"));
+    }
+
+    #[test]
+    fn font_inherits_per_field() {
+        let folder = Settings { font: Some("Hack".into()), font_size: Some(15), ..Default::default() };
+        let host = Settings { font_size: Some(11), ..Default::default() };
+        let eff = folder.merged_with(&host);
+        assert_eq!(eff.font.as_deref(), Some("Hack"));
+        assert_eq!(eff.font_size, Some(11));
+        // Rows saved before the fields existed still load.
+        let old: Settings = serde_json::from_str(r#"{"host":"h"}"#).unwrap();
+        assert_eq!((old.font, old.font_size), (None, None));
     }
 
     #[test]

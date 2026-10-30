@@ -5,8 +5,8 @@ import { followTarget, pushTarget } from "./panecwd.ts";
 import { osc7ToLocal } from "./paths.ts";
 
 test("promptUserOf reads the user, or nothing", () => {
-  assert.equal(promptUserOf("admin@super-earth:~$ "), "admin");
-  assert.equal(promptUserOf("root@super-earth:~# "), "root");
+  assert.equal(promptUserOf("admin@devbox:~$ "), "admin");
+  assert.equal(promptUserOf("root@devbox:~# "), "root");
   assert.equal(promptUserOf("[root@box ~]# "), "root");
   assert.equal(promptUserOf("travis@box ~> "), "travis");
   assert.equal(promptUserOf("$ "), undefined);

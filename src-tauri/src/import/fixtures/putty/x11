@@ -1,0 +1,6 @@
+Present=1
+HostName=old.example.com
+Protocol=ssh
+PortNumber=22
+UserName=admin
+Font=server:fixed

@@ -71,6 +71,7 @@ async fn ask_frontend(state: &AppState, mcp: &McpShared, event: &str, mut payloa
     payload["req_id"] = json!(id);
     let rx = mcp.expect(&id).await;
     state.sessions.app().emit(event, &payload).map_err(|e| e.to_string())?;
+    crate::session::wake_ui();
     match tokio::time::timeout(BRIDGE_TIMEOUT, rx).await {
         Ok(Ok(v)) => Ok(v),
         _ => {
@@ -93,6 +94,7 @@ async fn approved(state: &AppState, mcp: &McpShared, tool: &str, session: &str, 
         "mcp:approve",
         json!({ "req_id": id, "tool": tool, "session": session, "command": command }),
     );
+    crate::session::wake_ui();
     let reply = match tokio::time::timeout(APPROVAL_TIMEOUT, rx).await {
         Ok(Ok(v)) => v,
         _ => {

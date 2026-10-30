@@ -43,7 +43,7 @@
 </div>
 
 <style>
-  .backdrop { position: fixed; inset: 0; background: #0009; display: grid; place-content: center; z-index: 10; }
+  .backdrop { position: fixed; inset: 0; background: var(--overlay); display: grid; place-content: center; z-index: 10; }
   .dialog { background: var(--bg-raised); border: 1px solid var(--line); border-radius: 6px; padding: 16px; width: 360px; display: flex; flex-direction: column; gap: 8px; }
   h2 { margin: 0; font-size: 15px; font-weight: 600; }
   p { margin: 0; color: var(--fg-dim); font-size: 12px; }

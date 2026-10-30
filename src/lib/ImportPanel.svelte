@@ -79,7 +79,7 @@
           </ul>
           <div class="policy">
             <label><input type="radio" bind:group={policy} value="skip" /> Skip <span class="dim">leave existing nodes alone</span></label>
-            <label><input type="radio" bind:group={policy} value="overwrite" /> Overwrite settings <span class="dim">host, port, user, key and jump host of the existing node</span></label>
+            <label><input type="radio" bind:group={policy} value="overwrite" /> Overwrite settings <span class="dim">host, port, user, key, jump host and (PuTTY) font of the existing node</span></label>
             <label><input type="radio" bind:group={policy} value="copy" /> Import as copy <span class="dim">add anyway, suffixed “(2)” on a name clash</span></label>
           </div>
         {/if}
@@ -108,7 +108,7 @@
 </div>
 
 <style>
-  .backdrop { position: fixed; inset: 0; background: #0009; display: grid; place-content: center; z-index: 10; }
+  .backdrop { position: fixed; inset: 0; background: var(--overlay); display: grid; place-content: center; z-index: 10; }
   .dialog { background: var(--bg-raised); border: 1px solid var(--line); border-radius: 6px; padding: 14px 16px; width: 440px; max-height: 90vh; overflow: auto; display: flex; flex-direction: column; gap: 10px; }
   h2 { margin: 0; font-size: 15px; font-weight: 600; }
   p { margin: 0; color: var(--fg-dim); font-size: 12px; }

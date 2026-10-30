@@ -1,17 +1,20 @@
 <script lang="ts">
   // File pane beside a terminal: SFTP for SSH tabs, the local disk for local
   // tabs — same UI, the backend picks the filesystem from the session id.
-  // Supports multi-select and recursive (directory / multi-item) transfers.
+  // Supports multi-select and recursive (directory / multi-item) transfers, and
+  // file-manager moves/copies on the same filesystem: drag rows onto a folder, a
+  // crumb or ↑ (hold Ctrl to copy), Cut/Copy/Paste, Move to… / Copy to….
   import { onMount, onDestroy, untrack } from "svelte";
   import { open as pickOpen } from "@tauri-apps/plugin-dialog";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import {
-    sftpHome, sftpList, sftpMkdir, sftpRename, sftpDelete, sftpChmod,
-    sftpGetTree, sftpPutTree, sftpCancel, onTreeEvent,
+    sftpHome, sftpList, sftpMkdir, sftpRename, sftpChmod,
+    sftpGetTree, sftpPutTree, sftpCopyTree, sftpMove, sftpDeleteTree, sftpCancel, onTreeEvent, fileWrite,
     type FsEntry, type FsListing, type TreeEvent, type TreeOpts, type Conflict,
   } from "./api";
   import ContextMenu, { type MenuItem } from "./ContextMenu.svelte";
-  import { joinPath, crumbsOf, osc7ToLocal, humanSize, modeString } from "./paths";
+  import { joinPath, basename, crumbsOf, osc7ToLocal, humanSize, modeString } from "./paths";
+  import { fileClip, canPaste, dropAllowed, collisions, parentOf, type FsRef } from "./fileops";
   import { followTarget, pushTarget } from "./panecwd";
   import { isPermissionError, sftpSudoOpen, sftpSudoHasPassword, sftpSudoClear, writeText, type FsVia } from "./api";
   import { ensureSudo } from "./sudoedit";
@@ -71,17 +74,17 @@
   let menu = $state<{ x: number; y: number; items: MenuItem[] } | null>(null);
   let dropping = $state(false);
   // Inline prompt row (window.prompt is not available in the webview).
-  let ask = $state<{ kind: "rename" | "chmod" | "mkdir"; entry?: FsEntry; value: string } | null>(null);
+  let ask = $state<{ kind: "rename" | "chmod" | "mkdir" | "newfile" | "moveto" | "copyto"; entry?: FsEntry; paths?: string[]; value: string } | null>(null);
   let askEl = $state<HTMLInputElement | null>(null);
 
   // Per-file progress inside one tree transfer.
   interface FileProg { rel: string; done: number; total: number; state: "running" | "done" | "failed" | "skipped"; error?: string }
   // One top-level item (file or directory) being transferred recursively.
   interface Transfer {
-    id: string; name: string; dir: "get" | "put";
-    /** Destination directory: local dir for get, remote dir for put. */
+    id: string; name: string; dir: "get" | "put" | "copy";
+    /** Destination directory: local dir for get, remote dir for put/copy. */
     destDir: string;
-    /** Source path (remote for get, local for put) — kept for retry. */
+    /** Source path (remote for get/copy, local for put) — kept for retry. */
     src: string;
     opts: TreeOpts;
     filesTotal: number; filesDone: number; bytesTotal: number; bytesDone: number;
@@ -98,10 +101,11 @@
   let preserveMtime = $state(true);
   let preserveMode = $state(false);
   // Conflict handling: asked once per batch; "remember" reuses the choice for the session.
-  let conflictAsk = $state<null | { count: number; kind: "get" | "put"; run: (c: Conflict) => void }>(null);
+  let conflictAsk = $state<null | { count: number; kind: ConflictKind; run: (c: Conflict) => void }>(null);
   let rememberConflict = $state(false);
   let sessionConflict: Conflict | null = null;
   const unlisteners: Array<() => void> = [];
+  type ConflictKind = "get" | "put" | "copy" | "move";
 
   const isLocal = $derived(session === null);
   const rootBackend = $derived(via === "shell" || via === "sudo");
@@ -236,7 +240,14 @@
   }
   function selectAll() { selected = new Set(rows.map((r) => r.path)); anchor = rows[0]?.path ?? null; }
   function onListKey(k: KeyboardEvent) {
-    if ((k.ctrlKey || k.metaKey) && k.key.toLowerCase() === "a") { k.preventDefault(); selectAll(); }
+    const mod = k.ctrlKey || k.metaKey, key = k.key.toLowerCase();
+    if (mod && key === "a") { k.preventDefault(); selectAll(); }
+    else if (mod && key === "c" && selected.size) { k.preventDefault(); clip("copy"); }
+    else if (mod && key === "x" && selected.size) { k.preventDefault(); clip("cut"); }
+    else if (mod && key === "v") { k.preventDefault(); paste(); }
+    else if (k.key === "Delete" && selected.size) { k.preventDefault(); removeSelection(); }
+    else if (k.key === "F2" && selectedEntries.length === 1) { k.preventDefault(); startAsk("rename", selectedEntries[0]); }
+    else if (k.key === "Backspace" || (k.altKey && k.key === "ArrowUp")) { k.preventDefault(); up(); }
   }
 
   function activate(e: FsEntry) {
@@ -372,7 +383,7 @@
     t.bytesDone = vals.reduce((s, f) => s + (f.state === "done" ? f.total : f.done), 0);
     t.filesDone = vals.filter((f) => f.state === "done").length;
   }
-  function trackTree(dir: "get" | "put", src: string, name: string, destDir: string, conflict: Conflict) {
+  function trackTree(dir: Transfer["dir"], src: string, name: string, destDir: string, conflict: Conflict) {
     const id = crypto.randomUUID();
     const opts = optsFor(conflict);
     const t: Transfer = {
@@ -381,11 +392,11 @@
       state: "running", cancelled: false, failed: [], files: {}, warnings: [], expanded: false,
     };
     transfers = [t, ...transfers].slice(0, 50);
-    const call = dir === "get"
-      ? sftpGetTree(session, id, src, destDir, opts, via)
-      : sftpPutTree(session, id, src, destDir, opts, via);
+    const call = dir === "get" ? sftpGetTree(session, id, src, destDir, opts, via)
+      : dir === "put" ? sftpPutTree(session, id, src, destDir, opts, via)
+      : sftpCopyTree(session, id, src, destDir, opts, via);
     call
-      .then(() => { if (dir === "put") refresh(); })
+      .then(() => { if (dir !== "get") refresh(); })
       .catch((e) => { if (t.state === "running") { t.state = "error"; t.error = String(e); } });
   }
   function retryTree(t: Transfer) {
@@ -394,15 +405,15 @@
     t.state = "running"; t.error = undefined; t.cancelled = false; t.failed = [];
     for (const rel of only) { const f = t.files[rel]; if (f) { f.state = "running"; f.done = 0; f.error = undefined; } }
     const opts = { ...t.opts, conflict: "overwrite" as Conflict };
-    const call = t.dir === "get"
-      ? sftpGetTree(session, t.id, t.src, t.destDir, opts, via, only)
-      : sftpPutTree(session, t.id, t.src, t.destDir, opts, via, only);
+    const call = t.dir === "get" ? sftpGetTree(session, t.id, t.src, t.destDir, opts, via, only)
+      : t.dir === "put" ? sftpPutTree(session, t.id, t.src, t.destDir, opts, via, only)
+      : sftpCopyTree(session, t.id, t.src, t.destDir, opts, via, only);
     call
-      .then(() => { if (t.dir === "put") refresh(); })
+      .then(() => { if (t.dir !== "get") refresh(); })
       .catch((e) => { if (t.state === "running") { t.state = "error"; t.error = String(e); } });
   }
   // Ask the conflict policy once, then run the batch; remember for the session if asked.
-  function withConflict(kind: "get" | "put", count: number, run: (c: Conflict) => void) {
+  function withConflict(kind: ConflictKind, count: number, run: (c: Conflict) => void) {
     if (sessionConflict) { run(sessionConflict); return; }
     conflictAsk = { kind, count, run: (c) => { if (rememberConflict) sessionConflict = c; conflictAsk = null; run(c); } };
   }
@@ -433,19 +444,123 @@
   const clearDone = () => (transfers = transfers.filter((t) => t.state === "running"));
   const pct = (t: Transfer) => (t.bytesTotal ? Math.floor((t.bytesDone / t.bytesTotal) * 100) + "%" : t.state === "done" ? "100%" : humanSize(t.bytesDone));
 
+  // ---- copy / move on this filesystem (drag, Cut/Copy/Paste, Move to… / Copy to…)
+  const here = (): FsRef => ({ session, via });
+  async function namesIn(dir: string): Promise<string[] | null> {
+    if (listing && dir === listing.path) return listing.entries.map((e) => e.name);
+    try { return (await sftpList(session, dir, via)).entries.map((e) => e.name); } catch { return null; }
+  }
+  /** Ask the conflict policy only if `dir` already holds one of these names (or
+   *  can't be listed); a copy into the items' own folder always keeps both. */
+  async function conflictFor(kind: ConflictKind, paths: string[], dir: string, run: (c: Conflict) => void) {
+    const existing = await namesIn(dir);
+    const names = paths.filter((p) => !(kind === "copy" && parentOf(p) === dir)).map(basename);
+    const clash = existing === null ? names : collisions(names, existing);
+    if (!clash.length) run("rename");
+    else withConflict(kind, clash.length, run);
+  }
+  async function moveTo(paths: string[], dir: string) {
+    if (!dropAllowed(paths, dir, "move")) { error = "Can't move there (same folder, or a folder into itself)."; return; }
+    await conflictFor("move", paths, dir, async (c) => {
+      let msg = "";
+      try {
+        const res = await sftpMove(session, paths, dir, c, via);
+        const bad = res.filter((r) => r.error).map((r) => `${basename(r.from)}: ${r.error}`);
+        const skipped = res.filter((r) => !r.error && !r.to).length;
+        console.info(`[charon] files: moved ${res.filter((r) => r.to).length}/${paths.length} into ${dir}`);
+        msg = bad.length ? bad.join("; ") : skipped ? `${skipped} skipped (already there)` : "";
+      } catch (e) { msg = String(e); }
+      await refresh();
+      error = msg;
+    });
+  }
+  function copyTo(paths: string[], dir: string) {
+    if (!dropAllowed(paths, dir, "copy")) { error = "Can't copy a folder into itself."; return; }
+    conflictFor("copy", paths, dir, (c) => { for (const p of paths) trackTree("copy", p, basename(p), dir, c); });
+  }
+  function clip(op: "copy" | "cut") {
+    const paths = selectedEntries.map((e) => e.path);
+    if (paths.length) fileClip.current = { op, session, via, paths };
+  }
+  async function paste(dir = listing?.path) {
+    const c = fileClip.current;
+    if (!dir || !canPaste(c, here())) return;
+    if (c.op === "cut") { fileClip.current = null; await moveTo(c.paths, dir); }
+    else copyTo(c.paths, dir);
+  }
+
+  // Drag: press on a row, move 5px, release over a [data-dropdir] (folder row, crumb, ↑).
+  let press: { x: number; y: number; entry: FsEntry } | null = null;
+  let drag = $state<{ paths: string[]; x: number; y: number; target: string | null; copy: boolean } | null>(null);
+  function onRowDown(ev: PointerEvent, e: FsEntry) {
+    if (ev.button !== 0) return;
+    press = { x: ev.clientX, y: ev.clientY, entry: e };
+    window.addEventListener("pointermove", onDragMove);
+    window.addEventListener("pointerup", onDragUp);
+    window.addEventListener("keydown", onDragKey, true);
+  }
+  function dropTargetAt(x: number, y: number): string | null {
+    const hit = document.elementFromPoint(x, y)?.closest<HTMLElement>("[data-dropdir]");
+    return hit && el?.contains(hit) ? hit.dataset.dropdir ?? null : null;
+  }
+  function onDragMove(ev: PointerEvent) {
+    if (!press) return;
+    if (!drag) {
+      if (Math.hypot(ev.clientX - press.x, ev.clientY - press.y) < 5) return;
+      if (!selected.has(press.entry.path)) { selected = new Set([press.entry.path]); anchor = press.entry.path; }
+      drag = { paths: selectedEntries.map((x) => x.path), x: 0, y: 0, target: null, copy: false };
+    }
+    const copy = ev.ctrlKey || ev.metaKey;
+    const t = dropTargetAt(ev.clientX, ev.clientY);
+    drag.x = ev.clientX; drag.y = ev.clientY; drag.copy = copy;
+    drag.target = t !== null && dropAllowed(drag.paths, t, copy ? "copy" : "move") ? t : null;
+  }
+  function endDrag() {
+    press = null; drag = null;
+    window.removeEventListener("pointermove", onDragMove);
+    window.removeEventListener("pointerup", onDragUp);
+    window.removeEventListener("keydown", onDragKey, true);
+  }
+  function onDragUp() {
+    const d = drag;
+    endDrag();
+    if (!d) return;
+    // The release would click whatever is under it (a crumb navigates): eat that click.
+    const eat = (c: MouseEvent) => { c.stopPropagation(); c.preventDefault(); };
+    window.addEventListener("click", eat, { capture: true, once: true });
+    setTimeout(() => window.removeEventListener("click", eat, { capture: true }), 0);
+    if (d.target === null) return;
+    if (d.copy) copyTo(d.paths, d.target); else moveTo(d.paths, d.target);
+  }
+  function onDragKey(k: KeyboardEvent) {
+    if (k.key === "Escape" && (drag || press)) { k.preventDefault(); k.stopPropagation(); endDrag(); }
+  }
+  onDestroy(endDrag);
+
   // ---- inline prompts
   function startAsk(kind: NonNullable<typeof ask>["kind"], entry?: FsEntry) {
-    ask = { kind, entry, value: kind === "rename" ? entry!.name : kind === "chmod" ? entry!.mode.toString(8).padStart(3, "0") : "" };
+    const paths = kind === "moveto" || kind === "copyto" ? selectedEntries.map((x) => x.path) : undefined;
+    ask = { kind, entry, paths, value: kind === "rename" ? entry!.name : kind === "chmod" ? entry!.mode.toString(8).padStart(3, "0")
+      : paths ? listing?.path ?? "" : "" };
     queueMicrotask(() => { askEl?.focus(); askEl?.select(); });
   }
   async function submitAsk(e: SubmitEvent) {
     e.preventDefault();
     if (!ask || !listing) return;
-    const { kind, entry, value } = ask;
+    const { kind, entry, value, paths } = ask;
     const v = value.trim();
     if (!v) { ask = null; return; }
+    if (paths) {
+      ask = null;
+      if (kind === "moveto") await moveTo(paths, v); else copyTo(paths, v);
+      return;
+    }
     try {
       if (kind === "mkdir") await sftpMkdir(session, joinPath(listing.path, v), via);
+      else if (kind === "newfile") {
+        if (listing.entries.some((x) => x.name === v)) { error = `${v} already exists`; return; }
+        await fileWrite(session, joinPath(listing.path, v), "", "utf-8", "lf", via);
+      }
       else if (kind === "rename" && entry) await sftpRename(session, entry.path, joinPath(listing.path, v), via);
       else if (kind === "chmod" && entry) {
         if (!/^[0-7]{3,4}$/.test(v)) { error = "mode must be octal, e.g. 644 or 0755"; return; }
@@ -459,11 +574,15 @@
     const items = selectedEntries;
     if (!items.length) return;
     const label = items.length === 1 ? items[0].name : `${items.length} items`;
-    if (!confirm(`Delete ${label}? (directories must be empty)`)) return;
-    try {
-      for (const e of items) await sftpDelete(session, e.path, isDirEntry(e), via);
-      await refresh();
-    } catch (err) { error = String(err); }
+    const folders = items.some((e) => e.kind === "dir");
+    if (!confirm(`Delete ${label}?${folders ? " Folders are deleted with everything in them." : ""}`)) return;
+    let msg = "";
+    for (const e of items) {
+      try { await sftpDeleteTree(session, e.path, via); }
+      catch (err) { msg = `${e.name}: ${String(err)}`; break; }
+    }
+    await refresh();
+    error = msg;
   }
 
   function onRowMenu(ev: MouseEvent, e: FsEntry) {
@@ -480,6 +599,13 @@
         : { label: "Edit as root", action: () => only && editAsRoot(only), disabled: many || !only || !onopen || sudoBusy }] : []),
       { label: many ? `Download ${selected.size} items…` : "Download…", action: downloadSelection },
       { separator: true, label: "" },
+      { label: "Cut", action: () => clip("cut") },
+      { label: "Copy", action: () => clip("copy") },
+      ...(isDir && only ? [{ label: "Paste into folder", action: () => paste(only.path), disabled: !canPaste(fileClip.current, here()) }] : []),
+      { label: "Duplicate", action: () => listing && copyTo(selectedEntries.map((x) => x.path), listing.path) },
+      { label: "Move to…", action: () => startAsk("moveto") },
+      { label: "Copy to…", action: () => startAsk("copyto") },
+      { separator: true, label: "" },
       { label: "Rename…", action: () => only && startAsk("rename", only), disabled: many || !only },
       { label: many ? `Delete ${selected.size}…` : "Delete…", action: removeSelection },
       { label: "Copy path", action: () => writeText(selectedEntries.map((x) => x.path).join("\n")) },
@@ -490,6 +616,8 @@
     ev.preventDefault(); ev.stopPropagation();
     menu = { x: ev.clientX, y: ev.clientY, items: [
       { label: "New folder…", action: () => startAsk("mkdir") },
+      { label: "New file…", action: () => startAsk("newfile") },
+      { label: fileClip.current?.op === "cut" ? "Paste (move here)" : "Paste", action: () => paste(), disabled: !canPaste(fileClip.current, here()) },
       { label: "Upload files…", action: pickUploadFiles },
       { label: "Upload folder…", action: pickUploadFolder },
       { label: "Refresh", action: refresh },
@@ -504,13 +632,13 @@
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div class="pane" class:dropping bind:this={el} data-drop="files" style:--session-color={color ?? "var(--accent)"} oncontextmenu={onPaneMenu}>
   <div class="bar">
-    <button type="button" title="Up" onclick={up} disabled={!listing?.parent}>↑</button>
+    <button type="button" title="Up (drop items here to move them up)" onclick={up} disabled={!listing?.parent} data-dropdir={listing?.parent ?? undefined} class:droptarget={!!drag && drag.target === listing?.parent}>↑</button>
     <button type="button" title="Refresh" onclick={refresh} disabled={!listing}>⟳</button>
     <div class="crumbs">
       {#if listing}
         {#each crumbsOf(listing.path) as c, i (c.path)}
           {#if i > 0}<span class="sep">›</span>{/if}
-          <button type="button" class="crumb" onclick={() => go(c.path)} title={c.path}>{c.label}</button>
+          <button type="button" class="crumb" onclick={() => go(c.path)} title={c.path} data-dropdir={c.path} class:droptarget={drag?.target === c.path}>{c.label}</button>
         {/each}
       {/if}
     </div>
@@ -560,7 +688,8 @@
   {/if}
   {#if ask}
     <form class="ask" onsubmit={submitAsk}>
-      <span>{ask.kind === "mkdir" ? "New folder" : ask.kind === "rename" ? "Rename to" : "chmod (octal)"}</span>
+      <span>{ask.kind === "mkdir" ? "New folder" : ask.kind === "newfile" ? "New file" : ask.kind === "rename" ? "Rename to"
+        : ask.kind === "moveto" ? `Move ${ask.paths?.length ?? 0} to folder` : ask.kind === "copyto" ? `Copy ${ask.paths?.length ?? 0} to folder` : "chmod (octal)"}</span>
       <input bind:this={askEl} bind:value={ask.value} spellcheck="false" class="mono" onkeydown={(e) => { if (e.key === "Escape") ask = null; }} />
       <button type="submit">OK</button>
       <button type="button" onclick={() => (ask = null)}>Cancel</button>
@@ -578,6 +707,9 @@
     {#each rows as e (e.path)}
       {@const isDir = isDirEntry(e)}
       <div class="row" class:sel={selected.has(e.path)} class:dir={isDir} role="row" tabindex="0"
+        class:dragging={!!drag && drag.paths.includes(e.path)} class:droptarget={!!drag && drag.target === e.path}
+        data-dropdir={isDir ? e.path : undefined}
+        onpointerdown={(ev) => onRowDown(ev, e)}
         onclick={(ev) => onRowClick(ev, e)} ondblclick={() => activate(e)}
         onkeydown={(k) => { if (k.key === "Enter") activate(e); }}
         oncontextmenu={(ev) => onRowMenu(ev, e)}>
@@ -602,7 +734,7 @@
       {#each transfers as t (t.id)}
         <div class="tr" class:err={t.state === "error"}>
           <button type="button" class="disc" title="Show per-file progress" onclick={() => (t.expanded = !t.expanded)}>{t.expanded ? "▾" : "▸"}</button>
-          <span class="tname" title={`${t.destDir}${t.error ? ` · ${t.error}` : ""}`}>{t.dir === "get" ? "↓" : "↑"} {t.name}</span>
+          <span class="tname" title={`${t.destDir}${t.error ? ` · ${t.error}` : ""}`}>{t.dir === "get" ? "↓" : t.dir === "put" ? "↑" : "⧉"} {t.name}</span>
           <progress max={t.bytesTotal || 1} value={t.bytesDone}></progress>
           <span class="tpct">{pct(t)}</span>
           <span class="tcount" title="files done / total">{t.filesDone}/{t.filesTotal || "?"}{t.failed.length ? ` · ${t.failed.length} failed` : ""}</span>
@@ -627,6 +759,11 @@
       {/each}
     </div>
   {/if}
+  {#if drag}
+    <div class="ghost" style:left="{drag.x + 14}px" style:top="{drag.y + 10}px">
+      {drag.copy ? "copy" : "move"} {drag.paths.length === 1 ? basename(drag.paths[0]) : `${drag.paths.length} items`}{drag.target ? ` → ${basename(drag.target) || drag.target}` : ""}
+    </div>
+  {/if}
   {#if dropping}<div class="drop">Drop to upload into {listing?.path ?? "…"}</div>{/if}
   {#if menu}
     <ContextMenu x={menu.x} y={menu.y} items={menu.items} onclose={() => (menu = null)} />
@@ -640,7 +777,7 @@
   .bar button { padding: 1px 6px; }
   .bar button.on { border-color: var(--session-color); color: var(--fg); }
   .backend { display: flex; align-items: center; gap: 6px; padding: 2px 8px; font-size: 11px; color: var(--fg-dim); border-bottom: 1px solid var(--line); }
-  .backend.root { color: #ffb454; }
+  .backend.root { color: var(--warn); }
   .backend .link { border: 0; background: transparent; color: var(--session-color); padding: 0; text-decoration: underline; font-size: 11px; }
   .crumbs { flex: 1; min-width: 0; display: flex; align-items: center; overflow: hidden; white-space: nowrap; }
   .crumb { border: 0; background: transparent; padding: 1px 3px; color: var(--fg-dim); font-family: var(--font-mono); }
@@ -687,6 +824,9 @@
   .fr.ffail { color: var(--danger); }
   .frel { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .fst { text-align: right; }
-  .warn { color: #ffb454; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .drop { position: absolute; inset: 0; display: grid; place-content: center; background: #0008; color: var(--fg); pointer-events: none; }
+  .warn { color: var(--warn); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row.dragging { opacity: .5; }
+  .row.droptarget, .crumb.droptarget, .bar button.droptarget { background: var(--bg); outline: 1px solid var(--session-color); outline-offset: -1px; }
+  .ghost { position: fixed; z-index: 20; pointer-events: none; padding: 2px 8px; border: 1px solid var(--session-color); border-radius: 4px; background: var(--bg-raised); color: var(--fg); white-space: nowrap; font-size: 11px; }
+  .drop { position: absolute; inset: 0; display: grid; place-content: center; background: var(--overlay); color: var(--fg); pointer-events: none; }
 </style>

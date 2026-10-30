@@ -4,6 +4,106 @@ All notable changes to Charon are recorded here. Versions follow semver; the
 canonical version lives in `src-tauri/tauri.conf.json` and is propagated to
 `package.json` and `Cargo.toml` by `npm run bump` (`scripts/bump-version.mjs`).
 
+## 0.3.1
+
+### Tabs
+- **Tabs reopen at the next start.** The terminal tabs open when Charon closes
+  come back, including tabs in torn-off windows (they reopen in the main
+  window). The tab that was visible in the main window is visible again.
+  - Saved connections are looked up again, so renames and colour or font
+    changes since then apply, and deleted ones are skipped. Quick-connect,
+    local and serial tabs reopen as they were.
+  - Elevated local shells (which would prompt for UAC / sudo at launch) and
+    editor files are not reopened.
+  - Closing a torn-off window on its own closes its tabs for good; quitting
+    keeps them all.
+  - With a locked portable vault, tabs reopen after the unlock prompt.
+  - On by default; Settings → Tabs → "Reopen tabs from last time"
+    (`[ui] restore_tabs` in the profile). The list lives in
+    `data/open-tabs.json` and is kept current while Charon runs, so a crash
+    doesn't lose it either.
+
+## 0.3.0
+
+### Appearance
+- **Light and dark themes**, set in Settings → Appearance: Dark (the default),
+  Light, or Match system, which follows the OS live.
+  - Each theme has its own UI colours, a tuned 16-colour terminal palette and
+    a matching editor theme.
+  - Tests check text contrast against WCAG for every surface and every ANSI
+    colour.
+  - The app starts in the last theme it used, so there's no dark flash.
+- **Native controls follow the theme.** Dropdowns, scrollbars and pickers use
+  the theme's colour scheme, which fixes the hard-to-read `<select>` lists
+  (e.g. the credential editor) under GTK / Fedora.
+
+### Terminal
+- **Per-connection terminal font and size**, as in PuTTY saved sessions: Edit
+  → Terminal font. Set on a folder, everything under it inherits; blank uses
+  the profile's font.
+  - A connection with its own size zooms with Ctrl+= / Ctrl+- on its own tabs
+    only, and the zoom isn't saved.
+  - The default font and size are in Settings → Appearance.
+- The font field lists the installed monospace fonts: fontconfig on Linux, and
+  a probed list of common terminal fonts everywhere. Any name can still be
+  typed. A live preview shows the result.
+
+### Import
+- **The PuTTY import brings each session's font over**, family and size
+  (points become px): `Font` / `FontHeight` from the Windows registry, or the
+  `client:` font description from Unix PuTTY.
+  - Sessions still on PuTTY's factory default (Courier New 10) are left on
+    Charon's default font.
+  - X11 server fonts (`server:fixed`) can't be used, so they're reported in
+    the import warnings.
+  - Overwrite on re-import also updates the font.
+
+## 0.2.9
+
+### Files
+- **The file pane works like a file manager** on the same filesystem (one SSH
+  host, sudo-sftp, the shell backend or the local disk):
+  - Drag rows onto a folder, a breadcrumb or ↑ to move them; hold Ctrl to copy.
+    Esc cancels the drag.
+  - New right-click items: Cut, Copy, Paste / Paste into folder, Duplicate,
+    Move to… and Copy to… (type a folder path), and New file….
+  - Keys: Ctrl+C / Ctrl+X / Ctrl+V, Delete, F2 to rename, Backspace or Alt+↑ to
+    go up.
+  - Copies run as transfers, with progress, cancel and retry of failed files.
+  - You're asked about name clashes only when the destination already has one
+    (Overwrite / Skip / Keep both). Copying into the same folder always keeps
+    both, as "name (2)".
+- **Delete removes whole folders**, contents included. It used to need them
+  empty. The confirmation says so.
+
+### Credentials
+- **Edit a credential**, not just its name. ✎ (or a double-click) opens a form
+  for the name, the kind (password / private key), the password or key path,
+  and the key passphrase, with an option to remove the passphrase.
+  - Stored values are still never shown. A blank field keeps what is stored.
+  - Changing the kind needs a new value.
+  - Connections follow a rename, as before.
+
+## 0.2.8
+
+### Terminal
+- **Settings → Terminal → Renderer**: WebGL (default), Canvas or DOM, switched
+  live for every tab (new *Settings* button in the sidebar). `appearance.renderer`
+  in the profile now also accepts `"canvas"`.
+- Terminal output reaches its tab over a per-session channel instead of a global
+  event; a tab moving windows takes the channel over. On Linux the GTK main loop
+  is woken after every message to the UI (terminal output, file transfer
+  progress, MCP prompts, host-key prompts).
+
+### Diagnostics
+- `[charon]` console lines are copied to stdout, so a release build run from a
+  terminal shows them without devtools.
+- **Trace output timing** (Settings, or `CHARON_TRACE_OUTPUT=1`): every output
+  chunk logs `out: emit` (Rust), `out: recv`, `out: parsed` and `out: painted`
+  (JS) with one sequence number and its lag since the emit.
+- The Linux frame fallback says once if frames arrive on their own
+  (`raf: … fallback=0`), as well as whenever the timer stepped in.
+
 ## 0.2.7
 
 ### Linux

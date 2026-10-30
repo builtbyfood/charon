@@ -6,6 +6,7 @@ import jsonWorker from "monaco-editor/esm/vs/language/json/json.worker?worker";
 import cssWorker from "monaco-editor/esm/vs/language/css/css.worker?worker";
 import htmlWorker from "monaco-editor/esm/vs/language/html/html.worker?worker";
 import tsWorker from "monaco-editor/esm/vs/language/typescript/ts.worker?worker";
+import { THEMES, watchTheme } from "./themes";
 
 self.MonacoEnvironment = {
   getWorker(_: string, label: string) {
@@ -17,21 +18,11 @@ self.MonacoEnvironment = {
   },
 };
 
-monaco.editor.defineTheme("charon", {
-  base: "vs-dark",
-  inherit: true,
-  rules: [],
-  colors: {
-    "editor.background": "#101215",
-    "editor.foreground": "#d7dae0",
-    "editorLineNumber.foreground": "#4b5160",
-    "editorLineNumber.activeForeground": "#9aa3b2",
-    "editor.lineHighlightBackground": "#16191e",
-    "editorWhitespace.foreground": "#3a4150",
-    "editorIndentGuide.background": "#22262d",
-    "editor.selectionBackground": "#2f4f8a80",
-  },
-});
+// One Monaco theme per app theme (ids match themes.ts); follow the page's theme.
+for (const t of Object.values(THEMES)) {
+  monaco.editor.defineTheme(t.id, { base: t.editor.base, inherit: true, rules: [], colors: t.editor.colors });
+}
+watchTheme((t) => monaco.editor.setTheme(t.id));
 
 export { monaco };
 

@@ -5,6 +5,7 @@
   import { serialListPorts, type Node, type Settings, type SecretMeta, type PortInfo } from "./api";
   import { formFromSettings, settingsFromForm } from "./nodeform";
   import { PALETTE } from "./tree";
+  import FontPicker from "./FontPicker.svelte";
 
   let { node, inherited, creds, isNew, onsave, oncancel }: {
     node: Node;
@@ -159,6 +160,12 @@
       </div>
     </div>
 
+    <div class="field">
+      <span>Terminal font <span class="dim">blank = {inherited.font || inherited.font_size ? "inherit from the folder" : "the profile's (Settings → Appearance)"}</span></span>
+      <FontPicker bind:family={f.font} bind:size={f.fontSize} inheritFamily={inherited.font} inheritSize={inherited.font_size}
+        placeholder={inherited.font ? undefined : "profile default"} />
+    </div>
+
     <label>Tags
       <input bind:value={f.tags} placeholder={inherited.tags?.join(", ") ?? "prod, web"} spellcheck="false" />
     </label>
@@ -199,12 +206,12 @@
 </div>
 
 <style>
-  .backdrop { position: fixed; inset: 0; background: #0009; display: grid; place-content: center; z-index: 10; }
+  .backdrop { position: fixed; inset: 0; background: var(--overlay); display: grid; place-content: center; z-index: 10; }
   .dialog { background: var(--bg-raised); border: 1px solid var(--line); border-radius: 6px; padding: 14px 16px; width: 440px; max-height: 90vh; overflow: auto; display: flex; flex-direction: column; gap: 8px; }
   h2 { margin: 0 0 4px; font-size: 15px; font-weight: 600; }
   label, .field { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--fg-dim); }
   label input, label select, label textarea { color: var(--fg); }
-  label.check { flex-direction: row; align-items: center; gap: 6px; color: #ffb454; }
+  label.check { flex-direction: row; align-items: center; gap: 6px; color: var(--warn); }
   label.check input { width: auto; }
   textarea { font: inherit; background: var(--bg-sunken); border: 1px solid var(--line); border-radius: 3px; padding: 4px 8px; resize: vertical; }
   .mono { font-family: var(--font-mono); }

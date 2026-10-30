@@ -9,6 +9,7 @@
   import { canRetryAsSudo, ensureSudo } from "./sudoedit";
   import { cleanForCopy } from "./clipboard";
   import { basename } from "./paths";
+  import { currentTheme } from "./themes";
 
   let { onsend, ondirty }: {
     /** Ctrl+Enter: selection (or current line) to the session the file came from. */
@@ -61,7 +62,7 @@
   onMount(() => {
     registerEditorExtras();
     editor = monaco.editor.create(host, {
-      theme: "charon",
+      theme: currentTheme().id,
       automaticLayout: true,
       fontFamily: '"JetBrains Mono", "Cascadia Mono", Consolas, "DejaVu Sans Mono", monospace',
       fontSize: 13,
@@ -370,7 +371,7 @@
   .status button.sudo { border-color: var(--danger); color: var(--danger); }
   .sudo-ask { display: flex; align-items: center; gap: 4px; }
   .sudo-ask input { font-size: 11px; padding: 0 4px; width: 140px; }
-  :global(.eol-glyph::after) { color: #5a6275; opacity: .9; }
+  :global(.eol-glyph::after) { color: var(--muted); opacity: .9; }
   :global(.eol-lf::after) { content: "¶"; }
   :global(.eol-crlf::after) { content: "¤¶"; }
 </style>

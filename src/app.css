@@ -1,6 +1,9 @@
-/* Charon — a workbench, not a website. Dark, dense, one accent that means
-   "which machine am I on" and is set per connection, never globally. */
+/* Charon — a workbench, not a website. Dense, one accent that means "which
+   machine am I on" and is set per connection, never globally. Colours come from
+   src/lib/themes.ts (Settings → Appearance); these are the dark defaults shown
+   before the profile has loaded. */
 :root {
+  color-scheme: dark;
   --bg: #16181d;
   --bg-raised: #1e2128;
   --bg-sunken: #101215;
@@ -8,7 +11,14 @@
   --fg: #d7dae0;
   --fg-dim: #8b909a;
   --accent: #6aa2ff;          /* overridden per session by connection colour */
+  --on-accent: #06101f;
   --danger: #ff6b6b;
+  --warn: #ffb454;
+  --ok: #5fd38a;
+  --overlay: #00000099;
+  --shadow: #00000088;
+  --term-bg: #101215;
+  --muted: #5a6275;
   --font-ui: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
   --font-mono: "JetBrains Mono", "Cascadia Code", "Fira Code", Consolas, monospace;
 }
@@ -25,4 +35,7 @@ button, input, select {
 }
 button { cursor: pointer; }
 button:hover { border-color: var(--fg-dim); }
+/* Native popups (GTK/WebKit draw <option> lists themselves): keep them on-theme. */
+select option { background: var(--bg-raised); color: var(--fg); }
+input::placeholder { color: var(--fg-dim); opacity: .8; }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }

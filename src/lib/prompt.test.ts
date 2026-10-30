@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import { detectShell, looksLikeShellPrompt, looksLikeSudoPrompt, sudoUserOf, sudoAutoEligible, parseOsc7 } from "./prompt.ts";
 
 test("detectShell recognises the four shells and nothing else", () => {
-  assert.equal(detectShell("admin@super-earth:~$ "), "bash");
-  assert.equal(detectShell("root@super-earth:~# "), "bash");
+  assert.equal(detectShell("admin@devbox:~$ "), "bash");
+  assert.equal(detectShell("root@devbox:~# "), "bash");
   assert.equal(detectShell("[travis@box ~]$ "), "bash");
   assert.equal(detectShell("box% "), "zsh");
   assert.equal(detectShell("travis@box ~> "), "fish");
@@ -16,7 +16,7 @@ test("detectShell recognises the four shells and nothing else", () => {
 });
 
 test("looksLikeShellPrompt accepts sudo/su prompts and rejects REPLs", () => {
-  assert.equal(looksLikeShellPrompt("root@super-earth:~# "), "bash");
+  assert.equal(looksLikeShellPrompt("root@devbox:~# "), "bash");
   assert.equal(looksLikeShellPrompt("[root@box ~]# "), "bash");
   assert.equal(looksLikeShellPrompt("# "), "bash");
   assert.equal(looksLikeShellPrompt("$ "), "bash");
@@ -30,7 +30,7 @@ test("looksLikeShellPrompt accepts sudo/su prompts and rejects REPLs", () => {
 });
 
 test("parseOsc7 strips the host and decodes percent escapes", () => {
-  assert.equal(parseOsc7("file://super-earth/home/admin"), "/home/admin");
+  assert.equal(parseOsc7("file://devbox/home/admin"), "/home/admin");
   assert.equal(parseOsc7("file://localhost/"), "/");
   assert.equal(parseOsc7("file:///tmp/x y"), "/tmp/x y");
   assert.equal(parseOsc7("file://h/a%20b/%E2%9C%93"), "/a b/✓");

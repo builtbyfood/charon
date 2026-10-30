@@ -7,8 +7,8 @@ export interface Prefs {
   fontFamily: string;
   fontSize: number;
   scrollback: number;
-  /** "webgl" (default) or "dom" if the WebGL renderer misbehaves. */
-  renderer: "webgl" | "dom";
+  /** "webgl" (default), "canvas", or "dom" if the GPU renderers misbehave. */
+  renderer: "webgl" | "canvas" | "dom";
   copyOnSelect: boolean;
   ctrlCCopiesWhenSelected: boolean;
   middleClickPaste: boolean;
@@ -34,6 +34,15 @@ export interface Prefs {
 // profile's font goes first, these are the fallbacks.
 const FALLBACK_FONTS = '"Cascadia Mono", "Cascadia Code", "JetBrains Mono", "Fira Code", Consolas, "DejaVu Sans Mono", monospace';
 
+/** A font name as an xterm font list: the font, then the fallbacks. */
+export function fontStack(name: string): string {
+  const n = name.replace(/"/g, "").trim();
+  return n ? `"${n}", ${FALLBACK_FONTS}` : `"JetBrains Mono", ${FALLBACK_FONTS}`;
+}
+
+/** A connection's own terminal font (Settings.font / font_size); unset = the profile's. */
+export interface SessionFont { family?: string; size?: number }
+
 export const DEFAULTS: Prefs = {
   fontFamily: `"JetBrains Mono", ${FALLBACK_FONTS}`,
   fontSize: 13,
@@ -54,12 +63,11 @@ export const DEFAULTS: Prefs = {
 };
 
 export function prefsFromProfile(p: Profile): Prefs {
-  const font = p.appearance.font?.trim();
   return {
-    fontFamily: font ? `"${font.replace(/"/g, "")}", ${FALLBACK_FONTS}` : DEFAULTS.fontFamily,
+    fontFamily: fontStack(p.appearance.font ?? ""),
     fontSize: clamp(p.appearance.font_size, 6, 40, DEFAULTS.fontSize),
     scrollback: clamp(p.appearance.scrollback, 0, 1_000_000, DEFAULTS.scrollback),
-    renderer: p.appearance.renderer === "dom" ? "dom" : "webgl",
+    renderer: p.appearance.renderer === "dom" || p.appearance.renderer === "canvas" ? p.appearance.renderer : "webgl",
     copyOnSelect: !!p.terminal.copy_on_select,
     ctrlCCopiesWhenSelected: p.terminal.ctrl_c_copies_when_selected !== false,
     middleClickPaste: p.terminal.middle_click_paste !== false,

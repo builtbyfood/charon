@@ -19,8 +19,8 @@ test("an OSC 7 sequence updates session cwd and triggers the follow target", asy
 
   // What bash's precmd prints after `cd /tmp`: 133;D then OSC 7, BEL-terminated,
   // split across two writes the way the coalescer may deliver it.
-  await write(term, "\x1b]133;D;0\x07\x1b]7;file://super-earth/t");
-  await write(term, "mp\x07admin@super-earth:/tmp$ ");
+  await write(term, "\x1b]133;D;0\x07\x1b]7;file://devbox/t");
+  await write(term, "mp\x07admin@devbox:/tmp$ ");
   assert.equal(cwd, "/tmp");
   assert.deepEqual(backend, ["/tmp"]);
 
@@ -28,7 +28,7 @@ test("an OSC 7 sequence updates session cwd and triggers the follow target", asy
   assert.equal(followTarget(cwd, "/home/admin", false, osc7ToLocal), "/tmp");
 
   // Same directory again (another prompt in /tmp) → no new change, no follow.
-  await write(term, "\x1b]7;file://super-earth/tmp\x07");
+  await write(term, "\x1b]7;file://devbox/tmp\x07");
   assert.deepEqual(backend, ["/tmp"]);
   assert.equal(followTarget(cwd, "/tmp", false, osc7ToLocal), null);
 

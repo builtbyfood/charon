@@ -219,7 +219,9 @@ impl client::Handler for Handler {
                     known_hosts: self.keys.own_path().display().to_string(),
                 };
                 let event = format!("ssh:hostkey:{}", self.id);
-                match self.mgr.app().emit(&event, prompt) {
+                let sent = self.mgr.app().emit(&event, prompt);
+                crate::session::wake_ui();
+                match sent {
                     Ok(()) => tracing::info!(session = %self.id, %event, "host key prompt emitted; waiting for answer"),
                     Err(e) => tracing::error!(session = %self.id, %event, "could not emit host key prompt: {e}"),
                 }

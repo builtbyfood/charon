@@ -107,7 +107,7 @@
   .docs { display: flex; flex-direction: column; height: 100%; min-height: 0; font-size: 12px; }
   .tip { display: flex; align-items: baseline; gap: 6px; padding: 6px 8px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
   .tip .tag { font-size: 10px; text-transform: uppercase; color: var(--accent); }
-  .tip code { font-family: var(--font-mono); color: #ffb454; }
+  .tip code { font-family: var(--font-mono); color: var(--warn); }
   .tip .note { color: var(--fg-dim); }
   .body { flex: 1; overflow: auto; min-height: 0; padding: 8px; }
   .head, .manhead { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }

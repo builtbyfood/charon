@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/img/charon-icon.png" width="96" alt="Charon">
+  <img src="docs/img/icon-256.png" width="96" alt="Charon">
 </p>
 
 <h1 align="center">Charon</h1>
@@ -11,6 +11,7 @@
 
 <p align="center">
   <a href="https://github.com/builtbyfood/charon/releases/latest">Download</a> ·
+  <a href="docs/TESTING.md">Tester guide</a> ·
   <a href="docs/BUILDING.md">Build from source</a> ·
   <a href="CHANGELOG.md">Changelog</a>
 </p>

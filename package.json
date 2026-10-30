@@ -1,6 +1,6 @@
 {
   "name": "charon",
-  "version": "0.2.7",
+  "version": "0.3.1",
   "private": true,
   "type": "module",
   "scripts": {
@@ -17,6 +17,7 @@
     "@tauri-apps/api": "^2.1.0",
     "@tauri-apps/plugin-clipboard-manager": "^2.0.0",
     "@tauri-apps/plugin-dialog": "^2.0.0",
+    "@xterm/addon-canvas": "^0.7.0",
     "@xterm/addon-fit": "^0.10.0",
     "@xterm/addon-search": "^0.15.0",
     "@xterm/addon-serialize": "^0.13.0",

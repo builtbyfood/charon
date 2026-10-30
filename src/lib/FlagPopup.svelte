@@ -45,15 +45,15 @@
 </div>
 
 <style>
-  .popup { position: fixed; z-index: 30; width: 420px; max-width: 70vw; background: var(--bg-raised); border: 1px solid var(--line); border-radius: 5px; box-shadow: 0 8px 24px #000a; font-size: 12px; overflow: hidden; }
+  .popup { position: fixed; z-index: 30; width: 420px; max-width: 70vw; background: var(--bg-raised); border: 1px solid var(--line); border-radius: 5px; box-shadow: 0 8px 24px var(--shadow); font-size: 12px; overflow: hidden; }
   .head { display: flex; justify-content: space-between; align-items: center; padding: 3px 8px; border-bottom: 1px solid var(--line); }
   .head .cmd { font-family: var(--font-mono); color: var(--fg); font-weight: 600; }
   .rows { max-height: 240px; overflow: auto; }
   .row { display: grid; grid-template-columns: auto 1fr auto; gap: 8px; align-items: baseline; padding: 2px 8px; cursor: pointer; }
   .row:hover { background: var(--bg); }
-  .row.sel { background: var(--accent); color: #06101f; }
-  .row.sel .names, .row.sel .desc, .row.sel .src { color: #06101f; }
-  .names { font-family: var(--font-mono); color: #ffb454; white-space: nowrap; }
+  .row.sel { background: var(--accent); color: var(--on-accent); }
+  .row.sel .names, .row.sel .desc, .row.sel .src { color: var(--on-accent); }
+  .names { font-family: var(--font-mono); color: var(--warn); white-space: nowrap; }
   .desc { color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .src { color: var(--fg-dim); font-size: 10px; }
   .empty { padding: 6px 8px; color: var(--fg-dim); }

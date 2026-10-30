@@ -1,6 +1,7 @@
 // Frontend mirror of connections.rs inheritance, used to show what a folder
 // contributes to the nodes under it. The backend's `effective()` is authoritative.
 import type { Node, Settings } from "./api";
+import type { SessionFont } from "./prefs";
 
 /** `over` wins wherever it has a value (same rule as `Settings::merged_with`). */
 export function mergeSettings(base: Settings, over: Settings): Settings {
@@ -26,6 +27,16 @@ export function inheritedSettings(nodes: Node[], parentId: string | null): Setti
 /** Effective settings of `node` itself. */
 export const effectiveSettings = (nodes: Node[], node: Node): Settings =>
   mergeSettings(inheritedSettings(nodes, node.parent_id), node.settings);
+
+/** Tab colour: the node's own, else the nearest folder's. */
+export const colorOf = (nodes: Node[], n: Node): string | undefined =>
+  n.settings.color ?? inheritedSettings(nodes, n.parent_id).color;
+
+/** The connection's own terminal font after folder inheritance (none = the profile's). */
+export function fontOf(nodes: Node[], n: Node): SessionFont | undefined {
+  const e = effectiveSettings(nodes, n);
+  return e.font || e.font_size ? { family: e.font || undefined, size: e.font_size || undefined } : undefined;
+}
 
 /** Preset colours for the swatch row: distinct on a dark background. */
 export const PALETTE = ["#6aa2ff", "#5fd38a", "#ffb454", "#ff6b6b", "#c792ea", "#4dd0e1", "#f78c6c", "#9aa5b1"];
