@@ -29,6 +29,8 @@ pub struct AppInfo {
     pub os: String,
     /// Current OS user, the login user for a local sudo prompt.
     pub user: String,
+    /// CHARON_DEBUG_TICKER=1: show a plain DOM counter (WebKitGTK repaint isolation test).
+    pub debug_ticker: bool,
 }
 
 #[tauri::command]
@@ -41,6 +43,7 @@ pub fn app_info(state: State<'_, AppState>) -> AppInfo {
         data_dir: state.paths.data_dir.display().to_string(),
         os: os.into(),
         user,
+        debug_ticker: std::env::var("CHARON_DEBUG_TICKER").is_ok_and(|v| v == "1"),
     }
 }
 
@@ -70,6 +73,7 @@ pub fn get_profile(state: State<'_, AppState>) -> crate::profile::Profile {
 #[tauri::command]
 pub fn save_profile(state: State<'_, AppState>, profile: crate::profile::Profile) -> CmdResult<()> {
     crate::profile::save(&state.paths.data_dir, &profile).map_err(err)?;
+    crate::repaint::configure(&profile.terminal.linux_repaint);
     *state.profile.write().unwrap() = profile;
     Ok(())
 }
@@ -630,6 +634,14 @@ pub fn window_close_self(window: tauri::WebviewWindow) -> CmdResult<()> {
 #[tauri::command]
 pub fn session_attach(id: String, channel: tauri::ipc::Channel<crate::session::OutMsg>) {
     crate::session::SessionManager::attach(&id, channel);
+}
+
+/// The debug ticker changed the page: repaint like after output. Returns the
+/// repaint mode in effect ("off" on other OSes).
+#[tauri::command]
+pub fn repaint_poke() -> &'static str {
+    crate::repaint::poke("ticker");
+    crate::repaint::mode().name()
 }
 
 /// Output timing trace: `on` switches it, the result is the current state.

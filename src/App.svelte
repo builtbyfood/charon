@@ -12,11 +12,12 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { appInfo, vaultStatus, getProfile, saveProfile, announceProfile, onProfileSaved, sessionWrite, mcpAnswer, onMcpApprove, onMcpOpenEditor,
     tabStash, tabTake, tabDropTarget, tabWindowOpen, tabSend, windowCloseSelf, tabsSaved, tabsSave, listConnections, onTabAdopt, editorOpenInMain, onEditorOpenReq, traceOutput,
-    type AppInfo, type Node, type VaultStatus, type Profile, type FsVia, type McpApprove } from "./lib/api";
+    type AppInfo, type LinuxRepaint, type Node, type VaultStatus, type Profile, type FsVia, type McpApprove } from "./lib/api";
   import { prefsFromProfile, DEFAULTS, type Prefs, type SessionFont } from "./lib/prefs";
   import { applyTheme, resolveTheme, rememberTheme, type ThemePref } from "./lib/themes";
   import { dropIndex, reorder } from "./lib/tabdrag";
-import { restorePlan, toSaved } from "./lib/opentabs";
+  import { restorePlan, toSaved } from "./lib/opentabs";
+  import { startTicker } from "./lib/ticker.svelte";
 
   import type { OpenTarget, TabSnapshot } from "./lib/Terminal.svelte";
   /** Terminal tabs carry an OpenTarget; the single editor tab has none.
@@ -82,6 +83,11 @@ import { restorePlan, toSaved } from "./lib/opentabs";
     profile.appearance.renderer = r;
     prefs = prefsFromProfile(profile);
     persistProfile();
+  }
+  function setLinuxRepaint(m: LinuxRepaint) {
+    if (!profile) return;
+    profile.terminal.linux_repaint = m;
+    persistProfile(); // the backend applies it when the profile is saved
   }
   function setTrace(on: boolean) {
     if (!profile) return;
@@ -178,6 +184,7 @@ import { restorePlan, toSaved } from "./lib/opentabs";
 
   onMount(async () => {
     info = await appInfo();
+    if (info.debug_ticker) startTicker();
     profile = await getProfile();
     prefs = prefsFromProfile(profile);
     syncTheme();
@@ -435,6 +442,7 @@ import { restorePlan, toSaved } from "./lib/opentabs";
 {#if settingsOpen && profile}
   <SettingsPanel theme={(profile.appearance.theme || "charon-dark") as ThemePref} font={profile.appearance.font} fontSize={profile.appearance.font_size}
     renderer={prefs.renderer} trace={profile.terminal.trace_output === true} restoreTabs={profile.ui.restore_tabs !== false}
+    os={info?.os} linuxRepaint={(profile.terminal.linux_repaint || "off") as LinuxRepaint} onlinuxrepaint={setLinuxRepaint}
     ontheme={setTheme} onfont={setFont} onrenderer={setRenderer} ontrace={setTrace} onrestoretabs={setRestoreTabs} onclose={() => (settingsOpen = false)} />
 {/if}
 {#if mcpOpen}

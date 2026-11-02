@@ -147,6 +147,10 @@ ls src-tauri/target/release/bundle/{deb,rpm,appimage}/
 
 AppImage bundling downloads `linuxdeploy` on first run; it needs `file` and `patchelf`
 present (installed above). If the box has no outbound internet, build deb/rpm only.
+If it stops at `failed to run linuxdeploy` (seen on Fedora 44), the `strip` that
+linuxdeploy bundles is too old for the distro's libraries; run with
+`NO_STRIP=true npm run tauri build -- --bundles appimage` (add `--verbose` to see
+linuxdeploy's own output).
 
 Install to test:
 
@@ -184,9 +188,34 @@ tar czf charon-linux-portable.tar.gz portable
   `renderer = "dom"` under `[appearance]` in `data/profiles/default.toml`.
 - **Window has no min/close buttons on a VM** (they render *behind* the content):
   WebKitGTK's DMABUF renderer mis-composites on VMs and software GPUs. Charon sets
-  `WEBKIT_DISABLE_DMABUF_RENDERER=1` on Linux by default to avoid it; if a VM still
+  `WEBKIT_DISABLE_DMABUF_RENDERER=1` when it detects a VM (CPU `hypervisor` flag
+  or DMI vendor) or no `/dev/dri/renderD*` node, and logs `[charon] webkit:
+  dmabuf=…` at start. On real GPUs it leaves the renderer on: forcing it off
+  there made WebKitGTK 2.54 (Fedora 44, Intel i915, Wayland) stop presenting
+  frames until a key press or click. If a VM still
   glitches, also try `WEBKIT_DISABLE_COMPOSITING_MODE=1 charon`. Set either to `0`
   in the environment to opt back into the default renderer.
+- **Screen only updates after a key press or click** (seen on Fedora 44, Intel
+  i915, WebKitGTK 2.54): the page has the new output but WebKitGTK doesn't
+  present the frame until an input event. The cause found on that box was the
+  DMABUF renderer being forced off (above); Charon no longer does that on real
+  GPUs. As a fallback Charon can ask GTK to redraw the webview after output
+  (Settings → Terminal → "Linux: force repaint after output", `linux_repaint`
+  under `[terminal]`, off by default; it didn't help there). Try
+  `CHARON_REPAINT=draw`, `resize` or `nudge`; `CHARON_REPAINT=off` disables it. With trace on, each repaint logs `[charon] repaint: fired`;
+  otherwise a count every 5 s.
+  - Isolation test: `CHARON_DEBUG_TICKER=1 charon` shows a counter in the
+    terminal status bar that a plain `setInterval` bumps 4× a second (no xterm)
+    and logs each tick (`[charon] ticker n=`). If it stalls without input with
+    `CHARON_REPAINT=off`, it's WebKitGTK, not xterm.
+  - Bisecting against a bare Tauri app: `CHARON_BISECT=<flags>` (comma list,
+    logged at start as `[charon] bisect:`) switches parts of Charon off one at
+    a time. Rust side: `dmabuf` (don't disable the DMABUF renderer),
+    `noplugins`, `nofocus` (no `set_focus` on page load), `nomcp`, `nowake`
+    (no glib wakeup after output), `norepaint`. Page: `page=bare` (only a
+    counter, no CSS, no IPC), `page=bare-ipc` (+ the ticker's IPC), `page=css`
+    (+ the app's CSS and theme); on the full page `noraf`, `noconsole`. The
+    bare pages tick without `CHARON_DEBUG_TICKER`. See `src-tauri/src/bisect.rs`.
 - `npm test` needs Node ≥ 22.18 (native TypeScript for the `node:test` suites);
   the CI pins Node 22.
 

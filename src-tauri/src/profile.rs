@@ -49,6 +49,10 @@ section!(TerminalPrefs {
     /// "auto" runs it (newline sent after the 201~ end marker), "wait" leaves it
     /// highlighted for the user to press Enter.
     paste_run: String = "auto".into(),
+    /// Linux only: ask GTK to repaint the webview after output, for WebKitGTK
+    /// setups that don't show new frames until an input event (`repaint.rs`).
+    /// "off" | "draw" | "resize" | "nudge".
+    linux_repaint: String = "off".into(),
 });
 
 section!(Clipboard {

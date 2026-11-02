@@ -20,6 +20,7 @@ right_click = "moba"            # "moba": copy selection / paste, Shift+right-cl
 bracketed_paste = true
 paste_guard_lines = 2           # warn when pasting >= this many lines
 paste_run = "auto"              # "auto": pasted text ending in a newline runs; "wait": bash highlights it, press Enter
+linux_repaint = "off"           # Linux: repaint after output if the screen only updates on input; "off" | "draw" | "resize" | "nudge"
 
 [clipboard]
 strip_zero_width = true

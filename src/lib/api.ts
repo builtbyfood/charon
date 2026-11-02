@@ -36,7 +36,7 @@ export interface Node {
 export interface SessionInfo { id: string; title: string; kind: string; shell_integration: boolean; shell: string | null; cwd: string | null; remote_shell?: string | null }
 export const sessionSetShell = (id: string, shell: string | null) => invoke<void>("session_set_shell", { id, shell });
 export const sessionSetCwd = (id: string, cwd: string | null) => invoke<void>("session_set_cwd", { id, cwd });
-export interface AppInfo { version: string; portable: boolean; data_dir: string; os: "windows" | "macos" | "linux" | string; user: string }
+export interface AppInfo { version: string; portable: boolean; data_dir: string; os: "windows" | "macos" | "linux" | string; user: string; debug_ticker?: boolean }
 
 export const appInfo = () => invoke<AppInfo>("app_info");
 
@@ -45,7 +45,7 @@ export const appInfo = () => invoke<AppInfo>("app_info");
 export interface Profile {
   name: string;
   appearance: { font: string; font_size: number; theme: string; scrollback: number; renderer: "webgl" | "canvas" | "dom" | string; [k: string]: unknown };
-  terminal: { timestamps?: boolean; trace_output?: boolean; copy_on_select: boolean; ctrl_c_copies_when_selected: boolean; middle_click_paste: boolean; right_click?: "moba" | "menu" | string; bracketed_paste: boolean; paste_guard_lines: number; paste_run?: "auto" | "wait" | string; [k: string]: unknown };
+  terminal: { timestamps?: boolean; trace_output?: boolean; copy_on_select: boolean; ctrl_c_copies_when_selected: boolean; middle_click_paste: boolean; right_click?: "moba" | "menu" | string; bracketed_paste: boolean; paste_guard_lines: number; paste_run?: "auto" | "wait" | string; linux_repaint?: LinuxRepaint; [k: string]: unknown };
   files?: { auto_open?: boolean; parallel_transfers?: number; [k: string]: unknown };
   sudo?: { auto_send?: boolean; [k: string]: unknown };
   local?: { credential?: string; [k: string]: unknown };
@@ -190,6 +190,10 @@ export async function attachSession(
 }
 /** Output timing trace: pass true/false to switch it, null to just read it. */
 export const traceOutput = (on: boolean | null) => invoke<boolean>("trace_output", { on });
+/** Linux repaint workaround (src-tauri/src/repaint.rs). */
+export type LinuxRepaint = "off" | "draw" | "resize" | "nudge";
+/** The debug ticker changed the page; returns the repaint mode in effect. */
+export const repaintPoke = () => invoke<string>("repaint_poke");
 export const logFrontend = (level: string, msg: string) => invoke<void>("log_frontend", { level, msg });
 
 // Moving a tab between windows (src-tauri/src/tabmove.rs). The source holds the

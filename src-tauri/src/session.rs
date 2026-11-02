@@ -7,7 +7,7 @@ use base64::Engine;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 use tokio::sync::{oneshot, Mutex};
 
 /// Output parked for sessions whose tab is moving between windows.
@@ -24,9 +24,9 @@ pub enum OutMsg {
 
 /// The channel each session's output goes to: the Terminal that owns the tab
 /// attaches one, and a tab moving windows replaces it. A per-session channel,
-/// not a global event, so delivery doesn't depend on event routing.
-static SINKS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, tauri::ipc::Channel<OutMsg>>>> =
-    std::sync::LazyLock::new(Default::default);
+/// not a global event, so delivery doesn't depend on event routing. Output from
+/// before the attach (banner, first prompt) waits in the outbox and goes first.
+static OUT: std::sync::LazyLock<crate::outbox::Outbox> = std::sync::LazyLock::new(Default::default);
 static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Log every output emit with a timestamp (`trace_output`, or CHARON_TRACE_OUTPUT=1).
 pub static TRACE: std::sync::LazyLock<std::sync::atomic::AtomicBool> = std::sync::LazyLock::new(|| {
@@ -41,7 +41,9 @@ fn now_ms() -> f64 {
 /// loop so the message is dispatched now rather than at the next input event.
 pub fn wake_ui() {
     #[cfg(target_os = "linux")]
-    gtk::glib::MainContext::default().wakeup();
+    if !crate::bisect::has("nowake") {
+        gtk::glib::MainContext::default().wakeup();
+    }
 }
 
 #[async_trait]
@@ -218,32 +220,46 @@ impl SessionManager {
         HOLDS.data(id, data, |b| Self::emit_now(app, id, b));
     }
 
-    fn emit_now(app: &AppHandle, id: &str, data: &[u8]) {
+    fn emit_now(_app: &AppHandle, id: &str, data: &[u8]) {
+        use crate::outbox::{Msg, Route};
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let t = now_ms();
-        let b64 = base64::engine::general_purpose::STANDARD.encode(data);
-        let sink = SINKS.lock().unwrap().get(id).cloned();
-        let via = match sink {
-            Some(ch) => { let _ = ch.send(OutMsg::Data { seq, t, b64 }); "channel" }
-            None => { let _ = app.emit(&format!("term:data:{id}"), b64); "event" }
+        let via = match OUT.send(id, Msg::Data { seq, t, bytes: data.to_vec() }) {
+            Route::Sent => "channel",
+            Route::Buffered => "pending",
+            Route::BufferedDropping => "pending-full",
         };
         wake_ui();
+        if !data.is_empty() {
+            crate::repaint::poke("output");
+        }
         if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
             tracing::info!("[charon] out: emit session={id} seq={seq} bytes={} via={via} t={t:.1}", data.len());
         }
     }
 
-    fn closed_now(app: &AppHandle, id: &str, reason: &str) {
-        match SINKS.lock().unwrap().remove(id) {
-            Some(ch) => { let _ = ch.send(OutMsg::Closed { reason: reason.to_string() }); }
-            None => { let _ = app.emit(&format!("term:closed:{id}"), reason.to_string()); }
-        }
+    fn closed_now(_app: &AppHandle, id: &str, reason: &str) {
+        OUT.send(id, crate::outbox::Msg::Closed { reason: reason.to_string() });
         wake_ui();
+        crate::repaint::poke("output");
     }
 
-    /// Route `id`'s output to `ch` from now on (replacing a previous window's).
+    /// Route `id`'s output to `ch` from now on (replacing a previous window's),
+    /// after the output that arrived before any channel was attached.
     pub fn attach(id: &str, ch: tauri::ipc::Channel<OutMsg>) {
-        SINKS.lock().unwrap().insert(id.to_string(), ch);
+        use crate::outbox::Msg;
+        let sink = Box::new(move |m: Msg| {
+            let _ = ch.send(match m {
+                Msg::Data { seq, t, bytes } => OutMsg::Data { seq, t, b64: base64::engine::general_purpose::STANDARD.encode(bytes) },
+                Msg::Closed { reason } => OutMsg::Closed { reason },
+            });
+        });
+        let (flushed, dropped) = OUT.attach(id, sink);
+        if flushed > 0 {
+            wake_ui();
+            crate::repaint::poke("output");
+            tracing::info!("[charon] out: attach session={id} flushed={flushed} dropped_bytes={dropped}");
+        }
     }
 
     pub fn emit_closed(app: &AppHandle, id: &str, reason: &str) {

@@ -30,6 +30,7 @@
   import { WebglAddon } from "@xterm/addon-webgl";
   import { CanvasAddon } from "@xterm/addon-canvas";
   import { diag, epochMs } from "./diag";
+  import { ticker } from "./ticker.svelte";
   import { SearchAddon } from "@xterm/addon-search";
   import { SerializeAddon } from "@xterm/addon-serialize";
   import {
@@ -1371,6 +1372,7 @@ ${HIDE_CURSOR}`); onclosed(r); }, data: (raw, m) => {
       <button type="button" class="chip files-btn" class:on={filesOpen} onclick={toggleFiles} title="File pane (Ctrl+Shift+E)">files</button>
     {/if}
     {#if cwd}<span class="cwd mono" title="Working directory (OSC 7)">{cwd}</span>{/if}
+    {#if ticker.on}<span class="ticker mono" title="CHARON_DEBUG_TICKER: plain DOM counter, +4 a second; if it stalls without input, the webview isn't presenting frames">tick {ticker.n}</span>{/if}
     {#if status === "up" || osc133}
       <button type="button" class="chip" onclick={onChipClick} title={"Shell integration: detected shell · OSC 133 seen · commands recorded. Click for options." + (reason ? `\n133 off: ${reason}` : "")}>
         {shell ?? "shell?"} · 133 {osc133 ? "on" : `off${reason ? ` (${reason.split(",")[0]})` : ""}`} · {markCount} {markCount === 1 ? "mark" : "marks"}
@@ -1426,6 +1428,7 @@ ${HIDE_CURSOR}`); onclosed(r); }, data: (raw, m) => {
   .stamps-btn + .files-btn, .stamps-btn + .cwd, .stamps-btn + .chip { margin-left: 0; }
   .cwd { margin-left: auto; color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40%; }
   .cwd + .chip { margin-left: 0; }
+  .ticker { color: var(--warn); font-variant-numeric: tabular-nums; }
   .chip { margin-left: auto; font: inherit; font-family: var(--font-mono); color: inherit; background: transparent; padding: 0 6px; border: 1px solid var(--line); border-radius: 8px; cursor: pointer; }
   .reconnect { margin-left: 6px; border-color: var(--accent); color: var(--fg); }
   .sudo { margin-left: 6px; border-color: var(--warn); color: var(--warn); }

@@ -4,6 +4,65 @@ All notable changes to Charon are recorded here. Versions follow semver; the
 canonical version lives in `src-tauri/tauri.conf.json` and is propagated to
 `package.json` and `Cargo.toml` by `npm run bump` (`scripts/bump-version.mjs`).
 
+## 0.3.5
+
+### Linux
+- **"Linux: force repaint after output" is now off by default.** It didn't
+  help with the stall (the DMABUF fix in 0.3.4 did) and costs a GTK redraw per
+  burst of output. It stays in Settings → Terminal as a fallback. A profile
+  saved by 0.3.2–0.3.4 may already hold `linux_repaint = "draw"`; set it to
+  Off there.
+
+## 0.3.4
+
+### Linux
+- **Fixed: the screen only updating after a key press or click** (Fedora 44,
+  Intel i915, WebKitGTK 2.54, Wayland). The cause was Charon itself: it always
+  set `WEBKIT_DISABLE_DMABUF_RENDERER=1`, and with that renderer off WebKitGTK
+  stopped presenting frames without input. Found with `CHARON_BISECT=dmabuf`.
+  Charon now turns DMABUF off only on VMs and machines without a GPU render node
+  (where it mis-composites the window buttons) and logs the choice at start
+  (`[charon] webkit: dmabuf=…`). Setting `WEBKIT_DISABLE_DMABUF_RENDERER`
+  yourself still overrides it.
+
+## 0.3.3
+
+### Linux
+- **`CHARON_BISECT`** for the "updates only after input" stall. A bare Tauri app
+  on the same Fedora box updates live, so something in Charon's setup causes it.
+  `CHARON_BISECT=flag,…` turns pieces off one at a time:
+  - Rust side: `dmabuf` (leave WebKitGTK's DMABUF renderer on; Charon normally
+    disables it), `noplugins`, `nofocus`, `nomcp`, `nowake`, `norepaint`.
+  - Page: `page=bare` (only a counter, no CSS, no IPC), `page=bare-ipc`,
+    `page=css`; on the full page `noraf`, `noconsole`.
+- **`CHARON_REPAINT=nudge` no longer grows the window without end.** Wayland
+  applies resizes asynchronously, so the size read back mid-burst was the grown
+  one; the original size is now remembered for the burst.
+
+## 0.3.2
+
+### Linux
+- **Workaround for terminals that only update after a key press or click**
+  (Fedora 44, Intel i915, WebKitGTK 2.54). The trace showed every chunk
+  reaching the page and being painted within 50 ms; WebKitGTK just didn't put
+  the frame on screen until an input event.
+  - After output, Charon now asks GTK to redraw the webview, at most every
+    16 ms, on its own thread.
+  - Settings → Terminal → "Linux: force repaint after output". On by default.
+    Two stronger levels add a relayout, then a 1 px window nudge.
+  - `CHARON_REPAINT=off|draw|resize|nudge` overrides the setting.
+  - With trace on, each repaint is logged; otherwise a count every 5 s.
+- **`CHARON_DEBUG_TICKER=1`** shows a plain DOM counter in the terminal status
+  bar (4 ticks a second, no xterm) and logs each tick. It tells a WebKitGTK
+  presentation stall apart from an xterm problem.
+
+### Terminal
+- **Output from before the tab attached is no longer lost.** A session's first
+  chunks (login banner, first prompt) could be sent before its terminal had
+  connected its output channel. They went to an event nothing listened to
+  (`via=event` in the trace, with no `recv`). They now wait and are delivered
+  first, in order.
+
 ## 0.3.1
 
 ### Tabs

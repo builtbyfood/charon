@@ -4,19 +4,23 @@
   // only shows them and reports changes.
   import FontPicker from "./FontPicker.svelte";
   import { THEMES, type ThemePref } from "./themes";
+  import type { LinuxRepaint } from "./api";
 
-  let { theme, font, fontSize, renderer, trace, restoreTabs, ontheme, onfont, onrenderer, ontrace, onrestoretabs, onclose }: {
+  let { theme, font, fontSize, renderer, trace, restoreTabs, os, linuxRepaint, ontheme, onfont, onrenderer, ontrace, onrestoretabs, onlinuxrepaint, onclose }: {
     theme: ThemePref;
     font: string;
     fontSize: number;
     renderer: "webgl" | "canvas" | "dom";
     trace: boolean;
     restoreTabs: boolean;
+    os?: string;
+    linuxRepaint: LinuxRepaint;
     ontheme: (t: ThemePref) => void;
     onfont: (family: string, size: number | undefined) => void;
     onrenderer: (r: "webgl" | "canvas" | "dom") => void;
     ontrace: (on: boolean) => void;
     onrestoretabs: (on: boolean) => void;
+    onlinuxrepaint: (m: LinuxRepaint) => void;
     onclose: () => void;
   } = $props();
 
@@ -76,6 +80,18 @@
       </select>
     </label>
     <p>Try Canvas or DOM if text glitches, goes blank, or only updates after a key press. Applies to every tab at once.</p>
+    {#if os === "linux"}
+      <label class="field row">
+        <span>Linux: force repaint after output</span>
+        <select value={linuxRepaint} onchange={(e) => onlinuxrepaint((e.currentTarget as HTMLSelectElement).value as LinuxRepaint)}>
+          <option value="off">Off</option>
+          <option value="draw">On (redraw)</option>
+          <option value="resize">On, stronger (redraw + relayout)</option>
+          <option value="nudge">On, strongest (also nudge the window 1 px)</option>
+        </select>
+      </label>
+      <p>For systems where the screen only updates after a key press or click (WebKitGTK not presenting new frames): Charon asks GTK to redraw after output, at most every 16 ms. Off by default: the known cause (WebKitGTK's DMABUF renderer forced off) is handled at start. <code>CHARON_REPAINT=off|draw|resize|nudge</code> overrides this.</p>
+    {/if}
     <label class="sw">
       <input type="checkbox" checked={trace} onchange={(e) => ontrace((e.currentTarget as HTMLInputElement).checked)} />
       <span>Trace output timing</span>

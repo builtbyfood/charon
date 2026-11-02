@@ -1,6 +1,7 @@
 //! Charon backend. Tauri commands live in `commands.rs`; everything else is plain Rust
 //! so it can be unit-tested and later reused by the MCP server without the UI.
 
+pub mod bisect;
 pub mod clipboard;
 pub mod fonts;
 pub mod commands;
@@ -10,12 +11,14 @@ pub mod hidden;
 pub mod hostkeys;
 pub mod mcp;
 pub mod opentabs;
+pub mod outbox;
 pub mod import;
 pub mod local;
 pub mod serial;
 pub mod paths;
 pub mod ppk;
 pub mod profile;
+pub mod repaint;
 pub mod session;
 pub mod sftp;
 pub mod ssh;
@@ -23,6 +26,7 @@ pub mod tabmove;
 pub mod textfile;
 pub mod transfer;
 pub mod vault;
+pub mod webkitenv;
 
 use std::sync::Arc;
 use tauri::Manager;
@@ -52,13 +56,28 @@ pub fn run() {
         )
         .init();
 
-    // WebKitGTK's DMABUF renderer mis-composites on many VMs and software GPUs
-    // (blank areas, and the window's client-side decorations — min/close buttons —
-    // ending up painted behind the webview). Disable it unless the user set a
-    // preference; must happen before the webview initialises. Harmless elsewhere.
+    if bisect::active() {
+        tracing::info!("[charon] bisect: {}", bisect::describe());
+    }
+    // WebKitGTK's DMABUF renderer: off on VMs and GPU-less machines (it
+    // mis-composites there), on everywhere else (off, some real GPUs stop
+    // presenting frames until input). See `webkitenv.rs`. Must happen before the
+    // webview initialises.
     #[cfg(target_os = "linux")]
-    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
-        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    {
+        let user_set = std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_some();
+        let gfx = webkitenv::detect();
+        let off = webkitenv::disable_dmabuf(user_set, gfx) && !bisect::has("dmabuf");
+        if off {
+            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        }
+        tracing::info!(
+            "[charon] webkit: dmabuf={} (vm={} render_node={}{})",
+            if off || (user_set && std::env::var("WEBKIT_DISABLE_DMABUF_RENDERER").is_ok_and(|v| v != "0")) { "off" } else { "on" },
+            gfx.vm,
+            gfx.render_node,
+            if user_set { ", WEBKIT_DISABLE_DMABUF_RENDERER set" } else { "" }
+        );
     }
 
     // Data dir first: the WebView2 profile location must be decided before any
@@ -81,16 +100,23 @@ pub fn run() {
         tracing::info!(dir = %dir.display(), "webview profile");
     }
 
-    tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
-        .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_clipboard_manager::init())
+    let mut builder = tauri::Builder::default();
+    if !bisect::has("noplugins") {
+        builder = builder
+            .plugin(tauri_plugin_shell::init())
+            .plugin(tauri_plugin_dialog::init())
+            .plugin(tauri_plugin_clipboard_manager::init());
+    }
+    if bisect::active() {
+        builder = builder.plugin(tauri::plugin::Builder::<tauri::Wry>::new("charon-bisect").js_init_script(bisect::init_script()).build());
+    }
+    builder
         // WebView2 quirk: the window is shown (and takes Win32 focus) before the
         // webview controller exists, so a DOM `autofocus` shows a caret that gets no
         // keystrokes until the user clicks in the page. Hand the controller keyboard
         // focus once the page is up. Harmless elsewhere.
         .on_page_load(|webview, payload| {
-            if payload.event() == tauri::webview::PageLoadEvent::Finished {
+            if payload.event() == tauri::webview::PageLoadEvent::Finished && !bisect::has("nofocus") {
                 if let Err(e) = webview.set_focus() {
                     tracing::warn!("webview focus: {e}");
                 }
@@ -130,6 +156,11 @@ pub fn run() {
             let hostkeys = Arc::new(hostkeys::HostKeys::new(&paths.data_dir));
             let profile = Arc::new(std::sync::RwLock::new(profile::load_default(&paths.data_dir)));
             let open_tabs = opentabs::OpenTabs::new(&paths.data_dir);
+            repaint::configure(&profile.read().unwrap().terminal.linux_repaint);
+            #[cfg(target_os = "linux")]
+            if !bisect::has("norepaint") {
+                repaint::start(app.handle().clone());
+            }
             app.manage(AppState {
                 open_tabs,
                 hostkeys,
@@ -149,7 +180,7 @@ pub fn run() {
                 tauri::async_runtime::spawn(async move {
                     let state = handle.state::<AppState>();
                     let (enabled, port) = { let p = state.profile.read().unwrap(); (p.mcp.enabled, p.mcp.port) };
-                    if enabled {
+                    if enabled && !crate::bisect::has("nomcp") {
                         if let Err(e) = mcp::start(&handle, &state, port).await {
                             tracing::warn!("mcp autostart failed: {e:#}");
                         }
@@ -232,6 +263,7 @@ pub fn run() {
             commands::clipboard_read,
             commands::session_attach,
             commands::trace_output,
+            commands::repaint_poke,
             commands::log_frontend,
             commands::clipboard_write,
         ])

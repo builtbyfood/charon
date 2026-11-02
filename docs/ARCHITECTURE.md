@@ -5,7 +5,7 @@
 ```
  Svelte UI ──invoke()──▶ Tauri commands (Rust) ──▶ SessionManager
      ▲                                                 │
-     └──── listen("term:data:{id}") ◀── events ◀───────┘
+     └──── ipc::Channel per session (OutMsg) ◀────────┘
                                               ├─ SshSession   (russh)
                                               ├─ LocalPty     (portable-pty)
                                               └─ SerialSession(serialport)
@@ -14,9 +14,11 @@
 Every session is an `id` + a byte channel. The frontend never cares what's behind it.
 The Terminal attaches a `tauri::ipc::Channel` per session (`session_attach`); output
 goes down it as `OutMsg::Data { seq, t, b64 }` (raw bytes in base64, emit time for
-the output trace) and ends with `OutMsg::Closed`. Before any channel is attached the
-backend falls back to `term:data:{id}` / `term:closed:{id}` events, which nothing
-listens to. Input comes back through `session_write(id, data)`.
+the output trace) and ends with `OutMsg::Closed`. Output from before the channel is
+attached (a login banner, the first prompt) waits in the outbox (`outbox.rs`) and is
+sent first, in order, on attach. Input comes back through `session_write(id, data)`.
+On Linux every output chunk also pokes `repaint.rs`, which asks GTK to redraw the
+webview (at most every 16 ms) for WebKitGTK builds that otherwise wait for input.
 
 ## Windows and moving tabs
 
