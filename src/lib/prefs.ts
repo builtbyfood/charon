@@ -2,6 +2,7 @@
 // profile (data/profiles/default.toml). Defaults here only cover the moment
 // before the profile has loaded.
 import type { Profile } from "./api";
+import { PANE_DEFAULT, PANE_MIN, DEFAULT_COLS, colsFromProfile, type ColLayout } from "./filecols";
 
 export interface Prefs {
   fontFamily: string;
@@ -28,6 +29,9 @@ export interface Prefs {
   filesParallel: number;
   /** Gutter with the time each line was printed. */
   timestamps: boolean;
+  /** File pane width (px) and its list columns. */
+  filesWidth: number;
+  filesColumns: ColLayout;
 }
 
 // xterm needs a literal font list; it cannot resolve CSS variables. The
@@ -60,6 +64,8 @@ export const DEFAULTS: Prefs = {
   filesParallel: 4,
   sudoAutoSend: false,
   timestamps: false,
+  filesWidth: PANE_DEFAULT,
+  filesColumns: DEFAULT_COLS,
 };
 
 export function prefsFromProfile(p: Profile): Prefs {
@@ -80,6 +86,8 @@ export function prefsFromProfile(p: Profile): Prefs {
     filesParallel: clamp(p.files?.parallel_transfers ?? 4, 1, 64, DEFAULTS.filesParallel),
     sudoAutoSend: p.sudo?.auto_send === true,
     timestamps: p.terminal.timestamps === true,
+    filesWidth: clamp(p.files?.pane_width, PANE_MIN, 10_000, DEFAULTS.filesWidth),
+    filesColumns: colsFromProfile(p.files?.column_widths, p.files?.hidden_columns),
   };
 }
 

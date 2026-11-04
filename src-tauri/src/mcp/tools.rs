@@ -11,7 +11,7 @@ use tauri::Emitter;
 pub fn tool_specs() -> Value {
     let s = |props: Value, required: Value| json!({ "type": "object", "properties": props, "required": required });
     json!([
-        { "name": "list_sessions", "description": "List open terminal sessions (id, title, kind, host, shell, cwd, permission tier).",
+        { "name": "list_sessions", "description": "List open terminal sessions (id, title, kind ssh/local/serial, host, shell, cwd, permission tier). A local session's host is this machine's name.",
           "inputSchema": s(json!({}), json!([])) },
         { "name": "list_connections", "description": "List the saved connection tree (folders and hosts), without credentials.",
           "inputSchema": s(json!({}), json!([])) },
@@ -19,11 +19,11 @@ pub fn tool_specs() -> Value {
           "inputSchema": s(json!({ "node_id": { "type": "string" } }), json!(["node_id"])) },
         { "name": "read_scrollback", "description": "Recent commands (with exit codes and output) or lines from a session's scrollback, using OSC 133 marks.",
           "inputSchema": s(json!({ "session": { "type": "string" }, "last_n_commands": { "type": "integer" }, "last_n_lines": { "type": "integer" } }), json!(["session"])) },
-        { "name": "run_command", "description": "Run a command in a session and return its output and exit code (needs shell integration). May require in-app approval.",
+        { "name": "run_command", "description": "Run a command in a session (SSH, or a local bash/zsh/PowerShell tab) and return its output and exit code. Runs only at an idle prompt. May require in-app approval.",
           "inputSchema": s(json!({ "session": { "type": "string" }, "command": { "type": "string" }, "timeout_s": { "type": "integer" } }), json!(["session", "command"])) },
-        { "name": "sftp_get", "description": "Download a remote file to a local path.",
+        { "name": "sftp_get", "description": "Copy a file from the session's filesystem (SFTP; the local disk for a local session) to a local path.",
           "inputSchema": s(json!({ "session": { "type": "string" }, "remote": { "type": "string" }, "local": { "type": "string" } }), json!(["session", "remote", "local"])) },
-        { "name": "sftp_put", "description": "Upload a local file to a remote path. May require in-app approval.",
+        { "name": "sftp_put", "description": "Copy a local file to a path on the session's filesystem (SFTP; the local disk for a local session). May require in-app approval.",
           "inputSchema": s(json!({ "session": { "type": "string" }, "local": { "type": "string" }, "remote": { "type": "string" } }), json!(["session", "local", "remote"])) },
         { "name": "open_in_editor", "description": "Open a file in the app's editor (local path, or a session + remote path). as_root opens it over sudo-sftp: gated like run_command plus the sudo opt-in.",
           "inputSchema": s(json!({ "path": { "type": "string" }, "session": { "type": "string" }, "remote_path": { "type": "string" }, "as_root": { "type": "boolean" } }), json!([])) },
@@ -48,20 +48,33 @@ fn arg_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
     args.get(key).and_then(|v| v.as_str()).ok_or_else(|| format!("missing string argument {key:?}"))
 }
 
-/// Effective tier for a call: the session's node tier, else the profile default.
+/// Effective tier for a call: the session's node tier, else the profile default
+/// (`mcp.default_tier`; for local shells, see `local_tier`).
 async fn tier_for(state: &AppState, session: Option<&str>) -> Tier {
-    let default = Tier::parse(&state.profile.read().unwrap().mcp.default_tier);
-    let Some(id) = session else { return default };
-    let node = match state.sessions.info(id).await {
-        Some(info) => info.node_id,
-        None => return default,
+    let (default, local_default) = {
+        let p = state.profile.read().unwrap();
+        (Tier::parse(&p.mcp.default_tier), Tier::parse(&p.local.mcp_tier))
     };
-    match node {
-        Some(n) => {
-            let eff = state.store.lock().await.effective(&n).ok();
-            eff.and_then(|s| s.mcp_tier).map(|t| Tier::parse(&t)).unwrap_or(default)
-        }
-        None => default,
+    let Some(id) = session else { return default };
+    let Some(info) = state.sessions.info(id).await else { return default };
+    let node_tier = match &info.node_id {
+        Some(n) => state.store.lock().await.effective(n).ok().and_then(|s| s.mcp_tier).map(|t| Tier::parse(&t)),
+        None => None,
+    };
+    if info.kind == "local" {
+        return local_tier(node_tier, info.admin, local_default);
+    }
+    node_tier.unwrap_or(default)
+}
+
+/// A local shell's tier: its saved node's `mcp_tier` when it sets one; else
+/// `local.mcp_tier` (default read); but an elevated shell (Local (admin)) is read
+/// unless its node says otherwise. Never trusted by default.
+pub fn local_tier(node_tier: Option<Tier>, admin: bool, local_default: Tier) -> Tier {
+    match node_tier {
+        Some(t) => t,
+        None if admin => Tier::Read,
+        None => local_default,
     }
 }
 
@@ -317,6 +330,19 @@ mod tests {
         let root = serde_json::json!({ "session": "s", "remote_path": "/etc/hosts", "as_root": true });
         assert_eq!(subject("open_in_editor", &root).as_deref(), Some("as root: /etc/hosts"));
         assert_eq!(subject("list_sessions", &serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn local_tier_defaults() {
+        // Bare Local: the profile's local.mcp_tier.
+        assert_eq!(local_tier(None, false, Tier::Read), Tier::Read);
+        assert_eq!(local_tier(None, false, Tier::ExecApprove), Tier::ExecApprove);
+        // Local (admin): read, whatever local.mcp_tier says.
+        assert_eq!(local_tier(None, true, Tier::Trusted), Tier::Read);
+        assert_eq!(local_tier(None, true, Tier::ExecApprove), Tier::Read);
+        // A saved node's own tier wins, elevated or not.
+        assert_eq!(local_tier(Some(Tier::ExecApprove), true, Tier::Read), Tier::ExecApprove);
+        assert_eq!(local_tier(Some(Tier::Read), false, Tier::Trusted), Tier::Read);
     }
 
     #[test]

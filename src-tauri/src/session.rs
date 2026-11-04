@@ -57,7 +57,7 @@ pub trait Session: Send + Sync {
         Err(anyhow!("this session has no file access"))
     }
     /// Run a command on the interactive shell without the user seeing it (see
-    /// `hidden.rs`): returns its output and exit code. Only SSH shells do this.
+    /// `hidden.rs`): returns its output and exit code. SSH and local shells do this.
     async fn exec_hidden(&self, _cmd: &str) -> Result<(Vec<u8>, i32)> {
         Err(anyhow!("this session cannot run hidden commands"))
     }
@@ -82,6 +82,9 @@ pub trait Session: Send + Sync {
     async fn ssh_password(&self) -> Option<String> {
         None
     }
+    /// The UI detected the shell running in the session ("bash", "pwsh", …), or
+    /// lost track of it (None). Local sessions pick the hidden-command syntax from it.
+    fn shell_changed(&self, _shell: Option<&str>) {}
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -107,11 +110,14 @@ pub struct SessionInfo {
     /// SSH: the shell started instead of the login shell, if one was chosen.
     #[serde(default)]
     pub remote_shell: Option<String>,
+    /// Local: an elevated shell ("Local (admin)"). MCP never trusts it by default.
+    #[serde(default)]
+    pub admin: bool,
 }
 
 impl SessionInfo {
     pub fn new(id: String, title: String, kind: &str) -> Self {
-        Self { id, title, kind: kind.into(), shell_integration: false, shell: None, cwd: None, node_id: None, host: None, remote_shell: None }
+        Self { id, title, kind: kind.into(), shell_integration: false, shell: None, cwd: None, node_id: None, host: None, remote_shell: None, admin: false }
     }
 }
 
@@ -182,7 +188,8 @@ impl SessionManager {
 
     pub async fn set_shell(&self, id: &str, shell: Option<String>) -> Result<()> {
         let mut inner = self.inner.lock().await;
-        let (info, _) = inner.get_mut(id).ok_or_else(|| anyhow!("no session {id}"))?;
+        let (info, sess) = inner.get_mut(id).ok_or_else(|| anyhow!("no session {id}"))?;
+        sess.shell_changed(shell.as_deref());
         info.shell = shell;
         Ok(())
     }

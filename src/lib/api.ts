@@ -46,9 +46,9 @@ export interface Profile {
   name: string;
   appearance: { font: string; font_size: number; theme: string; scrollback: number; renderer: "webgl" | "canvas" | "dom" | string; [k: string]: unknown };
   terminal: { timestamps?: boolean; trace_output?: boolean; copy_on_select: boolean; ctrl_c_copies_when_selected: boolean; middle_click_paste: boolean; right_click?: "moba" | "menu" | string; bracketed_paste: boolean; paste_guard_lines: number; paste_run?: "auto" | "wait" | string; linux_repaint?: LinuxRepaint; [k: string]: unknown };
-  files?: { auto_open?: boolean; parallel_transfers?: number; [k: string]: unknown };
+  files?: { auto_open?: boolean; parallel_transfers?: number; pane_width?: number; hidden_columns?: string[]; column_widths?: Record<string, number>; [k: string]: unknown };
   sudo?: { auto_send?: boolean; [k: string]: unknown };
-  local?: { credential?: string; [k: string]: unknown };
+  local?: { credential?: string; mcp_tier?: "read" | "exec-approve" | "trusted" | string; [k: string]: unknown };
   clipboard: { strip_zero_width: boolean; nbsp_to_space: boolean; smart_quotes_to_ascii: boolean; trim_trailing_whitespace: boolean; crlf_to_lf: boolean; [k: string]: unknown };
   commands: { mark_gutter: boolean; tint_failed_commands: boolean; jump_keys: string[]; [k: string]: unknown };
   ssh: { keepalive_seconds: number; [k: string]: unknown };

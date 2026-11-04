@@ -4,8 +4,11 @@
 //! sentinels, then keeps swallowing the redrawn prompt (up to the next `133;B`
 //! mark or a short silence) so the user's screen does not change at all.
 //!
-//! Pure state machine, tested; the SSH task drives it.
+//! Pure state machine, tested; the SSH task and the local PTY's emitter thread
+//! drive it. POSIX shells get `wrap`, PowerShell gets `wrap_pwsh`; both print the
+//! same sentinels, so one `Capture` serves every shell.
 
+use base64::Engine;
 use std::time::{Duration, Instant};
 
 /// `ESC ] 7771 ; s BEL` — payload starts after this.
@@ -84,6 +87,81 @@ pub fn wrap(cmd: &str) -> String {
     } else {
         format!("\x15 printf '\\033]7771;s\\a'; {cmd}; {end}\n")
     }
+}
+
+/// The syntax a hidden command is wrapped in, from the shell running in the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    Posix,
+    Pwsh,
+}
+
+impl Dialect {
+    /// From a shell name (as the UI detects it) or a program path. fish has no `$?`
+    /// and cmd.exe no way to print the sentinels, so they (and anything unknown) get none.
+    pub fn of(shell: &str) -> Option<Dialect> {
+        let base = shell.rsplit(['/', '\\']).next().unwrap_or(shell).to_ascii_lowercase();
+        match base.strip_suffix(".exe").unwrap_or(&base) {
+            "bash" | "zsh" | "sh" | "dash" | "ksh" | "mksh" | "ash" => Some(Dialect::Posix),
+            "pwsh" | "pwsh-preview" | "powershell" => Some(Dialect::Pwsh),
+            _ => None,
+        }
+    }
+
+    pub fn wrap(self, cmd: &str) -> String {
+        match self {
+            Dialect::Posix => wrap(cmd),
+            Dialect::Pwsh => wrap_pwsh(cmd),
+        }
+    }
+}
+
+/// The keystrokes for one hidden command in PowerShell (5.1 and 7). Like the hook
+/// injection, the command travels as one base64 line through Invoke-Expression:
+/// PSReadLine would turn a multi-line command into `>>` continuation, and base64
+/// sidesteps quoting. A `try` keeps a terminating error from skipping the end
+/// sentinel. No Ctrl+U (PSReadLine's Windows mode doesn't bind it); `PromptState`
+/// already refuses a non-empty line. CR is the Enter key.
+///
+/// Exit code: the hook's `133;D` mapping (`$?` → 0, else `$LASTEXITCODE`, else 1),
+/// evaluated right after the command. The `133;D` the prompt prints afterwards
+/// would see the sentinel write's own `$?`. Two adjustments make it independent of
+/// whether Invoke-Expression passes a failure on in `$?`: `$LASTEXITCODE` is
+/// cleared first, so a nonzero value is this command's native exit code (it wins,
+/// stale codes can't leak in); and a new entry at the head of `$Error` counts as
+/// a failure.
+pub fn wrap_pwsh(cmd: &str) -> String {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(cmd.as_bytes());
+    let esc = "$([char]27)";
+    let bel = "$([char]7)";
+    format!(
+        " [Console]::Write(\"{esc}]7771;s{bel}\"); $global:LASTEXITCODE = 0; $__charon_e = $Error[0]; \
+try {{ Invoke-Expression ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{b64}'))); $__charon_ok = $? }} \
+catch {{ $__charon_ok = $false; $_ | Out-Host }}; \
+if ($Error.Count -and -not [object]::ReferenceEquals($Error[0], $__charon_e)) {{ $__charon_ok = $false }}; \
+[Console]::Write(\"{esc}]7771;e;$(if ($global:LASTEXITCODE) {{ $global:LASTEXITCODE }} elseif ($__charon_ok) {{ 0 }} else {{ 1 }}){bel}\")\r"
+    )
+}
+
+/// Windows: a command that would raise a UAC prompt, which shows on the secure
+/// desktop where nobody answers for an agent, so the hidden command would hang
+/// until it timed out. Returns what gave it away. Errs on the side of refusing
+/// (`echo sudo` is refused too). A program that merely *needs* elevation fails on
+/// its own (ERROR_ELEVATION_REQUIRED) and isn't caught here; only
+/// ShellExecute-style elevation prompts.
+pub fn uac_trigger(cmd: &str) -> Option<&'static str> {
+    let lower = cmd.to_ascii_lowercase();
+    let words = lower.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')));
+    for w in words {
+        match w {
+            "sudo" | "sudo.exe" => return Some("sudo"),
+            "gsudo" | "gsudo.exe" => return Some("gsudo"),
+            // runas.exe, and Start-Process -Verb RunAs (also -Verb:RunAs, via the split on ':').
+            "runas" | "runas.exe" => return Some("RunAs"),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Whether the interactive shell can take a hidden command right now, from the
@@ -345,6 +423,62 @@ mod tests {
         let w = wrap("ls");
         assert!(w.starts_with("\x15 printf"));
         assert!(w.ends_with("\"$?\"\n"));
+    }
+
+    #[test]
+    fn dialect_follows_the_shell() {
+        assert_eq!(Dialect::of("bash"), Some(Dialect::Posix));
+        assert_eq!(Dialect::of("/usr/bin/zsh"), Some(Dialect::Posix));
+        assert_eq!(Dialect::of("pwsh"), Some(Dialect::Pwsh));
+        assert_eq!(Dialect::of(r"C:\Program Files\PowerShell\7\pwsh.exe"), Some(Dialect::Pwsh));
+        assert_eq!(Dialect::of(r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe"), Some(Dialect::Pwsh));
+        assert_eq!(Dialect::of("fish"), None);
+        assert_eq!(Dialect::of(r"C:\WINDOWS\system32\cmd.exe"), None);
+        assert_eq!(Dialect::of("sudo"), None);
+    }
+
+    #[test]
+    fn pwsh_wrap_is_one_line_carrying_the_command_in_base64() {
+        let cmd = "Get-ChildItem 'C:\\it''s here'\n| Select -First 1";
+        let w = wrap_pwsh(cmd);
+        assert!(w.starts_with(' '), "leading space, as the hook injection");
+        assert!(w.ends_with('\r'), "Enter");
+        assert_eq!(w.matches(['\r', '\n']).count(), 1, "exactly one line: {w:?}");
+        assert!(!w.contains('\x1b'), "no raw ESC: the echo must not look like a sentinel");
+        let b64 = w.split("FromBase64String('").nth(1).unwrap().split('\'').next().unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+        assert_eq!(String::from_utf8(decoded).unwrap(), cmd);
+    }
+
+    #[test]
+    fn pwsh_exit_code_mapping() {
+        let w = wrap_pwsh("x");
+        // $LASTEXITCODE is cleared before the command, so a nonzero value is its own.
+        assert!(w.contains("$global:LASTEXITCODE = 0;"));
+        let reset = w.find("$global:LASTEXITCODE = 0").unwrap();
+        assert!(reset < w.find("Invoke-Expression").unwrap());
+        // Native exit code first, then $?/$Error (the hook's 133;D order: success → 0, else 1).
+        assert!(w.contains("$(if ($global:LASTEXITCODE) { $global:LASTEXITCODE } elseif ($__charon_ok) { 0 } else { 1 })"), "{w}");
+        // A terminating error is caught, still reaching the end sentinel as a failure.
+        assert!(w.contains("catch { $__charon_ok = $false;"));
+        // What PowerShell prints comes through the same Capture as POSIX shells.
+        let mut c = Capture::new();
+        assert!(c.feed(w.replace('\r', "\r\n").as_bytes()).is_empty(), "echo swallowed");
+        assert!(c.feed(b"\x1b]7771;s\x07charon\r\n\x1b]7771;e;3\x07").is_empty());
+        let shown = c.feed(b"\x1b]133;D;1\x07\x1b]133;A\x07PS C:\\> \x1b]133;B\x07");
+        assert!(shown.is_empty() && c.done());
+        assert_eq!(c.into_result(), (b"charon\r\n".to_vec(), 3));
+    }
+
+    #[test]
+    fn uac_triggers_are_refused_before_typing() {
+        assert_eq!(uac_trigger("sudo winget install foo"), Some("sudo"));
+        assert_eq!(uac_trigger("gsudo.exe whoami"), Some("gsudo"));
+        assert_eq!(uac_trigger("Start-Process notepad -Verb RunAs"), Some("RunAs"));
+        assert_eq!(uac_trigger("saps pwsh -Verb:runas"), Some("RunAs"));
+        assert_eq!(uac_trigger("runas /user:Administrator cmd"), Some("RunAs"));
+        assert_eq!(uac_trigger("Get-ChildItem C:\\Windows"), None);
+        assert_eq!(uac_trigger("echo pseudonym; ./sudoku.exe"), None);
     }
 
     #[test]

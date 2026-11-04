@@ -94,6 +94,13 @@ section!(Files {
     auto_open: bool = true,
     /// Max files transferring at once during a recursive/multi-item transfer.
     parallel_transfers: u16 = 4,
+    /// File pane width in px (the divider beside the terminal writes it back;
+    /// a double-click on the divider restores this default).
+    pane_width: u32 = 420,
+    /// Columns the header's right-click menu hid: "size", "mtime", "mode".
+    hidden_columns: Vec<String> = Vec::new(),
+    /// Column widths in px by key; no "name" = Name fills the free space.
+    column_widths: std::collections::BTreeMap<String, u32> = Default::default(),
 });
 
 section!(Sudo {
@@ -107,6 +114,10 @@ section!(Local {
     /// offers to a sudo/su prompt (Unix). Empty = none. Saved local nodes use
     /// their own credential instead.
     credential: String = "".into(),
+    /// MCP tier for the bare "Local" shell (no saved node): "read" | "exec-approve"
+    /// | "trusted". Local (admin) ignores it and stays "read" unless its node says
+    /// otherwise.
+    mcp_tier: String = "read".into(),
 });
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -217,6 +228,20 @@ mod tests {
         assert_eq!(p.ssh.keepalive_seconds, 30);
         // Sections not modelled here still ride along.
         assert!(p.extra.contains_key("docs"));
+        assert_eq!(p.files.pane_width, 420);
+        assert_eq!(p.local.mcp_tier, "read");
+        assert!(p.files.hidden_columns.is_empty() && p.files.column_widths.is_empty());
+    }
+
+    #[test]
+    fn file_pane_layout_round_trips() {
+        let mut p = Profile::parse(BUNDLED_DEFAULT).unwrap();
+        p.files.pane_width = 640;
+        p.files.hidden_columns = vec!["mode".into()];
+        p.files.column_widths.insert("name".into(), 300);
+        p.files.column_widths.insert("size".into(), 72);
+        let again = Profile::parse(&p.to_toml().unwrap()).unwrap();
+        assert_eq!(again.files, p.files);
     }
 
     #[test]

@@ -6,7 +6,6 @@
   // crumb or ↑ (hold Ctrl to copy), Cut/Copy/Paste, Move to… / Copy to….
   import { onMount, onDestroy, untrack } from "svelte";
   import { open as pickOpen } from "@tauri-apps/plugin-dialog";
-  import { getCurrentWebview } from "@tauri-apps/api/webview";
   import {
     sftpHome, sftpList, sftpMkdir, sftpRename, sftpChmod,
     sftpGetTree, sftpPutTree, sftpCopyTree, sftpMove, sftpDeleteTree, sftpCancel, onTreeEvent, fileWrite,
@@ -18,8 +17,10 @@
   import { followTarget, pushTarget } from "./panecwd";
   import { isPermissionError, sftpSudoOpen, sftpSudoHasPassword, sftpSudoClear, writeText, type FsVia } from "./api";
   import { ensureSudo } from "./sudoedit";
+  import { addDropTarget } from "./filedrop";
+  import { COLS, DEFAULT_COLS, visibleCols, gridTemplate, rowMinWidth, toggleCol, setColWidth, fitCol, type ColKey, type ColLayout } from "./filecols";
 
-  let { session, cwd, color, sshUser, shellUser, isIdle, parallel, onopen, onchdir, onclose }: {
+  let { session, cwd, color, sshUser, shellUser, isIdle, parallel, columns, oncolumns, onopen, onchdir, onclose }: {
     /** Session id; null = local disk. */
     session: string | null;
     /** Shell cwd from OSC 7, followed when "follow" is on. */
@@ -33,6 +34,9 @@
     isIdle?: () => boolean;
     /** Max files transferring at once (profile files.parallel_transfers); shown for reference. */
     parallel?: number;
+    /** Column widths / hidden set (profile [files]); `oncolumns` saves a change. */
+    columns?: ColLayout;
+    oncolumns?: (c: ColLayout) => void;
     /** Open a file in the editor with the backend the pane is using. */
     onopen?: (path: string, via: FsVia) => void;
     /** "→ term" is on: tell the shell to cd here. */
@@ -66,7 +70,7 @@
   // Set while the password form answers an ensureSudo() ask (Edit as root) rather
   // than switching the pane itself.
   let sudoResolve = $state<((pw: string | null) => void) | null>(null);
-  let sortKey = $state<"name" | "size" | "mtime" | "mode">("name");
+  let sortKey = $state<ColKey>("name");
   let sortDir = $state<1 | -1>(1);
   // Multi-select: a set of entry paths, with an anchor path for Shift ranges.
   let selected = $state<Set<string>>(new Set());
@@ -112,6 +116,16 @@
   const differentUser = $derived(!!shellUser && !!sshUser && shellUser !== sshUser);
   /** Windows has no mode bits; drop the column rather than show blanks. */
   const hasModes = $derived(!!listing && listing.entries.some((e) => e.mode));
+  // Columns: drag a header edge to resize, double-click it to fit the contents,
+  // right-click the header to hide or show one (Name always shows).
+  let cols = $state<ColLayout>(untrack(() => columns ?? DEFAULT_COLS));
+  let savedCols = untrack(() => JSON.stringify(columns ?? DEFAULT_COLS));
+  $effect(() => {
+    const c = columns ?? DEFAULT_COLS, j = JSON.stringify(c);
+    if (j !== savedCols) { savedCols = j; untrack(() => (cols = c)); }
+  });
+  const visible = $derived(visibleCols(cols, hasModes));
+  let listEl = $state<HTMLDivElement | null>(null);
   const rows = $derived.by(() => {
     if (!listing) return [];
     const list = listing.entries.filter((e) => showHidden || !e.name.startsWith("."));
@@ -131,26 +145,12 @@
 
   onMount(async () => {
     unlisteners.push(await onTreeEvent(onTree));
-    // OS drag-drop lands on the webview; take it if it was dropped over this pane.
-    unlisteners.push(await getCurrentWebview().onDragDropEvent((e) => {
-      const p = e.payload;
-      if (p.type === "leave") { dropping = false; return; }
-      const inside = el ? overThisPane(p.position.x, p.position.y) : false;
-      if (p.type === "over" || p.type === "enter") { dropping = inside; return; }
-      dropping = false;
-      if (p.type === "drop" && inside && p.paths.length) startUpload(p.paths);
-    }));
+    // Files from the OS file manager dropped on this pane upload into its directory,
+    // whatever their type (filedrop.ts routes each drop to the zone under the pointer).
+    if (el) unlisteners.push(addDropTarget({ zone: "files", el, hover: (on) => (dropping = on), drop: startUpload }));
     try { await go(await sftpHome(session, via)); } catch (e) { error = String(e); }
   });
   onDestroy(() => unlisteners.forEach((u) => u()));
-
-  // Tauri drag positions are physical pixels; hit-test with elementFromPoint (CSS px)
-  // so this matches App.svelte's editor-drop routing exactly (they must agree).
-  function overThisPane(px: number, py: number): boolean {
-    const s = window.devicePixelRatio || 1;
-    const hit = document.elementFromPoint(px / s, py / s);
-    return !!hit && !!el && el.contains(hit);
-  }
 
   async function go(path: string) {
     loading = true; error = ""; selected = new Set(); anchor = null; ask = null;
@@ -257,6 +257,64 @@
   }
   function sortBy(k: typeof sortKey) {
     if (sortKey === k) sortDir = sortDir === 1 ? -1 : 1; else { sortKey = k; sortDir = 1; }
+  }
+
+  // ---- columns
+  function saveCols() {
+    savedCols = JSON.stringify(cols);
+    oncolumns?.(cols);
+  }
+  function startColDrag(e: PointerEvent, key: ColKey) {
+    if (e.button !== 0) return;
+    e.preventDefault(); e.stopPropagation();
+    const grip = e.currentTarget as HTMLElement;
+    const startX = e.clientX, startW = grip.parentElement!.getBoundingClientRect().width;
+    const before = cols;
+    grip.setPointerCapture(e.pointerId);
+    const move = (ev: PointerEvent) => { cols = setColWidth(before, key, startW + ev.clientX - startX); };
+    const stop = () => {
+      grip.removeEventListener("pointermove", move); grip.removeEventListener("pointerup", stop);
+      if (cols !== before) saveCols();
+    };
+    grip.addEventListener("pointermove", move); grip.addEventListener("pointerup", stop);
+  }
+  /** Width of an element's text, whatever its box (cells ellipsize and right-align). */
+  function textWidth(el: Element): number {
+    const r = document.createRange();
+    r.selectNodeContents(el);
+    return r.getBoundingClientRect().width;
+  }
+  function fitWidth(key: ColKey): number {
+    const cells = [...(listEl?.querySelectorAll(`[data-col="${key}"]`) ?? [])];
+    return fitCol(key, cells.map(textWidth));
+  }
+  function autoFit(key: ColKey) {
+    cols = setColWidth(cols, key, fitWidth(key));
+    saveCols();
+  }
+  function fitAll() {
+    let next = cols;
+    for (const c of visible) next = setColWidth(next, c.key, fitWidth(c.key));
+    cols = next;
+    saveCols();
+  }
+  function onHeadMenu(ev: MouseEvent) {
+    ev.preventDefault(); ev.stopPropagation();
+    const shown = (k: ColKey) => k === "name" || !cols.hidden.includes(k);
+    menu = { x: ev.clientX, y: ev.clientY, items: [
+      ...COLS.map((c) => ({
+        label: `${shown(c.key) ? "✓" : "\u2003"} ${c.label}${c.key === "mode" && !hasModes ? " (no mode bits here)" : ""}`,
+        disabled: c.key === "name" || (c.key === "mode" && !hasModes),
+        action: () => {
+          cols = toggleCol(cols, c.key);
+          if (cols.hidden.includes(sortKey)) { sortKey = "name"; sortDir = 1; }
+          saveCols();
+        },
+      })),
+      { separator: true, label: "" },
+      { label: "Fit all columns", action: fitAll, disabled: !rows.length },
+      { label: "Reset columns", action: () => { cols = DEFAULT_COLS; saveCols(); } },
+    ] };
   }
 
   // ---- root escalation
@@ -697,12 +755,16 @@
   {/if}
   {#if error}<div class="err">{error}</div>{/if}
   <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
-  <div class="list" class:loading class:nomode={!hasModes} tabindex="0" onkeydown={onListKey}>
-    <div class="head">
-      <button type="button" onclick={() => sortBy("name")}>{selected.size ? `${selected.size} selected` : "Name"}{sortKey === "name" ? (sortDir > 0 ? " ▲" : " ▼") : ""}</button>
-      <button type="button" onclick={() => sortBy("size")}>Size{sortKey === "size" ? (sortDir > 0 ? " ▲" : " ▼") : ""}</button>
-      <button type="button" onclick={() => sortBy("mtime")}>Modified{sortKey === "mtime" ? (sortDir > 0 ? " ▲" : " ▼") : ""}</button>
-      {#if hasModes}<button type="button" onclick={() => sortBy("mode")}>Perm{sortKey === "mode" ? (sortDir > 0 ? " ▲" : " ▼") : ""}</button>{/if}
+  <div class="list" class:loading tabindex="0" onkeydown={onListKey} bind:this={listEl}
+    style:--cols={gridTemplate(cols, visible)} style:--row-min="{rowMinWidth(cols, visible)}px">
+    <div class="head" oncontextmenu={onHeadMenu} title="Right-click to show or hide columns">
+      {#each visible as c (c.key)}
+        <div class="hc">
+          <button type="button" data-col={c.key} onclick={() => sortBy(c.key)}>{c.key === "name" && selected.size ? `${selected.size} selected` : c.label}{sortKey === c.key ? (sortDir > 0 ? " ▲" : " ▼") : ""}</button>
+          <span class="grip" role="separator" aria-orientation="vertical" aria-label="Resize {c.label}" title="Drag to resize; double-click to fit"
+            onpointerdown={(e) => startColDrag(e, c.key)} ondblclick={() => autoFit(c.key)}></span>
+        </div>
+      {/each}
     </div>
     {#each rows as e (e.path)}
       {@const isDir = isDirEntry(e)}
@@ -713,10 +775,12 @@
         onclick={(ev) => onRowClick(ev, e)} ondblclick={() => activate(e)}
         onkeydown={(k) => { if (k.key === "Enter") activate(e); }}
         oncontextmenu={(ev) => onRowMenu(ev, e)}>
-        <span class="name" title={e.path}>{isDir ? "▸ " : ""}{e.name}{e.kind === "symlink" ? " →" : ""}</span>
-        <span class="size">{isDir ? "" : humanSize(e.size)}</span>
-        <span class="mtime">{when(e.mtime)}</span>
-        {#if hasModes}<span class="mode mono">{modeString(e.mode, isDir)}</span>{/if}
+        {#each visible as c (c.key)}
+          {#if c.key === "name"}<span class="name" data-col="name" title={e.path}>{isDir ? "▸ " : ""}{e.name}{e.kind === "symlink" ? " →" : ""}</span>
+          {:else if c.key === "size"}<span class="size" data-col="size">{isDir ? "" : humanSize(e.size)}</span>
+          {:else if c.key === "mtime"}<span class="mtime" data-col="mtime">{when(e.mtime)}</span>
+          {:else}<span class="mode mono" data-col="mode">{modeString(e.mode, isDir)}</span>{/if}
+        {/each}
       </div>
     {/each}
     {#if listing && rows.length === 0}<div class="empty">empty</div>{/if}
@@ -792,17 +856,21 @@
   .err { color: var(--danger); padding: 4px 8px; border-bottom: 1px solid var(--line); }
   .list { flex: 1; overflow: auto; min-height: 0; outline: none; }
   .list.loading { opacity: .6; }
-  .head, .row { display: grid; grid-template-columns: minmax(0, 1fr) 64px 118px 84px; gap: 6px; padding: 2px 8px; align-items: center; }
-  .nomode .head, .nomode .row { grid-template-columns: minmax(0, 1fr) 64px 118px; }
-  .head { position: sticky; top: 0; background: var(--bg-raised); border-bottom: 1px solid var(--line); color: var(--fg-dim); }
-  .head button { border: 0; background: transparent; text-align: left; padding: 2px 0; color: inherit; }
+  /* Columns from filecols.ts; gap and padding must match its COL_GAP / ROW_PAD. Past
+     --row-min the list scrolls sideways instead of squeezing the columns. */
+  .head, .row { display: grid; grid-template-columns: var(--cols); gap: 6px; padding: 2px 8px; align-items: center; min-width: var(--row-min); }
+  .head { position: sticky; top: 0; z-index: 1; background: var(--bg-raised); border-bottom: 1px solid var(--line); color: var(--fg-dim); }
+  .hc { position: relative; display: flex; min-width: 0; }
+  .head button { flex: 1; min-width: 0; border: 0; background: transparent; text-align: left; padding: 2px 0; color: inherit; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .grip { position: absolute; top: -2px; bottom: -2px; right: -6px; width: 6px; cursor: col-resize; touch-action: none; }
+  .grip:hover, .grip:active { background: var(--session-color); opacity: .6; }
   .row { cursor: default; user-select: none; }
   .row:hover { background: var(--bg); }
   .row.sel { background: var(--bg); box-shadow: inset 2px 0 0 var(--session-color); }
   .row.dir .name { color: var(--fg); font-weight: 600; }
   .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .size { text-align: right; color: var(--fg-dim); font-variant-numeric: tabular-nums; }
-  .mtime, .mode { color: var(--fg-dim); white-space: nowrap; }
+  .size, .mtime, .mode { color: var(--fg-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .mono { font-family: var(--font-mono); }
   .empty { color: var(--fg-dim); padding: 12px; text-align: center; }
   .transfers { border-top: 1px solid var(--line); max-height: 200px; overflow: auto; padding: 4px 8px; }

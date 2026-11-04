@@ -55,8 +55,9 @@
   import { CommandTracker, InjectionSwallower, detectShell, injectionFor, hookTextFor, looksLikeShellPrompt, looksLikeSudoPrompt, sudoUserOf, sudoAutoEligible, promptUserOf } from "./osc133";
   import { sudoHasPassword, sudoSendPassword, sessionShells, connectionSetRemoteShell, type HostShells } from "./api";
   import { gutterRows, type GutterRow } from "./stamps";
+  import { clampPane, PANE_DEFAULT, type ColLayout } from "./filecols";
 
-  let { open, adopt, color, font, prefs, active = true, os, osUser, onfontsize, ontimestamps, onclosed, onabort, oncwd, onopenfile, onfiles, oncommand }: {
+  let { open, adopt, color, font, prefs, active = true, os, osUser, onfontsize, ontimestamps, onclosed, onabort, oncwd, onopenfile, onfiles, onfileslayout, oncommand }: {
     open: OpenTarget;
     /** Arrived from another window: restore this instead of connecting. */
     adopt?: TabSnapshot;
@@ -86,6 +87,8 @@
     onopenfile?: (path: string, fs: string | null, origin: string | null, via: FsVia) => void;
     /** The file pane was shown/hidden (tab-bar button state). */
     onfiles?: (open: boolean) => void;
+    /** The file pane was resized or its columns changed; the owner persists it (other tabs follow prefs). */
+    onfileslayout?: (l: { width?: number; columns?: ColLayout }) => void;
     /** The command being typed changed (for the Docs pane): (command|null, session|null). */
     oncommand?: (command: string | null, session: string | null) => void;
   } = $props();
@@ -138,7 +141,16 @@
   let chipMenu = $state<{ x: number; y: number } | null>(null);
   // File pane (Ctrl+Shift+E): SFTP for SSH, local disk for local tabs; serial has none.
   let filesOpen = $state(false);
-  let filesWidth = $state(420);
+  // Width as dragged; shown clamped so the terminal keeps its minimum (filecols.ts).
+  let filesWidth = $state(untrack(() => prefs.filesWidth));
+  let splitW = $state(0);
+  const paneW = $derived(clampPane(filesWidth, splitW));
+  // Saved in another tab (or the profile reloaded): follow it.
+  let savedWidth = untrack(() => prefs.filesWidth);
+  $effect(() => {
+    const w = prefs.filesWidth;
+    if (w !== savedWidth) { savedWidth = w; untrack(() => (filesWidth = w)); }
+  });
   const hasFiles = $derived(open.kind !== "serial");
   export function toggleFiles() { if (hasFiles) { filesOpen = !filesOpen; onfiles?.(filesOpen); if (!filesOpen) term?.focus(); } }
   export function filesShown(): boolean { return filesOpen; }
@@ -165,13 +177,28 @@
       : `cd -- ${sq(path)}`;
     sessionWrite(sessionId, `${cmd}\n`);
   }
+  // The divider: drag to resize the pane (the terminal refits as it narrows or widens,
+  // via the ResizeObserver below, and the remote gets the new size), double-click for
+  // the default width.
   function startPaneDrag(e: PointerEvent) {
-    const startX = e.clientX, startW = filesWidth;
+    if (e.button !== 0) return;
+    const startX = e.clientX, startW = paneW;
     const target = e.currentTarget as HTMLElement;
     target.setPointerCapture(e.pointerId);
-    const move = (ev: PointerEvent) => { filesWidth = Math.max(240, Math.min(window.innerWidth * 0.7, startW - (ev.clientX - startX))); };
-    const stop = () => { target.removeEventListener("pointermove", move); target.removeEventListener("pointerup", stop); fit?.fit(); };
+    const move = (ev: PointerEvent) => { filesWidth = clampPane(startW - (ev.clientX - startX), splitW); };
+    const stop = () => {
+      target.removeEventListener("pointermove", move); target.removeEventListener("pointerup", stop);
+      filesWidth = paneW;
+      if (filesWidth !== startW) setPaneWidth(filesWidth);
+    };
     target.addEventListener("pointermove", move); target.addEventListener("pointerup", stop);
+  }
+  function setPaneWidth(w: number) {
+    filesWidth = w;
+    savedWidth = w;
+    onfileslayout?.({ width: w });
+    // Fit now rather than wait for the observer, so the log shows the new size.
+    requestAnimationFrame(() => { fit?.fit(); console.info(`[charon] files: pane width=${paneW} term=${term?.cols}x${term?.rows}`); });
   }
 
   // Search overlay (Ctrl+Shift+F).
@@ -1251,7 +1278,7 @@ ${HIDE_CURSOR}`); onclosed(r); }, data: (raw, m) => {
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div class="wrap" style:--session-color={color ?? "var(--accent)"}>
-  <div class="split">
+  <div class="split" bind:clientWidth={splitW}>
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div class="termbox" oncontextmenu={onContextMenu}>
     {#if prefs.timestamps}
@@ -1271,9 +1298,11 @@ ${HIDE_CURSOR}`); onclosed(r); }, data: (raw, m) => {
     {/if}
   </div>
   {#if filesOpen && hasFiles && sessionId}
-    <div class="vsplit" role="separator" aria-orientation="vertical" aria-label="Resize file pane" onpointerdown={startPaneDrag}></div>
-    <div class="files" style:width="{filesWidth}px">
+    <div class="vsplit" role="separator" aria-orientation="vertical" aria-label="Resize file pane" title="Drag to resize; double-click for the default width"
+      onpointerdown={startPaneDrag} ondblclick={() => setPaneWidth(PANE_DEFAULT)}></div>
+    <div class="files" style:width="{paneW}px">
       <SftpPane session={open.kind === "local" ? null : sessionId} {cwd} {color} {sshUser} shellUser={promptUser} isIdle={shellIdle} parallel={prefs.filesParallel}
+        columns={prefs.filesColumns} oncolumns={(c) => onfileslayout?.({ columns: c })}
         onopen={onopenfile ? (p, via) => onopenfile?.(p, open.kind === "local" ? null : sessionId, sessionId, via) : undefined}
         onchdir={chdir} onclose={toggleFiles} />
     </div>

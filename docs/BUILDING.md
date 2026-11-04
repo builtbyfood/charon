@@ -147,10 +147,6 @@ ls src-tauri/target/release/bundle/{deb,rpm,appimage}/
 
 AppImage bundling downloads `linuxdeploy` on first run; it needs `file` and `patchelf`
 present (installed above). If the box has no outbound internet, build deb/rpm only.
-If it stops at `failed to run linuxdeploy` (seen on Fedora 44), the `strip` that
-linuxdeploy bundles is too old for the distro's libraries; run with
-`NO_STRIP=true npm run tauri build -- --bundles appimage` (add `--verbose` to see
-linuxdeploy's own output).
 
 Install to test:
 

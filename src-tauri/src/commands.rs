@@ -375,11 +375,18 @@ pub async fn session_open_local(state: State<'_, AppState>, req: OpenLocal) -> C
         Ok(Some(Secret { kind: SecretKind::Password, value, .. })) => Some(value),
         _ => None,
     });
-    let params = LocalParams { shell: Some(program), args, cwd: req.cwd.or(eff.cwd), cols: req.cols, rows: req.rows, sudo_password };
+    // Elevated, `program` is sudo: name the shell it starts, for the hidden-command syntax.
+    let shell_name = req.admin.then(|| shell.clone());
+    let params = LocalParams { shell: Some(program), args, cwd: req.cwd.or(eff.cwd), cols: req.cols, rows: req.rows, sudo_password, shell_name };
     let sess = LocalSession::spawn(state.sessions.app().clone(), id.clone(), params).map_err(err)?;
     let title = if req.admin { format!("{} (admin)", basename(&shell)) } else { basename(&sess.program) };
     let mut info = SessionInfo::new(id, title, "local");
     info.node_id = req.node_id.clone();
+    // For MCP list_sessions and the tier rule (an elevated shell is never trusted by default).
+    info.admin = req.admin;
+    info.host = Some(crate::local::hostname());
+    let launched = if req.admin { &shell } else { &sess.program };
+    info.shell = Some(basename(launched).trim_end_matches(".exe").to_string());
     // Local shells get shell-integration too (only injected when a known shell is
     // detected from the prompt — pwsh/bash/zsh; cmd.exe is left alone).
     info.shell_integration = eff.shell_integration.unwrap_or(true);
