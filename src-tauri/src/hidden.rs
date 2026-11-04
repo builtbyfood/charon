@@ -4,14 +4,20 @@
 //! sentinels, then keeps swallowing the redrawn prompt (up to the next `133;B`
 //! mark or a short silence) so the user's screen does not change at all.
 //!
-//! Pure state machine, tested; the SSH task drives it.
+//! Pure state machine, tested; the SSH task and the local PTY's emitter thread
+//! drive it. POSIX shells get `wrap`, PowerShell gets `wrap_pwsh`; both print the
+//! same sentinels, so one `Capture` serves every shell.
 
+use base64::Engine;
 use std::time::{Duration, Instant};
 
 /// `ESC ] 7771 ; s BEL` — payload starts after this.
 pub const START: &[u8] = b"\x1b]7771;s\x07";
 /// `ESC ] 7771 ; e ; <exit code> BEL` — payload ends before this.
 pub const END_PREFIX: &[u8] = b"\x1b]7771;e;";
+/// `ESC ] 7771 ; o ; <base64> BEL` — a piece of the output, sent inside the
+/// sentinel stream (PowerShell). When a payload has any, they are the output.
+pub const OUT_PREFIX: &[u8] = b"\x1b]7771;o;";
 /// `ESC ] 133 ; B` (BEL or ESC \ terminated) — prompt redrawn, screen state restored.
 const PROMPT_END: &[u8] = b"\x1b]133;B";
 /// No hook in this shell: after the end sentinel, this much silence ends the tail swallow.
@@ -86,6 +92,92 @@ pub fn wrap(cmd: &str) -> String {
     }
 }
 
+/// The syntax a hidden command is wrapped in, from the shell running in the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    Posix,
+    Pwsh,
+}
+
+impl Dialect {
+    /// From a shell name (as the UI detects it) or a program path. fish has no `$?`
+    /// and cmd.exe no way to print the sentinels, so they (and anything unknown) get none.
+    pub fn of(shell: &str) -> Option<Dialect> {
+        let base = shell.rsplit(['/', '\\']).next().unwrap_or(shell).to_ascii_lowercase();
+        match base.strip_suffix(".exe").unwrap_or(&base) {
+            "bash" | "zsh" | "sh" | "dash" | "ksh" | "mksh" | "ash" => Some(Dialect::Posix),
+            "pwsh" | "pwsh-preview" | "powershell" => Some(Dialect::Pwsh),
+            _ => None,
+        }
+    }
+
+    pub fn wrap(self, cmd: &str) -> String {
+        match self {
+            Dialect::Posix => wrap(cmd),
+            Dialect::Pwsh => wrap_pwsh(cmd),
+        }
+    }
+}
+
+/// The keystrokes for one hidden command in PowerShell (5.1 and 7). Like the hook
+/// injection, the command travels as one base64 line through Invoke-Expression:
+/// PSReadLine would turn a multi-line command into `>>` continuation, and base64
+/// sidesteps quoting. A `try` keeps a terminating error from skipping the end
+/// sentinel. No Ctrl+U (PSReadLine's Windows mode doesn't bind it); `PromptState`
+/// already refuses a non-empty line. CR is the Enter key.
+///
+/// Output travels in the sentinel stream, not on the screen: collected with
+/// `*>&1 | Out-String` and written as base64 `7771;o` chunks (`OUT_PREFIX`). On
+/// Windows, ConPTY passes OSC sequences straight through but repaints text
+/// later, so printed output (`Write-Output x`, even through `Out-Host` or
+/// `[Console]::Write`) arrived after the end sentinel and was swallowed with the
+/// tail. A slow native command (`cmd /c ...`) hid this by giving the repaint time.
+///
+/// Exit code: the hook's `133;D` mapping (`$?` → 0, else `$LASTEXITCODE`, else 1),
+/// evaluated right after the command. The `133;D` the prompt prints afterwards
+/// would see the sentinel write's own `$?`. Two adjustments make it independent of
+/// whether Invoke-Expression passes a failure on in `$?`: `$LASTEXITCODE` is
+/// cleared first, so a nonzero value is this command's native exit code (it wins,
+/// stale codes can't leak in); and a new entry at the head of `$Error` counts as
+/// a failure.
+pub fn wrap_pwsh(cmd: &str) -> String {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(cmd.as_bytes());
+    let esc = "$([char]27)";
+    let bel = "$([char]7)";
+    format!(
+        " [Console]::Write(\"{esc}]7771;s{bel}\"); $global:LASTEXITCODE = 0; $__charon_e = $Error[0]; \
+$__charon_o = ''; \
+try {{ $__charon_o = Invoke-Expression ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{b64}'))) *>&1 | Out-String; $__charon_ok = $? }} \
+catch {{ $__charon_ok = $false; $__charon_o += $_ | Out-String }}; \
+$__charon_b = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$__charon_o)); \
+for ($__charon_i = 0; $__charon_i -lt $__charon_b.Length; $__charon_i += {OUT_CHUNK}) {{ \
+[Console]::Write(\"{esc}]7771;o;\" + $__charon_b.Substring($__charon_i, [Math]::Min({OUT_CHUNK}, $__charon_b.Length - $__charon_i)) + \"{bel}\") }}; \
+if ($Error.Count -and -not [object]::ReferenceEquals($Error[0], $__charon_e)) {{ $__charon_ok = $false }}; \
+[Console]::Write(\"{esc}]7771;e;$(if ($global:LASTEXITCODE) {{ $global:LASTEXITCODE }} elseif ($__charon_ok) {{ 0 }} else {{ 1 }}){bel}\")\r"
+    )
+}
+
+/// Windows: a command that would raise a UAC prompt, which shows on the secure
+/// desktop where nobody answers for an agent, so the hidden command would hang
+/// until it timed out. Returns what gave it away. Errs on the side of refusing
+/// (`echo sudo` is refused too). A program that merely *needs* elevation fails on
+/// its own (ERROR_ELEVATION_REQUIRED) and isn't caught here; only
+/// ShellExecute-style elevation prompts.
+pub fn uac_trigger(cmd: &str) -> Option<&'static str> {
+    let lower = cmd.to_ascii_lowercase();
+    let words = lower.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')));
+    for w in words {
+        match w {
+            "sudo" | "sudo.exe" => return Some("sudo"),
+            "gsudo" | "gsudo.exe" => return Some("gsudo"),
+            // runas.exe, and Start-Process -Verb RunAs (also -Verb:RunAs, via the split on ':').
+            "runas" | "runas.exe" => return Some("RunAs"),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Whether the interactive shell can take a hidden command right now, from the
 /// OSC 133 marks in its output and the user's own keystrokes. A hidden command is
 /// typed into the terminal, so it is only safe at a prompt with an empty line: with
@@ -101,6 +193,11 @@ pub struct PromptState {
     typed: bool,
     /// Tail of the previous chunk, for a mark split across chunks.
     tail: Vec<u8>,
+    /// Cursor-position queries the shell is still waiting on (PSReadLine on Unix
+    /// asks right after drawing the prompt). Typed meanwhile, a hidden command is
+    /// read as the answer and lost. Plus the tail for a query split across chunks.
+    queries: usize,
+    query_tail: Vec<u8>,
 }
 
 impl PromptState {
@@ -108,6 +205,24 @@ impl PromptState {
 
     /// Session output (everything the shell prints, captured or not).
     pub fn output(&mut self, data: &[u8]) {
+        let mut q = std::mem::take(&mut self.query_tail);
+        q.extend_from_slice(data);
+        self.queries += q.windows(DSR.len()).filter(|w| *w == DSR).count();
+        self.query_tail = q[q.len() - (DSR.len() - 1).min(q.len())..].to_vec();
+        self.marks(data);
+    }
+
+    /// A cursor query was answered (by the terminal, or by `Capture` for one it swallowed).
+    pub fn answered(&mut self, n: usize) {
+        self.queries = self.queries.saturating_sub(n);
+    }
+
+    /// The shell is waiting for the terminal to answer a cursor query.
+    pub fn awaiting_report(&self) -> bool {
+        self.queries > 0
+    }
+
+    fn marks(&mut self, data: &[u8]) {
         let mut buf = std::mem::take(&mut self.tail);
         buf.extend_from_slice(data);
         let mut i = 0;
@@ -139,6 +254,14 @@ impl PromptState {
 
     /// The user's keystrokes or paste going to the shell.
     pub fn input(&mut self, data: &[u8]) {
+        // The terminal answering a query (cursor position after PSReadLine's
+        // `ESC[6n`) goes the same way as keystrokes but leaves the line empty.
+        if is_terminal_report(data) {
+            if data.ends_with(b"R") {
+                self.answered(1);
+            }
+            return;
+        }
         if !data.is_empty() && self.at_prompt {
             self.typed = true;
         }
@@ -183,6 +306,10 @@ pub struct Capture {
     sudo_sent: bool,
     /// Rolling tail of recent output, for prompt sniffing across chunk boundaries.
     sniff: Vec<u8>,
+    /// Cursor-position queries swallowed so far and not yet answered; the tail
+    /// of the last swallowed chunk, for a query split across chunks.
+    dsr_pending: usize,
+    dsr_carry: Vec<u8>,
 }
 
 impl Default for Capture {
@@ -194,7 +321,7 @@ impl Default for Capture {
 impl Capture {
     pub fn new() -> Self {
         let now = Instant::now();
-        Self { phase: Phase::Echo, buf: Vec::new(), payload: Vec::new(), code: 0, started: now, last_byte: now, sudo_pw: None, sudo_user: String::new(), sudo_sent: false, sniff: Vec::new() }
+        Self { phase: Phase::Echo, buf: Vec::new(), payload: Vec::new(), code: 0, started: now, last_byte: now, sudo_pw: None, sudo_user: String::new(), sudo_sent: false, sniff: Vec::new(), dsr_pending: 0, dsr_carry: Vec::new() }
     }
 
     /// Arm auto-answering of the login user's own `[sudo] password for <user>:`
@@ -227,6 +354,42 @@ impl Capture {
 
     /// Feed session output; returns the bytes the UI should still see.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let shown = self.feed_inner(bytes);
+        // What is shown is always a suffix of this chunk; the rest was swallowed.
+        let swallowed = &bytes[..bytes.len().saturating_sub(shown.len())];
+        self.note_queries(swallowed);
+        shown
+    }
+
+    /// PSReadLine on Linux/macOS asks for the cursor position (`ESC[6n`) while it
+    /// redraws and waits for the answer, reading stdin until it comes. Swallowed
+    /// here, the query never reaches the terminal, so nothing would answer and the
+    /// shell would hang. Answer each one ourselves (`take_replies`). The position is a
+    /// guess; PSReadLine asks again after the prompt the user sees, and the real
+    /// terminal answers that one. (Windows ConPTY answers these itself.)
+    fn note_queries(&mut self, swallowed: &[u8]) {
+        if swallowed.is_empty() {
+            return;
+        }
+        let mut buf = std::mem::take(&mut self.dsr_carry);
+        buf.extend_from_slice(swallowed);
+        self.dsr_pending += buf.windows(DSR.len()).filter(|w| *w == DSR).count();
+        // Keep a possible query prefix, but never a whole query (counted already).
+        let keep = (DSR.len() - 1).min(buf.len());
+        self.dsr_carry = buf[buf.len() - keep..].to_vec();
+    }
+
+    /// Replies to the cursor-position queries swallowed since the last call, and
+    /// how many (for `PromptState::answered`).
+    pub fn take_replies(&mut self) -> Option<(Vec<u8>, usize)> {
+        if self.dsr_pending == 0 {
+            return None;
+        }
+        let n = std::mem::take(&mut self.dsr_pending);
+        Some((DSR_REPLY.repeat(n), n))
+    }
+
+    fn feed_inner(&mut self, bytes: &[u8]) -> Vec<u8> {
         self.last_byte = Instant::now();
         // Keep a short tail of raw output for sudo-prompt sniffing.
         if self.sudo_pw.is_some() && !self.sudo_sent {
@@ -309,7 +472,41 @@ impl Capture {
     }
 
     pub fn into_result(self) -> (Vec<u8>, i32) {
-        (self.payload, self.code)
+        (out_chunks(&self.payload).unwrap_or(self.payload), self.code)
+    }
+}
+
+/// Base64 per `7771;o` chunk (a multiple of 4, so each decodes on its own).
+const OUT_CHUNK: usize = 3000;
+
+/// The decoded `7771;o` chunks of a payload, or `None` if it has none. Anything
+/// else in the payload (what the terminal repainted) is dropped.
+fn out_chunks(payload: &[u8]) -> Option<Vec<u8>> {
+    let mut rest = find(payload, OUT_PREFIX).map(|i| &payload[i..])?;
+    let mut out = Vec::new();
+    while let Some(i) = find(rest, OUT_PREFIX) {
+        rest = &rest[i + OUT_PREFIX.len()..];
+        let end = rest.iter().position(|&b| b == 0x07).unwrap_or(rest.len());
+        if let Ok(d) = base64::engine::general_purpose::STANDARD.decode(&rest[..end]) {
+            out.extend(d);
+        }
+        rest = &rest[end..];
+    }
+    Some(out)
+}
+
+/// Device status report: "where is the cursor?", and the answer we give inside a capture.
+const DSR: &[u8] = b"\x1b[6n";
+const DSR_REPLY: &[u8] = b"\x1b[1;1R";
+
+/// A terminal's answer to a query rather than keystrokes: a cursor position
+/// (`ESC [ row ; col R`) or a device attributes report (`ESC [ ? … c`).
+pub fn is_terminal_report(data: &[u8]) -> bool {
+    let Some(body) = data.strip_prefix(b"\x1b[") else { return false };
+    match body.split_last() {
+        Some((b'R', args)) => !args.is_empty() && args.iter().all(|b| b.is_ascii_digit() || *b == b';'),
+        Some((b'c', args)) => args.first() == Some(&b'?') && args[1..].iter().all(|b| b.is_ascii_digit() || *b == b';'),
+        _ => false,
     }
 }
 
@@ -345,6 +542,126 @@ mod tests {
         let w = wrap("ls");
         assert!(w.starts_with("\x15 printf"));
         assert!(w.ends_with("\"$?\"\n"));
+    }
+
+    #[test]
+    fn dialect_follows_the_shell() {
+        assert_eq!(Dialect::of("bash"), Some(Dialect::Posix));
+        assert_eq!(Dialect::of("/usr/bin/zsh"), Some(Dialect::Posix));
+        assert_eq!(Dialect::of("pwsh"), Some(Dialect::Pwsh));
+        assert_eq!(Dialect::of(r"C:\Program Files\PowerShell\7\pwsh.exe"), Some(Dialect::Pwsh));
+        assert_eq!(Dialect::of(r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe"), Some(Dialect::Pwsh));
+        assert_eq!(Dialect::of("fish"), None);
+        assert_eq!(Dialect::of(r"C:\WINDOWS\system32\cmd.exe"), None);
+        assert_eq!(Dialect::of("sudo"), None);
+    }
+
+    #[test]
+    fn pwsh_wrap_is_one_line_carrying_the_command_in_base64() {
+        let cmd = "Get-ChildItem 'C:\\it''s here'\n| Select -First 1";
+        let w = wrap_pwsh(cmd);
+        assert!(w.starts_with(' '), "leading space, as the hook injection");
+        assert!(w.ends_with('\r'), "Enter");
+        assert_eq!(w.matches(['\r', '\n']).count(), 1, "exactly one line: {w:?}");
+        assert!(!w.contains('\x1b'), "no raw ESC: the echo must not look like a sentinel");
+        let b64 = w.split("FromBase64String('").nth(1).unwrap().split('\'').next().unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+        assert_eq!(String::from_utf8(decoded).unwrap(), cmd);
+    }
+
+    #[test]
+    fn output_chunks_replace_what_was_painted() {
+        let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+        let (a, b) = (b64("line one\r\n"), b64("two\r\n"));
+        // ConPTY repaint noise around the chunks is dropped; chunks join in order.
+        let mut c = Capture::new();
+        c.feed(b"echo\x1b]7771;s\x07\x1b[?25l");
+        c.feed(format!("\x1b]7771;o;{a}\x07\x1b[H\x1b]7771;o;").as_bytes());
+        c.feed(format!("{b}\x07\x1b]7771;e;0\x07").as_bytes());
+        assert_eq!(c.into_result(), (b"line one\r\ntwo\r\n".to_vec(), 0));
+        // No chunks (POSIX shells): the payload as printed.
+        let mut c = Capture::new();
+        c.feed(b"\x1b]7771;s\x07plain\r\n\x1b]7771;e;0\x07");
+        assert_eq!(c.into_result().0, b"plain\r\n");
+        // A command with no output still sends nothing, and gives nothing.
+        assert_eq!(out_chunks(b"\x1b[?25h"), None);
+    }
+
+    #[test]
+    fn pwsh_exit_code_mapping() {
+        let w = wrap_pwsh("x");
+        // $LASTEXITCODE is cleared before the command, so a nonzero value is its own.
+        assert!(w.contains("$global:LASTEXITCODE = 0;"));
+        let reset = w.find("$global:LASTEXITCODE = 0").unwrap();
+        assert!(reset < w.find("Invoke-Expression").unwrap());
+        // Native exit code first, then $?/$Error (the hook's 133;D order: success → 0, else 1).
+        assert!(w.contains("$(if ($global:LASTEXITCODE) { $global:LASTEXITCODE } elseif ($__charon_ok) { 0 } else { 1 })"), "{w}");
+        // A terminating error is caught, still reaching the end sentinel as a failure.
+        assert!(w.contains("catch { $__charon_ok = $false;"));
+        // Output is collected and sent in the sentinel stream, not drawn.
+        assert!(w.contains("*>&1 | Out-String; $__charon_ok = $?"), "{w}");
+        assert!(w.contains("]7771;o;"), "{w}");
+        // What PowerShell prints comes through the same Capture as POSIX shells.
+        let mut c = Capture::new();
+        assert!(c.feed(w.replace('\r', "\r\n").as_bytes()).is_empty(), "echo swallowed");
+        assert!(c.feed(b"\x1b]7771;s\x07charon\r\n\x1b]7771;e;3\x07").is_empty());
+        let shown = c.feed(b"\x1b]133;D;1\x07\x1b]133;A\x07PS C:\\> \x1b]133;B\x07");
+        assert!(shown.is_empty() && c.done());
+        assert_eq!(c.into_result(), (b"charon\r\n".to_vec(), 3));
+    }
+
+    #[test]
+    fn swallowed_cursor_queries_are_answered_but_shown_ones_are_left_to_the_terminal() {
+        let mut c = Capture::new();
+        // PSReadLine's queries inside the window, one split across chunks.
+        assert!(c.feed(b"echo...\x1b[6n\x1b]7771;s\x07out\x1b[").is_empty());
+        assert!(c.feed(b"6n\x1b]7771;e;0\x07\x1b[?1h\x1b[6n").is_empty());
+        assert_eq!(c.take_replies(), Some((b"\x1b[1;1R\x1b[1;1R\x1b[1;1R".to_vec(), 3)));
+        assert_eq!(c.take_replies(), None, "answered once");
+        // The query after the visible prompt reaches the terminal, which answers it.
+        let shown = c.feed(b"\x1b]133;B\x07\x1b[?1h\x1b[6n");
+        assert_eq!(shown, b"\x1b[?1h\x1b[6n");
+        assert_eq!(c.take_replies(), None);
+    }
+
+    #[test]
+    fn prompt_state_tracks_unanswered_cursor_queries() {
+        let mut p = PromptState::default();
+        p.output(b"\x1b]133;B\x07\x1b[?1h\x1b[");
+        assert!(!p.awaiting_report());
+        p.output(b"6n");
+        assert!(p.awaiting_report(), "query split across chunks");
+        p.input(b"\x1b[3;5R");
+        assert!(!p.awaiting_report(), "the terminal answered");
+        p.output(b"\x1b[6n\x1b[6n");
+        p.answered(2);
+        assert!(!p.awaiting_report(), "answered by the capture");
+        p.input(b"\x1b[1;1R");
+        assert!(!p.awaiting_report(), "an extra answer doesn't underflow");
+    }
+
+    #[test]
+    fn a_terminal_report_is_not_typing() {
+        assert!(is_terminal_report(b"\x1b[12;40R"));
+        assert!(is_terminal_report(b"\x1b[?1;2c"));
+        assert!(!is_terminal_report(b"\x1b[A"), "arrow up is typing");
+        assert!(!is_terminal_report(b"R"));
+        assert!(!is_terminal_report(b"ls\r"));
+        let mut p = PromptState::default();
+        p.output(b"\x1b]133;A\x07PS> \x1b]133;B\x07\x1b[6n");
+        p.input(b"\x1b[3;5R");
+        assert!(p.ready().is_ok(), "the cursor report left the line empty");
+    }
+
+    #[test]
+    fn uac_triggers_are_refused_before_typing() {
+        assert_eq!(uac_trigger("sudo winget install foo"), Some("sudo"));
+        assert_eq!(uac_trigger("gsudo.exe whoami"), Some("gsudo"));
+        assert_eq!(uac_trigger("Start-Process notepad -Verb RunAs"), Some("RunAs"));
+        assert_eq!(uac_trigger("saps pwsh -Verb:runas"), Some("RunAs"));
+        assert_eq!(uac_trigger("runas /user:Administrator cmd"), Some("RunAs"));
+        assert_eq!(uac_trigger("Get-ChildItem C:\\Windows"), None);
+        assert_eq!(uac_trigger("echo pseudonym; ./sudoku.exe"), None);
     }
 
     #[test]

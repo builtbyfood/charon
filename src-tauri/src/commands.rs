@@ -225,18 +225,22 @@ pub struct OpenError {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hostkey: Option<HostKeyChanged>,
+    /// need_credential: the user Charon would log in as (the connection's, else the
+    /// OS user), so the prompt can show it and let it be changed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
 }
 
 impl OpenError {
     fn other<E: std::fmt::Display>(e: E) -> Self {
-        Self { kind: "error", message: format!("{e:#}"), hostkey: None }
+        Self { kind: "error", message: format!("{e:#}"), hostkey: None, user: None }
     }
 
     /// Classify a connect failure: host key mismatches get their own kind + details.
     fn connect(e: anyhow::Error) -> Self {
         match e.downcast_ref::<SshError>() {
             Some(SshError::HostKeyChanged(d)) => {
-                Self { kind: "hostkey_changed", message: format!("{e:#}"), hostkey: Some(d.clone()) }
+                Self { kind: "hostkey_changed", message: format!("{e:#}"), hostkey: Some(d.clone()), user: None }
             }
             _ => Self::other(e),
         }
@@ -292,11 +296,12 @@ pub async fn session_open_ssh(state: State<'_, AppState>, req: OpenSsh) -> Resul
                     kind: "need_credential",
                     message: format!("credential {name:?} is not in the vault"),
                     hostkey: None,
+                    user: Some(user.clone()),
                 })
             }
         }
     } else {
-        return Err(OpenError { kind: "need_credential", message: "no credential".into(), hostkey: None });
+        return Err(OpenError { kind: "need_credential", message: "no credential".into(), hostkey: None, user: Some(user.clone()) });
     };
 
     // Jump hosts: `jump_host` names a saved node (which may itself have a jump
@@ -375,11 +380,18 @@ pub async fn session_open_local(state: State<'_, AppState>, req: OpenLocal) -> C
         Ok(Some(Secret { kind: SecretKind::Password, value, .. })) => Some(value),
         _ => None,
     });
-    let params = LocalParams { shell: Some(program), args, cwd: req.cwd.or(eff.cwd), cols: req.cols, rows: req.rows, sudo_password };
+    // Elevated, `program` is sudo: name the shell it starts, for the hidden-command syntax.
+    let shell_name = req.admin.then(|| shell.clone());
+    let params = LocalParams { shell: Some(program), args, cwd: req.cwd.or(eff.cwd), cols: req.cols, rows: req.rows, sudo_password, shell_name };
     let sess = LocalSession::spawn(state.sessions.app().clone(), id.clone(), params).map_err(err)?;
     let title = if req.admin { format!("{} (admin)", basename(&shell)) } else { basename(&sess.program) };
     let mut info = SessionInfo::new(id, title, "local");
     info.node_id = req.node_id.clone();
+    // For MCP list_sessions and the tier rule (an elevated shell is never trusted by default).
+    info.admin = req.admin;
+    info.host = Some(crate::local::hostname());
+    let launched = if req.admin { &shell } else { &sess.program };
+    info.shell = Some(basename(launched).trim_end_matches(".exe").to_string());
     // Local shells get shell-integration too (only injected when a known shell is
     // detected from the prompt — pwsh/bash/zsh; cmd.exe is left alone).
     info.shell_integration = eff.shell_integration.unwrap_or(true);
@@ -506,7 +518,11 @@ pub async fn session_set_cwd(state: State<'_, AppState>, id: String, cwd: Option
 #[tauri::command]
 pub async fn session_write(state: State<'_, AppState>, id: String, data_b64: String) -> CmdResult<()> {
     let bytes = base64::engine::general_purpose::STANDARD.decode(data_b64).map_err(err)?;
-    state.sessions.mark_user_write(&id).await;
+    // xterm answering the shell's cursor query (pwsh asks at every prompt) is not
+    // the user typing; counted as typing it would hold off MCP run_command for 3 s.
+    if !crate::hidden::is_terminal_report(&bytes) {
+        state.sessions.mark_user_write(&id).await;
+    }
     state.sessions.get(&id).await.map_err(err)?.write(&bytes).await.map_err(err)
 }
 

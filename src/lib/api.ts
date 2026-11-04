@@ -46,9 +46,9 @@ export interface Profile {
   name: string;
   appearance: { font: string; font_size: number; theme: string; scrollback: number; renderer: "webgl" | "canvas" | "dom" | string; [k: string]: unknown };
   terminal: { timestamps?: boolean; trace_output?: boolean; copy_on_select: boolean; ctrl_c_copies_when_selected: boolean; middle_click_paste: boolean; right_click?: "moba" | "menu" | string; bracketed_paste: boolean; paste_guard_lines: number; paste_run?: "auto" | "wait" | string; linux_repaint?: LinuxRepaint; [k: string]: unknown };
-  files?: { auto_open?: boolean; parallel_transfers?: number; [k: string]: unknown };
+  files?: { auto_open?: boolean; parallel_transfers?: number; pane_width?: number; hidden_columns?: string[]; column_widths?: Record<string, number>; [k: string]: unknown };
   sudo?: { auto_send?: boolean; [k: string]: unknown };
-  local?: { credential?: string; [k: string]: unknown };
+  local?: { credential?: string; mcp_tier?: "read" | "exec-approve" | "trusted" | string; [k: string]: unknown };
   clipboard: { strip_zero_width: boolean; nbsp_to_space: boolean; smart_quotes_to_ascii: boolean; trim_trailing_whitespace: boolean; crlf_to_lf: boolean; [k: string]: unknown };
   commands: { mark_gutter: boolean; tint_failed_commands: boolean; jump_keys: string[]; [k: string]: unknown };
   ssh: { keepalive_seconds: number; [k: string]: unknown };
@@ -68,10 +68,12 @@ export const saveConnection = (node: Node) => invoke<void>("save_connection", { 
 export const deleteConnection = (id: string) => invoke<void>("delete_connection", { id });
 
 /** Set `settings.credential` on a saved node without the caller holding the tree. */
-export async function linkCredential(nodeId: string, credential: string | undefined): Promise<void> {
+/** Point a saved connection at a vault credential; `user`, when given, is stored
+ *  with it (the name typed at the login prompt, which the credential goes with). */
+export async function linkCredential(nodeId: string, credential: string | undefined, user?: string): Promise<void> {
   const n = (await listConnections()).find((x) => x.id === nodeId);
   if (!n) return;
-  await saveConnection({ ...n, settings: { ...n.settings, credential } });
+  await saveConnection({ ...n, settings: { ...n.settings, credential, ...(user ? { user } : {}) } });
 }
 
 // Importers. `path` overrides the source's default location.
@@ -134,7 +136,7 @@ export interface HostKeyChanged {
   /** true: the stale line is in Charon's own known_hosts and `hostkeyForget` can drop it. */
   own: boolean;
 }
-export interface OpenError { kind: "need_credential" | "hostkey_changed" | "error"; message: string; hostkey?: HostKeyChanged }
+export interface OpenError { kind: "need_credential" | "hostkey_changed" | "error"; message: string; hostkey?: HostKeyChanged; user?: string }
 export const hostkeyForget = (host: string, port: number) => invoke<number>("hostkey_forget", { host, port });
 /** The OpenSSH command that removes a host from ~/.ssh/known_hosts. */
 export const sshKeygenRemove = (host: string, port: number) =>

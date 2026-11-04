@@ -18,6 +18,7 @@
     shell?: Shell; cwd?: string; program: string; sshUser?: string; promptUser?: string;
     filesOpen: boolean; filesWidth: number;
     stamps: Stamp[]; startedShell: string;
+    loginAs?: string;
   }
   import type { SavedMark, Shell } from "./osc133";
   import type { Stamp } from "./stamps";
@@ -55,8 +56,9 @@
   import { CommandTracker, InjectionSwallower, detectShell, injectionFor, hookTextFor, looksLikeShellPrompt, looksLikeSudoPrompt, sudoUserOf, sudoAutoEligible, promptUserOf } from "./osc133";
   import { sudoHasPassword, sudoSendPassword, sessionShells, connectionSetRemoteShell, type HostShells } from "./api";
   import { gutterRows, type GutterRow } from "./stamps";
+  import { clampPane, PANE_DEFAULT, type ColLayout } from "./filecols";
 
-  let { open, adopt, color, font, prefs, active = true, os, osUser, onfontsize, ontimestamps, onclosed, onabort, oncwd, onopenfile, onfiles, oncommand }: {
+  let { open, adopt, color, font, prefs, active = true, os, osUser, onfontsize, ontimestamps, onclosed, onabort, oncwd, onopenfile, onfiles, onfileslayout, oncommand }: {
     open: OpenTarget;
     /** Arrived from another window: restore this instead of connecting. */
     adopt?: TabSnapshot;
@@ -86,6 +88,8 @@
     onopenfile?: (path: string, fs: string | null, origin: string | null, via: FsVia) => void;
     /** The file pane was shown/hidden (tab-bar button state). */
     onfiles?: (open: boolean) => void;
+    /** The file pane was resized or its columns changed; the owner persists it (other tabs follow prefs). */
+    onfileslayout?: (l: { width?: number; columns?: ColLayout }) => void;
     /** The command being typed changed (for the Docs pane): (command|null, session|null). */
     oncommand?: (command: string | null, session: string | null) => void;
   } = $props();
@@ -138,7 +142,16 @@
   let chipMenu = $state<{ x: number; y: number } | null>(null);
   // File pane (Ctrl+Shift+E): SFTP for SSH, local disk for local tabs; serial has none.
   let filesOpen = $state(false);
-  let filesWidth = $state(420);
+  // Width as dragged; shown clamped so the terminal keeps its minimum (filecols.ts).
+  let filesWidth = $state(untrack(() => prefs.filesWidth));
+  let splitW = $state(0);
+  const paneW = $derived(clampPane(filesWidth, splitW));
+  // Saved in another tab (or the profile reloaded): follow it.
+  let savedWidth = untrack(() => prefs.filesWidth);
+  $effect(() => {
+    const w = prefs.filesWidth;
+    if (w !== savedWidth) { savedWidth = w; untrack(() => (filesWidth = w)); }
+  });
   const hasFiles = $derived(open.kind !== "serial");
   export function toggleFiles() { if (hasFiles) { filesOpen = !filesOpen; onfiles?.(filesOpen); if (!filesOpen) term?.focus(); } }
   export function filesShown(): boolean { return filesOpen; }
@@ -165,13 +178,28 @@
       : `cd -- ${sq(path)}`;
     sessionWrite(sessionId, `${cmd}\n`);
   }
+  // The divider: drag to resize the pane (the terminal refits as it narrows or widens,
+  // via the ResizeObserver below, and the remote gets the new size), double-click for
+  // the default width.
   function startPaneDrag(e: PointerEvent) {
-    const startX = e.clientX, startW = filesWidth;
+    if (e.button !== 0) return;
+    const startX = e.clientX, startW = paneW;
     const target = e.currentTarget as HTMLElement;
     target.setPointerCapture(e.pointerId);
-    const move = (ev: PointerEvent) => { filesWidth = Math.max(240, Math.min(window.innerWidth * 0.7, startW - (ev.clientX - startX))); };
-    const stop = () => { target.removeEventListener("pointermove", move); target.removeEventListener("pointerup", stop); fit?.fit(); };
+    const move = (ev: PointerEvent) => { filesWidth = clampPane(startW - (ev.clientX - startX), splitW); };
+    const stop = () => {
+      target.removeEventListener("pointermove", move); target.removeEventListener("pointerup", stop);
+      filesWidth = paneW;
+      if (filesWidth !== startW) setPaneWidth(filesWidth);
+    };
     target.addEventListener("pointermove", move); target.addEventListener("pointerup", stop);
+  }
+  function setPaneWidth(w: number) {
+    filesWidth = w;
+    savedWidth = w;
+    onfileslayout?.({ width: w });
+    // Fit now rather than wait for the observer, so the log shows the new size.
+    requestAnimationFrame(() => { fit?.fit(); console.info(`[charon] files: pane width=${paneW} term=${term?.cols}x${term?.rows}`); });
   }
 
   // Search overlay (Ctrl+Shift+F).
@@ -243,12 +271,18 @@
 
   // Inline credential form, shown only when nothing in the vault matches.
   let password = $state("");
+  // SSH login prompt: the user to log in as. `defaultUser` is what Charon would use
+  // (the connection's, else the OS user); typing another sets `loginAs`, which this
+  // tab then uses for every (re)connect — like answering "login as:" in PuTTY/Moba.
+  let authUser = $state("");
+  let defaultUser = $state<string | undefined>();
+  let loginAs = $state<string | undefined>();
   let saveAs = $state("");
   let authError = $state("");
   let passwordEl = $state<HTMLInputElement | null>(null);
   const HIDE_CURSOR = "\x1b[?25l";
   const SHOW_CURSOR = "\x1b[?25h";
-  const defaultSaveName = () => `${open.user ?? ""}${open.user ? "@" : ""}${open.host ?? open.nodeId ?? "host"}`;
+  const defaultSaveName = () => { const u = authUser.trim() || open.user; return `${u ?? ""}${u ? "@" : ""}${open.host ?? open.nodeId ?? "host"}`; };
 
   onMount(async () => {
     term = new Terminal({
@@ -420,7 +454,7 @@
       screen: serializer.serialize(), cols: term.cols, rows: term.rows,
       marks: tracker.exportMarks(),
       osc133, integrationEnabled, injectDone, reason, shell, cwd, program, sshUser, promptUser,
-      filesOpen, filesWidth,
+      filesOpen, filesWidth, loginAs,
       stamps: stampMarks.filter((s) => !s.marker.isDisposed).map((s) => ({ line: s.marker.line, t: s.t })),
       startedShell,
     };
@@ -439,7 +473,7 @@
     tracker.importMarks(a.marks);
     osc133 = a.osc133; markCount = tracker.marks.length; integrationEnabled = a.integrationEnabled;
     injectDone = a.injectDone; reason = a.reason; shell = a.shell; cwd = a.cwd; program = a.program;
-    sshUser = a.sshUser; promptUser = a.promptUser; filesWidth = a.filesWidth; startedShell = a.startedShell;
+    sshUser = a.sshUser; promptUser = a.promptUser; filesWidth = a.filesWidth; startedShell = a.startedShell; loginAs = a.loginAs;
     // Writing the screen back stamped its lines "now"; the real times come with it.
     for (const st of stampMarks) st.marker.dispose();
     stampMarks = [];
@@ -497,7 +531,7 @@
         : open.kind === "serial"
         ? await openSerial({ id, node_id: open.nodeId, cols: term.cols, rows: term.rows })
         : await openSsh({
-            id, node_id: open.nodeId, host: open.host, user: open.user, port: open.port,
+            id, node_id: open.nodeId, host: open.host, user: loginAs ?? open.user, port: open.port,
             password: pw, cols: term.cols, rows: term.rows, remote_shell: shellOverride,
           });
       sessionId = info.id;
@@ -511,7 +545,7 @@
       else { reason = "off in settings"; console.info("[charon] 133: detected=none injected=false reason=disabled by node/folder setting"); }
       await listenSession(info.id);
       term.focus();
-      if (pw && saveAs.trim()) await saveTypedPassword(pw, saveAs.trim());
+      if (pw && saveAs.trim()) await saveTypedPassword(pw, saveAs.trim(), loginAs);
       password = "";
     } catch (e) {
       const oe = isOpenError(e) ? e : { kind: "error" as const, message: String(e) };
@@ -520,6 +554,8 @@
       if (oe.kind === "need_credential" || (pw !== undefined && /authentication rejected/.test(oe.message))) {
         // Ask (again) inline. First time: no message; retry: say why.
         authError = pw !== undefined ? oe.message : "";
+        if (oe.user) defaultUser = oe.user;
+        if (!authUser) authUser = loginAs ?? oe.user ?? open.user ?? "";
         status = "auth";
         password = "";
         queueMicrotask(() => passwordEl?.focus());
@@ -586,6 +622,9 @@ ${HIDE_CURSOR}`); onclosed(r); }, data: (raw, m) => {
     console.info("[charon] host key answer", { session: hostkey.session, accept });
     try {
       await sshHostKeyAnswer(hostkey.session, accept);
+      // Accepted: the key is saved and login carries on; show that rather than
+      // leaving the key panel up until authentication finishes.
+      if (accept) { hostkey = null; status = "connecting"; }
     } catch (e) {
       hkAnswered = null;
       hkError = String(e);
@@ -606,10 +645,10 @@ ${HIDE_CURSOR}`); onclosed(r); }, data: (raw, m) => {
     }
   }
 
-  async function saveTypedPassword(pw: string, name: string) {
+  async function saveTypedPassword(pw: string, name: string, user?: string) {
     try {
       await vaultSet(name, { kind: "password", value: pw });
-      if (open.nodeId) { await linkCredential(open.nodeId, name); notifyChanged("connections"); }
+      if (open.nodeId) { await linkCredential(open.nodeId, name, user); notifyChanged("connections"); }
       notifyChanged("vault");
     } catch (e) {
       term.write(`\r\n\x1b[33mcould not save credential: ${String(e)}\x1b[0m\r\n`);
@@ -619,6 +658,8 @@ ${HIDE_CURSOR}`); onclosed(r); }, data: (raw, m) => {
   function submitAuth(e: SubmitEvent) {
     e.preventDefault();
     if (!password) return;
+    const u = authUser.trim();
+    loginAs = u && u !== defaultUser ? u : undefined;
     connect(password);
   }
 
@@ -1251,7 +1292,7 @@ ${HIDE_CURSOR}`); onclosed(r); }, data: (raw, m) => {
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div class="wrap" style:--session-color={color ?? "var(--accent)"}>
-  <div class="split">
+  <div class="split" bind:clientWidth={splitW}>
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div class="termbox" oncontextmenu={onContextMenu}>
     {#if prefs.timestamps}
@@ -1271,9 +1312,11 @@ ${HIDE_CURSOR}`); onclosed(r); }, data: (raw, m) => {
     {/if}
   </div>
   {#if filesOpen && hasFiles && sessionId}
-    <div class="vsplit" role="separator" aria-orientation="vertical" aria-label="Resize file pane" onpointerdown={startPaneDrag}></div>
-    <div class="files" style:width="{filesWidth}px">
+    <div class="vsplit" role="separator" aria-orientation="vertical" aria-label="Resize file pane" title="Drag to resize; double-click for the default width"
+      onpointerdown={startPaneDrag} ondblclick={() => setPaneWidth(PANE_DEFAULT)}></div>
+    <div class="files" style:width="{paneW}px">
       <SftpPane session={open.kind === "local" ? null : sessionId} {cwd} {color} {sshUser} shellUser={promptUser} isIdle={shellIdle} parallel={prefs.filesParallel}
+        columns={prefs.filesColumns} oncolumns={(c) => onfileslayout?.({ columns: c })}
         onopen={onopenfile ? (p, via) => onopenfile?.(p, open.kind === "local" ? null : sessionId, sessionId, via) : undefined}
         onchdir={chdir} onclose={toggleFiles} />
     </div>
@@ -1343,7 +1386,12 @@ ${HIDE_CURSOR}`); onclosed(r); }, data: (raw, m) => {
   {/if}
   {#if status === "auth"}
     <form class="auth" onsubmit={submitAuth}>
-      <span class="who">{open.user ? open.user + "@" : ""}{open.host ?? "saved host"}</span>
+      {#if open.kind === "ssh"}
+        <input class="user" placeholder="user" bind:value={authUser} autocomplete="off" spellcheck="false"
+          title="User to log in as (the connection has none set: the default is your OS user)" /><span class="who">@{open.host ?? "saved host"}</span>
+      {:else}
+        <span class="who">{open.user ? open.user + "@" : ""}{open.host ?? "saved host"}</span>
+      {/if}
       <input type="password" placeholder="Password" bind:value={password} bind:this={passwordEl}
         autocomplete="off" spellcheck="false" />
       <label class="save">
@@ -1406,6 +1454,8 @@ ${HIDE_CURSOR}`); onclosed(r); }, data: (raw, m) => {
   .auth input[type="password"] { width: 180px; font-family: var(--font-mono); }
   .auth .save { display: flex; align-items: center; gap: 4px; color: var(--fg-dim); }
   .auth .name { width: 160px; font-family: var(--font-mono); }
+  .auth .user { width: 110px; font-family: var(--font-mono); }
+  .auth .user + .who { margin-left: -4px; }
   .auth .name:disabled { opacity: .4; }
   .auth .err { color: var(--danger); }
   .hostkey { padding: 8px 10px; background: var(--bg-raised); border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 4px; font-size: 12px; }

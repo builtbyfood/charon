@@ -5,7 +5,8 @@
 //! owner of sessions.
 //!
 //! Permission tiers come from each session's node (`Settings.mcp_tier`,
-//! inherited): `read` = list/read/get_connection only; `exec-approve` =
+//! inherited); without one, `mcp.default_tier`, or for local shells
+//! `local.mcp_tier` (Local (admin): read). `read` = list/read/get_connection only; `exec-approve` =
 //! run_command / sftp_put pop an in-app approval; `trusted` = no prompt. Every
 //! call is appended to `data/mcp.log`.
 

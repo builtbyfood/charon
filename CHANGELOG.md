@@ -4,6 +4,115 @@ All notable changes to Charon are recorded here. Versions follow semver; the
 canonical version lives in `src-tauri/tauri.conf.json` and is propagated to
 `package.json` and `Cargo.toml` by `npm run bump` (`scripts/bump-version.mjs`).
 
+## 0.3.9
+
+### MCP (PowerShell fixes; the 0.3.8 CI failures)
+- **Windows: `run_command` lost cmdlet output** (`Write-Output x` came back
+  empty; the Windows CI job failed on it). ConPTY passes Charon's OSC sentinels
+  straight through but repaints printed text a moment later, so the output
+  arrived after the end sentinel and was swallowed with the redrawn prompt.
+  Going through `Out-Host` (or `[Console]::Write`) didn't change that. The
+  output now travels in the sentinel stream itself: PowerShell collects it
+  (`*>&1 | Out-String`) and sends it as base64 `OSC 7771;o` chunks, which the
+  capture decodes. Nothing is painted, so nothing can leak to the screen either.
+  A slow native command (`cmd /c ...`) had hidden the bug by giving the repaint
+  time.
+- **Linux/macOS: pwsh hung, or quit, on a hidden command.** PSReadLine asks the
+  terminal where the cursor is (`ESC[6n`) and waits for the answer. Three fixes:
+  - Charon now answers the queries it hides, for local tabs and SSH alike.
+  - A hidden command waits up to 1 s while a visible query is still unanswered.
+    Typed earlier, it was read as the answer and lost.
+  - The terminal's answer no longer counts as typing, which had made the next
+    `run_command` wait 3 s or fail with "text on the command line".
+
+### Merge
+- This release joins two lines that both grew from 0.3.5: the GitHub one (file
+  pane drops/columns, MCP on local tabs, Local tab tier) and the SSH fixes
+  (editable login user; keyboard-interactive before password, 30 s per auth
+  step). Their changelogs share the 0.3.6 and 0.3.7 headings below.
+
+## 0.3.8
+
+### MCP
+- **Settings for the Local tab's tier**: MCP panel → *Local tab tier* (read /
+  exec-approve / trusted) sets `local.mcp_tier`, the tier of the plain *Local*
+  button, so you no longer have to edit the profile. Choosing trusted shows a
+  warning. Saved local connections keep their own tier, and *Local (admin)* stays
+  read unless its connection says otherwise.
+
+## 0.3.7
+
+### MCP
+- **MCP works on local tabs.** `run_command` used to do nothing in a local
+  shell. It now runs the command hidden, exactly as on SSH: the line is typed
+  wrapped in sentinels, and the output is captured until the prompt comes back.
+  This works in bash and zsh (Linux, macOS) and in PowerShell 5.1 and 7, where
+  the command goes as one base64 `Invoke-Expression` line. As on SSH, it runs
+  only at an idle, empty prompt, with one MCP command per tab at a time, and not
+  while you are typing. Keystrokes made during a hidden command are held until
+  it ends. fish and cmd.exe tabs get a clear "needs bash, zsh or PowerShell"
+  error.
+- PowerShell exit codes follow the hook's `133;D` rule (success → 0, else
+  `$LASTEXITCODE`, else 1). `$LASTEXITCODE` is cleared first, so a native exit
+  code is the command's own. A cmdlet error or a `throw` gives 1.
+- `list_sessions` shows local tabs with `kind = local`, `host` = this machine's
+  name, the shell, the cwd and the tier. `read_scrollback`, `sftp_get`/`sftp_put`
+  (on the local disk) and `open_in_editor` work on them too.
+- **Tiers for local tabs:** a saved local connection uses its own `mcp_tier`.
+  The bare *Local* button uses the new profile setting `local.mcp_tier` (default
+  `read`). *Local (admin)* is always `read` unless its connection says
+  otherwise, so an elevated shell is never trusted by default.
+- `sudo` in a local hidden command is gated as on SSH. At exec-approve it needs
+  the approval dialog's "allow sudo password" box; at trusted it needs the
+  connection's `mcp_sudo`. The answer is the stored local credential, given only
+  to your own `[sudo] password for <you>:` prompt. On Windows, a command that
+  would raise a UAC prompt (`sudo`, `gsudo`, `runas`, `-Verb RunAs`) is refused
+  straight away rather than hanging until the timeout.
+
+### SSH
+- **Fixed: logins hanging after "accept and save" on some servers** (a UniFi
+  Dream Machine, a NAS: OpenSSH that offers only `publickey,keyboard-interactive`).
+  Charon tried the plain password method first; once the server refused it, the
+  keyboard-interactive request never got an answer (russh 0.45). It now tries
+  keyboard-interactive first, and every login step gives up after 30 s with an
+  error instead of waiting forever. The tab also leaves the host key panel as
+  soon as the key is accepted.
+
+## 0.3.6
+
+### File pane
+- **Dropping files on the file pane uploads them on Linux** (Fedora, scaled
+  displays): a `.txt` or script dropped on the pane opened in the editor instead.
+  WebKitGTK reports drop positions in CSS pixels although Tauri labels them
+  physical, and the hit-test divided them by the display scale, so it landed up
+  and to the left of the pointer, on the terminal. Only Windows positions are
+  scaled now, and one router (`filedrop.ts`) decides every drop: on a file pane →
+  upload into its directory, whatever the file type; on a terminal or the editor
+  tab → open in the editor; anywhere else (sidebar, tab bar) → nothing. Drops on
+  a terminal in a tab window open in the main window's editor.
+- The pane's drop highlight now shows on Linux too. `[charon] drop:` lines log
+  the raw position, devicePixelRatio, the converted point and the element hit.
+- **Resize the file pane** with the divider beside the terminal; double-click it
+  for the default width (420 px). The pane keeps at least 240 px and the terminal
+  at least 320 px, also when the window shrinks. The terminal refits as it
+  narrows or widens and the remote gets the new size. The width is saved as
+  `files.pane_width` and every tab's pane follows it.
+- **File list columns**: drag a header edge to resize Name, Size, Modified or
+  Perm; double-click the edge to fit the contents. Right-click the header to
+  hide or show columns (Name always shows), *Fit all columns* or *Reset
+  columns*. Saved as `files.column_widths` and `files.hidden_columns`. Name
+  fills the free space until it is given a width of its own; past the columns'
+  total width the list scrolls sideways.
+
+### SSH
+- **The login prompt asks for the user too.** A connection with no user set
+  (common after a MobaXterm import, where Moba asks "login as:" each time) logged
+  in as your OS user with no way to change it, so a server that wants `root`
+  (a UniFi Dream Machine, for one) rejected every password. The prompt now shows
+  the user Charon will use, editable; the one you type is used for that tab's
+  reconnects and, with "save to vault as", saved on the connection with the
+  password.
+
 ## 0.3.5
 
 ### Linux

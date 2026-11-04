@@ -8,7 +8,6 @@
   import { diag } from "./lib/diag";
   import VaultUnlock from "./lib/VaultUnlock.svelte";
   import ContextMenu, { type MenuItem } from "./lib/ContextMenu.svelte";
-  import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { appInfo, vaultStatus, getProfile, saveProfile, announceProfile, onProfileSaved, sessionWrite, mcpAnswer, onMcpApprove, onMcpOpenEditor,
     tabStash, tabTake, tabDropTarget, tabWindowOpen, tabSend, windowCloseSelf, tabsSaved, tabsSave, listConnections, onTabAdopt, editorOpenInMain, onEditorOpenReq, traceOutput,
@@ -16,6 +15,8 @@
   import { prefsFromProfile, DEFAULTS, type Prefs, type SessionFont } from "./lib/prefs";
   import { applyTheme, resolveTheme, rememberTheme, type ThemePref } from "./lib/themes";
   import { dropIndex, reorder } from "./lib/tabdrag";
+  import type { ColLayout } from "./lib/filecols";
+  import { addDropTarget } from "./lib/filedrop";
   import { restorePlan, toSaved } from "./lib/opentabs";
   import { startTicker } from "./lib/ticker.svelte";
 
@@ -148,6 +149,24 @@
     }
   }
 
+  /** MCP tier of the bare Local tab (MCP panel); read by the backend on each call once saved. */
+  function setLocalMcpTier(tier: string) {
+    if (!profile) return;
+    (profile.local ??= {}).mcp_tier = tier;
+    persistProfile();
+  }
+  /** File pane width / columns from any tab's pane; new panes and the other tabs follow. */
+  function setFilesLayout(l: { width?: number; columns?: ColLayout }) {
+    if (!profile) return;
+    const files = (profile.files ??= {});
+    if (l.width !== undefined) files.pane_width = l.width;
+    if (l.columns) {
+      files.column_widths = Object.fromEntries(Object.entries(l.columns.widths).filter((e): e is [string, number] => !!e[1]));
+      files.hidden_columns = [...l.columns.hidden];
+    }
+    prefs = prefsFromProfile(profile);
+    persistProfile();
+  }
   function setFontSize(size: number) {
     if (!profile) return;
     profile.appearance.font_size = size;
@@ -201,6 +220,9 @@
       diag.trace = await traceOutput(null).catch(() => diag.trace);
     });
     vault = await vaultStatus();
+    // Files dropped on a terminal or the editor tab open in the editor (the main
+    // window's); a file pane inside a terminal takes its own drops (filedrop.ts).
+    addDropTarget({ zone: "editor", drop: (paths) => { for (const p of paths) openFromUi(p, null, null); } });
     // Tabs arriving from other windows; a new tab window starts with the one it was made for.
     await onTabAdopt((p) => adoptTab(p.token, p.x));
     if (!isMain) {
@@ -226,15 +248,6 @@
         else if (p.session && p.remote_path) await openInEditor(p.remote_path, p.session, p.session, p.as_root ? "sudo" : "sftp", opts);
         mcpAnswer(p.req_id, { ok: true });
       } catch (e) { mcpAnswer(p.req_id, { ok: false, error: String(e) }); }
-    });
-    // Files dropped on the window open in the editor — unless they land on a file
-    // pane, which uploads them itself (it marks its element data-drop="files").
-    await getCurrentWebview().onDragDropEvent((e) => {
-      if (e.payload.type !== "drop") return;
-      const s = window.devicePixelRatio || 1;
-      const target = document.elementFromPoint(e.payload.position.x / s, e.payload.position.y / s);
-      if (target?.closest("[data-drop='files']")) return;
-      for (const p of e.payload.paths) openFromUi(p, null, null);
     });
   });
 
@@ -410,12 +423,12 @@
         </div>
       {/if}
       {#each tabs as t (t.id)}
-        <div class="pane" hidden={active !== t.id}>
+        <div class="pane" hidden={active !== t.id} data-drop="editor">
           {#if t.editor}
             <EditorPane bind:this={editorPane} onsend={sendToSession} ondirty={(d) => (editorDirty = d)} />
           {:else if t.open}
             <Terminal bind:this={terms[t.id]} open={t.open} adopt={t.adopt} color={t.color} font={t.font} {prefs} active={active === t.id} os={info?.os} osUser={info?.user} onfontsize={setFontSize} ontimestamps={setTimestamps} onclosed={() => {}} onabort={() => closeTab(t.id)}
-              onopenfile={openFromUi} onfiles={(o) => (filesOpen[t.id] = o)}
+              onopenfile={openFromUi} onfiles={(o) => (filesOpen[t.id] = o)} onfileslayout={setFilesLayout}
               oncommand={(cmd, sess) => { if (isMain && active === t.id) { docsCommand = cmd; docsSession = sess; } }} />
           {/if}
         </div>
@@ -446,7 +459,7 @@
     ontheme={setTheme} onfont={setFont} onrenderer={setRenderer} ontrace={setTrace} onrestoretabs={setRestoreTabs} onclose={() => (settingsOpen = false)} />
 {/if}
 {#if mcpOpen}
-  <McpPanel onclose={() => (mcpOpen = false)} />
+  <McpPanel localTier={profile?.local?.mcp_tier ?? "read"} onlocaltier={setLocalMcpTier} onclose={() => (mcpOpen = false)} />
 {/if}
 {#if approve}
   <div class="backdrop" role="presentation">

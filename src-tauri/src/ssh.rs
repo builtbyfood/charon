@@ -15,6 +15,10 @@ use std::sync::Arc;
 use tauri::Emitter;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
+/// How long one authentication step may take (a wrong password costs the server's
+/// failure delay, a few seconds) before we stop waiting for a server that went quiet.
+const AUTH_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// How long the user gets to answer the host key prompt before we give up.
 const HOSTKEY_PROMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
@@ -279,19 +283,20 @@ async fn authenticate(handle: &mut Handle<Handler>, user: &str, host: &str, auth
     let authed = match auth {
         Auth::Key { key, passphrase } => {
             let key = Auth::load_key(key, passphrase.as_deref())?;
-            handle.authenticate_publickey(user, Arc::new(key)).await?
+            step(async { Ok(handle.authenticate_publickey(user, Arc::new(key)).await?) }, "public key").await?
         }
         Auth::Password(pw) => {
-            // Try the plain "password" method first, then fall back to keyboard-
-            // interactive with the same password. Many servers (HPE iLO, and any
-            // OpenSSH with `PasswordAuthentication no` + `KbdInteractiveAuthentication
-            // yes`) accept a password *only* through keyboard-interactive, which they
-            // often present as an "MFA"/challenge — so a plain password attempt is
-            // rejected and it looks like MFA is required when it isn't.
-            if handle.authenticate_password(user, pw).await? {
+            // Keyboard-interactive first, then the plain "password" method. Many
+            // servers (HPE iLO, UniFi OS, any OpenSSH with `PasswordAuthentication no`
+            // + `KbdInteractiveAuthentication yes`) take a password *only* through
+            // keyboard-interactive. The other order hangs with russh 0.45 on those:
+            // after the server refuses "password", the keyboard-interactive request
+            // never gets an answer (seen on a UDM and a NAS, both OpenSSH 8.4+).
+            // A server without keyboard-interactive answers Failure at once.
+            if step(keyboard_interactive(handle, user, pw), "keyboard-interactive").await? {
                 true
             } else {
-                keyboard_interactive(handle, user, pw).await?
+                step(async { Ok(handle.authenticate_password(user, pw).await?) }, "password").await?
             }
         }
     };
@@ -299,6 +304,13 @@ async fn authenticate(handle: &mut Handle<Handler>, user: &str, host: &str, auth
         return Err(anyhow!("authentication rejected for {user}@{host}"));
     }
     Ok(())
+}
+
+/// One auth exchange, bounded by `AUTH_STEP_TIMEOUT`.
+async fn step<F: std::future::Future<Output = Result<bool>>>(f: F, what: &str) -> Result<bool> {
+    tokio::time::timeout(AUTH_STEP_TIMEOUT, f)
+        .await
+        .map_err(|_| anyhow!("no answer from the server during {what} authentication ({}s)", AUTH_STEP_TIMEOUT.as_secs()))?
 }
 
 /// Answer keyboard-interactive prompts with the password. This covers the common
@@ -425,6 +437,8 @@ impl SshSession {
                                     let show = cap.feed(&data);
                                     // Keep ordering: drain any coalesced normal output first.
                                     if !show.is_empty() { out.flush_close(); SessionManager::emit_data(&app, &id, &show); }
+                                    // Answer swallowed cursor queries (pwsh's PSReadLine on a Unix host).
+                                    if let Some((r, n)) = cap.take_replies() { prompt.answered(n); let _ = channel.data(&r[..]).await; }
                                     // Auto-answer a sudo/su prompt so hidden commands don't hang.
                                     let pw_send = cap.take_password_send();
                                     if cap.done() { finish(capture.take(), Ok(())); }

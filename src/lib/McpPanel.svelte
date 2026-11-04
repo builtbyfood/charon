@@ -4,7 +4,13 @@
   import { onMount, onDestroy } from "svelte";
   import { writeText, mcpStatus, mcpSetEnabled, mcpRegenToken, mcpConfig, mcpLog, type McpStatus, type McpLogLine } from "./api";
 
-  let { onclose }: { onclose: () => void } = $props();
+  let { localTier = "read", onlocaltier, onclose }: {
+    /** MCP tier of the bare Local tab (profile local.mcp_tier); App owns the profile and saves it. */
+    localTier?: string;
+    onlocaltier?: (tier: string) => void;
+    onclose: () => void;
+  } = $props();
+  const TIERS = ["read", "exec-approve", "trusted"];
 
   let status = $state<McpStatus | null>(null);
   let showToken = $state(false);
@@ -50,6 +56,17 @@
       <div class="row">
         <label class="sw"><input type="checkbox" checked={status.enabled} disabled={busy} onchange={toggle} /> Enable server</label>
         <span class="state" class:on={status.running}>{status.running ? `listening on 127.0.0.1:${status.port}` : "stopped"}</span>
+      </div>
+
+      <div class="field">
+        <label for="mcp-local-tier">Local tab tier</label>
+        <div class="tokrow">
+          <select id="mcp-local-tier" value={TIERS.includes(localTier) ? localTier : "read"} onchange={(e) => onlocaltier?.(e.currentTarget.value)}>
+            {#each TIERS as t (t)}<option value={t}>{t}</option>{/each}
+          </select>
+          <span class="dim">For the plain <b>Local</b> button. A saved local connection uses its own tier; <b>Local (admin)</b> stays read unless its connection says otherwise.</span>
+        </div>
+        {#if localTier === "trusted"}<span class="warn">trusted: an agent can run any command in your local shells without asking.</span>{/if}
       </div>
 
       <div class="field">
@@ -118,6 +135,8 @@
   .subj { grid-column: 2 / -1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg); }
   .subj.why { color: var(--danger); }
   .err { color: var(--danger); margin: 0; }
+  .warn { color: var(--danger); }
+  select { flex: none; }
   .foot { display: flex; justify-content: flex-end; }
   button { padding: 2px 8px; }
 </style>
