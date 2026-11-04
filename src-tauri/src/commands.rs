@@ -513,7 +513,11 @@ pub async fn session_set_cwd(state: State<'_, AppState>, id: String, cwd: Option
 #[tauri::command]
 pub async fn session_write(state: State<'_, AppState>, id: String, data_b64: String) -> CmdResult<()> {
     let bytes = base64::engine::general_purpose::STANDARD.decode(data_b64).map_err(err)?;
-    state.sessions.mark_user_write(&id).await;
+    // xterm answering the shell's cursor query (pwsh asks at every prompt) is not
+    // the user typing; counted as typing it would hold off MCP run_command for 3 s.
+    if !crate::hidden::is_terminal_report(&bytes) {
+        state.sessions.mark_user_write(&id).await;
+    }
     state.sessions.get(&id).await.map_err(err)?.write(&bytes).await.map_err(err)
 }
 

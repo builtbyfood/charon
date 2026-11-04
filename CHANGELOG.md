@@ -4,6 +4,21 @@ All notable changes to Charon are recorded here. Versions follow semver; the
 canonical version lives in `src-tauri/tauri.conf.json` and is propagated to
 `package.json` and `Cargo.toml` by `npm run bump` (`scripts/bump-version.mjs`).
 
+## Unreleased
+
+### MCP (PowerShell fixes; the 0.3.8 CI failures)
+- **Windows: `run_command` lost cmdlet output** (`Write-Output x` came back
+  empty). PowerShell draws a line's output only after the whole line has run,
+  which was after the end sentinel. The command now goes through `Out-Host`, so
+  its output is drawn first.
+- **Linux/macOS: pwsh hung, or quit, on a hidden command.** PSReadLine asks the
+  terminal where the cursor is (`ESC[6n`) and waits for the answer. Three fixes:
+  - Charon now answers the queries it hides, for local tabs and SSH alike.
+  - A hidden command waits up to 1 s while a visible query is still unanswered.
+    Typed earlier, it was read as the answer and lost.
+  - The terminal's answer no longer counts as typing, which had made the next
+    `run_command` wait 3 s or fail with "text on the command line".
+
 ## 0.3.8
 
 ### MCP

@@ -354,6 +354,11 @@ fn emit_loop(
         crate::session::Coalescer::new(co_id, move |b: &[u8]| sink.data(b))
     };
     let mut capture: Option<(crate::hidden::Capture, Reply)> = None;
+    // A hidden command waiting to be typed: the shell still expects the terminal's
+    // answer to a cursor query (PSReadLine, right after the prompt), and would read
+    // the command as that answer. Typed once answered, or after REPORT_WAIT anyway.
+    let mut queued: Option<(Vec<u8>, Option<(String, String)>, Reply, std::time::Instant)> = None;
+    const REPORT_WAIT: Duration = Duration::from_secs(1);
     // End a capture: answer the caller, then type what the user typed meanwhile.
     let finish = |capture: &mut Option<(crate::hidden::Capture, Reply)>, r: Result<(), String>| {
         if let Some((cap, reply)) = capture.take() {
@@ -373,6 +378,9 @@ fn emit_loop(
         if capture.is_some() {
             wait = wait.min(Duration::from_millis(100));
         }
+        if queued.is_some() {
+            wait = wait.min(Duration::from_millis(20));
+        }
         match rx.recv_timeout(wait) {
             Ok(Ev::Data(chunk)) => {
                 typing.lock().unwrap().prompt.output(&chunk);
@@ -382,6 +390,11 @@ fn emit_loop(
                         if !show.is_empty() {
                             co.flush_close(); // keep ordering behind earlier output
                             sink.data(&show);
+                        }
+                        // Answer the cursor queries the capture swallowed (PSReadLine waits for them).
+                        if let Some((r, n)) = cap.take_replies() {
+                            typing.lock().unwrap().prompt.answered(n);
+                            let _ = write_pty(&writer, &r);
                         }
                         // The login user's own sudo prompt, when MCP allowed it. Never logged.
                         if let Some(pw) = cap.take_password_send() {
@@ -396,11 +409,39 @@ fn emit_loop(
                 }
             }
             Ok(Ev::Capture { line, sudo, reply }) => {
-                co.flush_close(); // don't let buffered output land inside the capture window
-                let mut t = typing.lock().unwrap();
-                if capture.is_some() {
+                if capture.is_some() || queued.is_some() {
                     let _ = reply.send(Err(anyhow!("another hidden command is still running")));
-                } else if let Err(why) = t.prompt.ready() {
+                } else {
+                    queued = Some((line, sudo, reply, std::time::Instant::now()));
+                }
+            }
+            Ok(Ev::Eof) | Err(RecvTimeoutError::Disconnected) => {
+                co.flush_close();
+                if let Some((_, _, reply, _)) = queued.take() {
+                    let _ = reply.send(Err(anyhow!("session closed")));
+                }
+                finish(&mut capture, Err("session closed".into()));
+                break;
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if co.due_in().is_some_and(|d| d.is_zero()) {
+                    co.flush_timer();
+                }
+                if let Some(r) = capture.as_mut().and_then(|(c, _)| c.tick()) {
+                    finish(&mut capture, r);
+                }
+            }
+        }
+        // Type the queued hidden command once the shell isn't waiting on the terminal.
+        if capture.is_none() {
+            if let Some((line, sudo, reply, since)) = queued.take() {
+                let mut t = typing.lock().unwrap();
+                if t.prompt.awaiting_report() && since.elapsed() < REPORT_WAIT {
+                    queued = Some((line, sudo, reply, since));
+                    continue;
+                }
+                co.flush_close(); // don't let buffered output land inside the capture window
+                if let Err(why) = t.prompt.ready() {
                     tracing::info!(session = %id, "hidden command refused: {why}");
                     let _ = reply.send(Err(anyhow!("{why}")));
                 } else if let Err(e) = write_pty(&writer, &line) {
@@ -412,19 +453,6 @@ fn emit_loop(
                         cap.set_sudo_password(pw, user);
                     }
                     capture = Some((cap, reply));
-                }
-            }
-            Ok(Ev::Eof) | Err(RecvTimeoutError::Disconnected) => {
-                co.flush_close();
-                finish(&mut capture, Err("session closed".into()));
-                break;
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                if co.due_in().is_some_and(|d| d.is_zero()) {
-                    co.flush_timer();
-                }
-                if let Some(r) = capture.as_mut().and_then(|(c, _)| c.tick()) {
-                    finish(&mut capture, r);
                 }
             }
         }
@@ -602,11 +630,18 @@ mod tests {
         assert_eq!(reason.as_deref(), Some("exit 0"));
     }
 
-    /// Collects everything the terminal would be shown.
-    struct Screen(Arc<Mutex<Vec<u8>>>);
+    /// Collects everything the terminal would be shown, and why the shell ended.
+    struct Screen(Arc<Mutex<Vec<u8>>>, Arc<Mutex<Option<String>>>);
     impl Sink for Screen {
         fn data(&self, b: &[u8]) { self.0.lock().unwrap().extend_from_slice(b); }
-        fn closed(&self, _: &str) {}
+        fn closed(&self, r: &str) { *self.1.lock().unwrap() = Some(r.to_string()); }
+    }
+
+    /// The end of the screen and the close reason, for a failure message.
+    fn dump(screen: &Mutex<Vec<u8>>, closed: &Mutex<Option<String>>) -> String {
+        let s = screen.lock().unwrap();
+        let tail = String::from_utf8_lossy(&s[s.len().saturating_sub(2000)..]).into_owned();
+        format!("closed={:?}\nscreen tail: {tail:?}", closed.lock().unwrap())
     }
 
     /// Wait until the screen (from byte `from` on) contains `needle`.
@@ -624,26 +659,48 @@ mod tests {
         false
     }
 
+    /// Be the terminal: answer each cursor-position query that reaches the screen
+    /// (PSReadLine on Unix asks at every prompt and waits), through `write` as
+    /// xterm's reply would come. Stops when the session is dropped.
+    fn answer_cursor_queries(sess: &Arc<LocalSession>, screen: &Arc<Mutex<Vec<u8>>>) {
+        let (sess, screen) = (Arc::downgrade(sess), screen.clone());
+        std::thread::spawn(move || {
+            let mut answered = 0;
+            while let Some(s) = sess.upgrade() {
+                let asked = screen.lock().unwrap().windows(4).filter(|w| *w == b"\x1b[6n").count();
+                for _ in answered..asked {
+                    let _ = futures::executor::block_on(s.write(b"\x1b[1;1R"));
+                }
+                answered = asked;
+                drop(s);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        });
+    }
+
     /// Start `program args` in a real PTY and wait for the hook's first prompt (133;B).
-    fn hooked_shell(program: &Path, args: Vec<String>) -> (Arc<LocalSession>, Arc<Mutex<Vec<u8>>>) {
+    fn hooked_shell(program: &Path, args: Vec<String>) -> (Arc<LocalSession>, Arc<Mutex<Vec<u8>>>, Arc<Mutex<Option<String>>>) {
         let screen = Arc::new(Mutex::new(Vec::new()));
+        let closed = Arc::new(Mutex::new(None));
         let p = LocalParams {
             shell: Some(program.to_string_lossy().into_owned()), args, cwd: None, cols: 120, rows: 30,
             sudo_password: None, shell_name: None,
         };
-        let sess = LocalSession::spawn_with(Screen(screen.clone()), "hidden-test", p).unwrap();
+        let sess = LocalSession::spawn_with(Screen(screen.clone(), closed.clone()), "hidden-test", p).unwrap();
+        answer_cursor_queries(&sess, &screen);
         let ok = wait_for(&screen, b"\x1b]133;B", 0, 60);
-        assert!(ok, "no hooked prompt: {:?}", String::from_utf8_lossy(&screen.lock().unwrap()));
-        (sess, screen)
+        assert!(ok, "no hooked prompt\n{}", dump(&screen, &closed));
+        (sess, screen, closed)
     }
 
     /// Run a hidden command; check nothing of it (typed line, output, sentinels) reached the screen.
-    async fn hidden(sess: &LocalSession, screen: &Mutex<Vec<u8>>, cmd: &str, marker: &str) -> (String, i32) {
+    async fn hidden(sess: &LocalSession, screen: &Mutex<Vec<u8>>, closed: &Mutex<Option<String>>, cmd: &str, marker: &str) -> (String, i32) {
         let before = screen.lock().unwrap().len();
-        let (out, code) = tokio::time::timeout(std::time::Duration::from_secs(60), sess.exec_hidden(cmd))
-            .await
-            .expect("hidden command timed out")
-            .expect("hidden command failed");
+        let (out, code) = match tokio::time::timeout(std::time::Duration::from_secs(60), sess.exec_hidden(cmd)).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => panic!("hidden command {cmd:?} failed: {e:#}\n{}", dump(screen, closed)),
+            Err(_) => panic!("hidden command {cmd:?} timed out\n{}", dump(screen, closed)),
+        };
         std::thread::sleep(std::time::Duration::from_millis(400)); // anything that leaks would be here by now
         let shown = String::from_utf8_lossy(&screen.lock().unwrap()[before..]).into_owned();
         assert!(!shown.contains(marker) && !shown.contains("7771"), "leaked to the screen: {shown:?}");
@@ -659,12 +716,12 @@ mod tests {
         let hook = include_str!("../../shell-integration/bash.sh");
         std::fs::write(&rc, format!("HISTFILE=/dev/null\nPS1='$ '\n{hook}\n")).unwrap();
         let args = vec!["--noprofile".into(), "--rcfile".into(), rc.to_string_lossy().into_owned(), "-i".into()];
-        let (sess, screen) = hooked_shell(&bash, args);
+        let (sess, screen, closed) = hooked_shell(&bash, args);
 
-        let (out, code) = hidden(&sess, &screen, "echo charon-hidden; (exit 3)", "charon-hidden").await;
+        let (out, code) = hidden(&sess, &screen, &closed, "echo charon-hidden; (exit 3)", "charon-hidden").await;
         assert_eq!((out.trim(), code), ("charon-hidden", 3));
         // The shell is back at its prompt: the next one works too.
-        let (out, code) = hidden(&sess, &screen, "echo again-$((40+2))", "again-").await;
+        let (out, code) = hidden(&sess, &screen, &closed, "echo again-$((40+2))", "again-").await;
         assert_eq!((out.trim(), code), ("again-42", 0));
         sess.close().await.unwrap();
     }
@@ -686,22 +743,22 @@ mod tests {
         // CHARON_HOOKED is exported: run from inside a Charon tab, it would skip the hook.
         let setup = format!("Remove-Item Env:CHARON_HOOKED -ErrorAction Ignore; . '{}'", hook.to_string_lossy().replace('\'', "''"));
         let args = vec!["-NoLogo".into(), "-NoProfile".into(), "-NoExit".into(), "-Command".into(), setup];
-        let (sess, screen) = hooked_shell(&pwsh, args);
+        let (sess, screen, closed) = hooked_shell(&pwsh, args);
 
         // A native command's exit code comes through $LASTEXITCODE.
         #[cfg(windows)]
         let native3 = "Write-Output charon-hidden; cmd /c exit 3";
         #[cfg(not(windows))]
         let native3 = "Write-Output charon-hidden; sh -c 'exit 3'";
-        let (out, code) = hidden(&sess, &screen, native3, "charon-hidden").await;
+        let (out, code) = hidden(&sess, &screen, &closed, native3, "charon-hidden").await;
         assert_eq!((out.trim(), code), ("charon-hidden", 3));
         // Success; a cmdlet error ($? false, no native code); a terminating error.
-        let (out, code) = hidden(&sess, &screen, "Write-Output fine", "fine").await;
+        let (out, code) = hidden(&sess, &screen, &closed, "Write-Output fine", "fine").await;
         assert_eq!((out.trim(), code), ("fine", 0));
-        assert_eq!(hidden(&sess, &screen, "Get-Item ./charon-missing-xyz", "charon-missing").await.1, 1);
-        assert_eq!(hidden(&sess, &screen, "throw 'charon-boom'", "charon-boom").await.1, 1);
+        assert_eq!(hidden(&sess, &screen, &closed, "Get-Item ./charon-missing-xyz", "charon-missing").await.1, 1);
+        assert_eq!(hidden(&sess, &screen, &closed, "throw 'charon-boom'", "charon-boom").await.1, 1);
         // An earlier native failure doesn't leak into the next command's code.
-        assert_eq!(hidden(&sess, &screen, "Write-Output after", "after").await.1, 0);
+        assert_eq!(hidden(&sess, &screen, &closed, "Write-Output after", "after").await.1, 0);
         sess.close().await.unwrap();
     }
 

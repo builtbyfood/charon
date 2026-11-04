@@ -425,6 +425,8 @@ impl SshSession {
                                     let show = cap.feed(&data);
                                     // Keep ordering: drain any coalesced normal output first.
                                     if !show.is_empty() { out.flush_close(); SessionManager::emit_data(&app, &id, &show); }
+                                    // Answer swallowed cursor queries (pwsh's PSReadLine on a Unix host).
+                                    if let Some((r, n)) = cap.take_replies() { prompt.answered(n); let _ = channel.data(&r[..]).await; }
                                     // Auto-answer a sudo/su prompt so hidden commands don't hang.
                                     let pw_send = cap.take_password_send();
                                     if cap.done() { finish(capture.take(), Ok(())); }

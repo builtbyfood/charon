@@ -123,6 +123,11 @@ impl Dialect {
 /// sentinel. No Ctrl+U (PSReadLine's Windows mode doesn't bind it); `PromptState`
 /// already refuses a non-empty line. CR is the Enter key.
 ///
+/// `| Out-Host`: the console host formats a line's pipeline output only after the
+/// whole line has run, which is after the end sentinel, so `Write-Output x` would
+/// land in the swallowed tail. Out-Host prints it inside the statement. A native
+/// command flushes on its own, which is why only cmdlet output went missing.
+///
 /// Exit code: the hook's `133;D` mapping (`$?` → 0, else `$LASTEXITCODE`, else 1),
 /// evaluated right after the command. The `133;D` the prompt prints afterwards
 /// would see the sentinel write's own `$?`. Two adjustments make it independent of
@@ -136,7 +141,7 @@ pub fn wrap_pwsh(cmd: &str) -> String {
     let bel = "$([char]7)";
     format!(
         " [Console]::Write(\"{esc}]7771;s{bel}\"); $global:LASTEXITCODE = 0; $__charon_e = $Error[0]; \
-try {{ Invoke-Expression ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{b64}'))); $__charon_ok = $? }} \
+try {{ Invoke-Expression ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{b64}'))) | Out-Host; $__charon_ok = $? }} \
 catch {{ $__charon_ok = $false; $_ | Out-Host }}; \
 if ($Error.Count -and -not [object]::ReferenceEquals($Error[0], $__charon_e)) {{ $__charon_ok = $false }}; \
 [Console]::Write(\"{esc}]7771;e;$(if ($global:LASTEXITCODE) {{ $global:LASTEXITCODE }} elseif ($__charon_ok) {{ 0 }} else {{ 1 }}){bel}\")\r"
@@ -179,6 +184,11 @@ pub struct PromptState {
     typed: bool,
     /// Tail of the previous chunk, for a mark split across chunks.
     tail: Vec<u8>,
+    /// Cursor-position queries the shell is still waiting on (PSReadLine on Unix
+    /// asks right after drawing the prompt). Typed meanwhile, a hidden command is
+    /// read as the answer and lost. Plus the tail for a query split across chunks.
+    queries: usize,
+    query_tail: Vec<u8>,
 }
 
 impl PromptState {
@@ -186,6 +196,24 @@ impl PromptState {
 
     /// Session output (everything the shell prints, captured or not).
     pub fn output(&mut self, data: &[u8]) {
+        let mut q = std::mem::take(&mut self.query_tail);
+        q.extend_from_slice(data);
+        self.queries += q.windows(DSR.len()).filter(|w| *w == DSR).count();
+        self.query_tail = q[q.len() - (DSR.len() - 1).min(q.len())..].to_vec();
+        self.marks(data);
+    }
+
+    /// A cursor query was answered (by the terminal, or by `Capture` for one it swallowed).
+    pub fn answered(&mut self, n: usize) {
+        self.queries = self.queries.saturating_sub(n);
+    }
+
+    /// The shell is waiting for the terminal to answer a cursor query.
+    pub fn awaiting_report(&self) -> bool {
+        self.queries > 0
+    }
+
+    fn marks(&mut self, data: &[u8]) {
         let mut buf = std::mem::take(&mut self.tail);
         buf.extend_from_slice(data);
         let mut i = 0;
@@ -217,6 +245,14 @@ impl PromptState {
 
     /// The user's keystrokes or paste going to the shell.
     pub fn input(&mut self, data: &[u8]) {
+        // The terminal answering a query (cursor position after PSReadLine's
+        // `ESC[6n`) goes the same way as keystrokes but leaves the line empty.
+        if is_terminal_report(data) {
+            if data.ends_with(b"R") {
+                self.answered(1);
+            }
+            return;
+        }
         if !data.is_empty() && self.at_prompt {
             self.typed = true;
         }
@@ -261,6 +297,10 @@ pub struct Capture {
     sudo_sent: bool,
     /// Rolling tail of recent output, for prompt sniffing across chunk boundaries.
     sniff: Vec<u8>,
+    /// Cursor-position queries swallowed so far and not yet answered; the tail
+    /// of the last swallowed chunk, for a query split across chunks.
+    dsr_pending: usize,
+    dsr_carry: Vec<u8>,
 }
 
 impl Default for Capture {
@@ -272,7 +312,7 @@ impl Default for Capture {
 impl Capture {
     pub fn new() -> Self {
         let now = Instant::now();
-        Self { phase: Phase::Echo, buf: Vec::new(), payload: Vec::new(), code: 0, started: now, last_byte: now, sudo_pw: None, sudo_user: String::new(), sudo_sent: false, sniff: Vec::new() }
+        Self { phase: Phase::Echo, buf: Vec::new(), payload: Vec::new(), code: 0, started: now, last_byte: now, sudo_pw: None, sudo_user: String::new(), sudo_sent: false, sniff: Vec::new(), dsr_pending: 0, dsr_carry: Vec::new() }
     }
 
     /// Arm auto-answering of the login user's own `[sudo] password for <user>:`
@@ -305,6 +345,42 @@ impl Capture {
 
     /// Feed session output; returns the bytes the UI should still see.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let shown = self.feed_inner(bytes);
+        // What is shown is always a suffix of this chunk; the rest was swallowed.
+        let swallowed = &bytes[..bytes.len().saturating_sub(shown.len())];
+        self.note_queries(swallowed);
+        shown
+    }
+
+    /// PSReadLine on Linux/macOS asks for the cursor position (`ESC[6n`) while it
+    /// redraws and waits for the answer, reading stdin until it comes. Swallowed
+    /// here, the query never reaches the terminal, so nothing would answer and the
+    /// shell would hang. Answer each one ourselves (`take_replies`). The position is a
+    /// guess; PSReadLine asks again after the prompt the user sees, and the real
+    /// terminal answers that one. (Windows ConPTY answers these itself.)
+    fn note_queries(&mut self, swallowed: &[u8]) {
+        if swallowed.is_empty() {
+            return;
+        }
+        let mut buf = std::mem::take(&mut self.dsr_carry);
+        buf.extend_from_slice(swallowed);
+        self.dsr_pending += buf.windows(DSR.len()).filter(|w| *w == DSR).count();
+        // Keep a possible query prefix, but never a whole query (counted already).
+        let keep = (DSR.len() - 1).min(buf.len());
+        self.dsr_carry = buf[buf.len() - keep..].to_vec();
+    }
+
+    /// Replies to the cursor-position queries swallowed since the last call, and
+    /// how many (for `PromptState::answered`).
+    pub fn take_replies(&mut self) -> Option<(Vec<u8>, usize)> {
+        if self.dsr_pending == 0 {
+            return None;
+        }
+        let n = std::mem::take(&mut self.dsr_pending);
+        Some((DSR_REPLY.repeat(n), n))
+    }
+
+    fn feed_inner(&mut self, bytes: &[u8]) -> Vec<u8> {
         self.last_byte = Instant::now();
         // Keep a short tail of raw output for sudo-prompt sniffing.
         if self.sudo_pw.is_some() && !self.sudo_sent {
@@ -391,6 +467,21 @@ impl Capture {
     }
 }
 
+/// Device status report: "where is the cursor?", and the answer we give inside a capture.
+const DSR: &[u8] = b"\x1b[6n";
+const DSR_REPLY: &[u8] = b"\x1b[1;1R";
+
+/// A terminal's answer to a query rather than keystrokes: a cursor position
+/// (`ESC [ row ; col R`) or a device attributes report (`ESC [ ? … c`).
+pub fn is_terminal_report(data: &[u8]) -> bool {
+    let Some(body) = data.strip_prefix(b"\x1b[") else { return false };
+    match body.split_last() {
+        Some((b'R', args)) => !args.is_empty() && args.iter().all(|b| b.is_ascii_digit() || *b == b';'),
+        Some((b'c', args)) => args.first() == Some(&b'?') && args[1..].iter().all(|b| b.is_ascii_digit() || *b == b';'),
+        _ => false,
+    }
+}
+
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
@@ -461,6 +552,8 @@ mod tests {
         assert!(w.contains("$(if ($global:LASTEXITCODE) { $global:LASTEXITCODE } elseif ($__charon_ok) { 0 } else { 1 })"), "{w}");
         // A terminating error is caught, still reaching the end sentinel as a failure.
         assert!(w.contains("catch { $__charon_ok = $false;"));
+        // Output is drawn inside the statement, before the end sentinel.
+        assert!(w.contains("| Out-Host; $__charon_ok = $?"), "{w}");
         // What PowerShell prints comes through the same Capture as POSIX shells.
         let mut c = Capture::new();
         assert!(c.feed(w.replace('\r', "\r\n").as_bytes()).is_empty(), "echo swallowed");
@@ -468,6 +561,49 @@ mod tests {
         let shown = c.feed(b"\x1b]133;D;1\x07\x1b]133;A\x07PS C:\\> \x1b]133;B\x07");
         assert!(shown.is_empty() && c.done());
         assert_eq!(c.into_result(), (b"charon\r\n".to_vec(), 3));
+    }
+
+    #[test]
+    fn swallowed_cursor_queries_are_answered_but_shown_ones_are_left_to_the_terminal() {
+        let mut c = Capture::new();
+        // PSReadLine's queries inside the window, one split across chunks.
+        assert!(c.feed(b"echo...\x1b[6n\x1b]7771;s\x07out\x1b[").is_empty());
+        assert!(c.feed(b"6n\x1b]7771;e;0\x07\x1b[?1h\x1b[6n").is_empty());
+        assert_eq!(c.take_replies(), Some((b"\x1b[1;1R\x1b[1;1R\x1b[1;1R".to_vec(), 3)));
+        assert_eq!(c.take_replies(), None, "answered once");
+        // The query after the visible prompt reaches the terminal, which answers it.
+        let shown = c.feed(b"\x1b]133;B\x07\x1b[?1h\x1b[6n");
+        assert_eq!(shown, b"\x1b[?1h\x1b[6n");
+        assert_eq!(c.take_replies(), None);
+    }
+
+    #[test]
+    fn prompt_state_tracks_unanswered_cursor_queries() {
+        let mut p = PromptState::default();
+        p.output(b"\x1b]133;B\x07\x1b[?1h\x1b[");
+        assert!(!p.awaiting_report());
+        p.output(b"6n");
+        assert!(p.awaiting_report(), "query split across chunks");
+        p.input(b"\x1b[3;5R");
+        assert!(!p.awaiting_report(), "the terminal answered");
+        p.output(b"\x1b[6n\x1b[6n");
+        p.answered(2);
+        assert!(!p.awaiting_report(), "answered by the capture");
+        p.input(b"\x1b[1;1R");
+        assert!(!p.awaiting_report(), "an extra answer doesn't underflow");
+    }
+
+    #[test]
+    fn a_terminal_report_is_not_typing() {
+        assert!(is_terminal_report(b"\x1b[12;40R"));
+        assert!(is_terminal_report(b"\x1b[?1;2c"));
+        assert!(!is_terminal_report(b"\x1b[A"), "arrow up is typing");
+        assert!(!is_terminal_report(b"R"));
+        assert!(!is_terminal_report(b"ls\r"));
+        let mut p = PromptState::default();
+        p.output(b"\x1b]133;A\x07PS> \x1b]133;B\x07\x1b[6n");
+        p.input(b"\x1b[3;5R");
+        assert!(p.ready().is_ok(), "the cursor report left the line empty");
     }
 
     #[test]
