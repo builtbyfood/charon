@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, tick } from "svelte";
+  import { onMount, tick, untrack } from "svelte";
   import Sidebar from "./lib/Sidebar.svelte";
   import Terminal from "./lib/Terminal.svelte";
   import EditorPane from "./lib/EditorPane.svelte";
@@ -19,11 +19,19 @@
   import { addDropTarget } from "./lib/filedrop";
   import { restorePlan, toSaved } from "./lib/opentabs";
   import { startTicker } from "./lib/ticker.svelte";
+  import { broadcastTargets, fanOut, fanSudo, idleExpired } from "./lib/broadcast";
+  import { broadcastCount, filesAllTarget, gridLayout, syncSplitFiles } from "./lib/splitview";
+  import { sudoSendPassword, broadcastRoles, bcPublish, onBcState, bcHello, onBcHello, bcInput, onBcInput, focusWindow, type BcInput } from "./lib/api";
 
   import type { OpenTarget, TabSnapshot } from "./lib/Terminal.svelte";
   /** Terminal tabs carry an OpenTarget; the single editor tab has none.
-   *  `adopt` = the tab came from another window (see moveTab). */
-  interface Tab { id: string; title: string; color?: string; font?: SessionFont; open?: OpenTarget; editor?: true; adopt?: TabSnapshot }
+   *  `adopt` = the tab came from another window (see moveTab).
+   *  `popped` = a placeholder in the main window for a tab shown in a Split pop-out
+   *  (that window's label). In a stashed tab on its way: `filesBefore` = its Files
+   *  state from before Split, `popout` = it opens a Split pop-out window, carrying
+   *  the `bundle` of the other tabs' stash tokens. */
+  interface Tab { id: string; title: string; color?: string; font?: SessionFont; open?: OpenTarget; editor?: true; adopt?: TabSnapshot;
+    popped?: string; filesBefore?: boolean; popout?: true; bundle?: string[] }
 
   // Every window runs this component. "main" has the sidebar, the editor and the
   // MCP prompts; tab windows ("tab-<token>", torn off the tab bar) hold terminals only.
@@ -60,6 +68,188 @@
   let tabs = $state<Tab[]>([]);
   let active = $state<string | null>(null);
   const activeTerm = $derived(active && tabs.find((t) => t.id === active && t.open && t.open.kind !== "serial") ? active : null);
+
+  // ---- MultiExec (broadcast input). Tick tabs (or "Broadcast to folder"), then
+  // Ctrl+Shift+B: what is typed or pasted in the source tab also goes to every
+  // ticked tab's session. The source is the terminal that last had the keyboard,
+  // in any window: the state is shared between windows (`bc:state`), and each
+  // window repeats the source's input on its own ticked tabs (`bc:input`).
+  let bc = $state<{ on: boolean; selected: Set<string>; source: string | null; rev: number }>({ on: false, selected: new Set(), source: null, rev: 0 });
+  let bcHint = $state("");
+  const isTermTab = (t: Tab) => !!t.open && !t.editor;
+  const bcCount = $derived(broadcastCount(bc.selected, bc.source));
+  const broadcasting = $derived(bc.on && !!bc.source && bcCount > 1);
+  /** Change the shared state here and tell the other windows (newest `rev` wins). */
+  function publish(p: { on?: boolean; selected?: Set<string>; source?: string | null }) {
+    bc = { on: p.on ?? bc.on, selected: p.selected ?? bc.selected, source: p.source !== undefined ? p.source : bc.source, rev: Math.max(Date.now(), bc.rev + 1) };
+    bcPublish({ on: bc.on, selected: [...bc.selected], source: bc.source, rev: bc.rev, from: appWindow.label }).catch(() => {});
+  }
+  /** A terminal got the keyboard: it is the broadcast source now (the amber border follows it). */
+  function claimSource(id: string) {
+    if (bc.source !== id && tabs.some((t) => t.id === id && isTermTab(t))) publish({ source: id });
+  }
+  function toggleSelected(id: string, on: boolean) {
+    const s = new Set(bc.selected);
+    if (on) s.add(id); else s.delete(id);
+    publish({ selected: s, on: bc.on && broadcastCount(s, bc.source) > 1 });
+  }
+  function flashHint(msg: string) { bcHint = msg; setTimeout(() => { if (bcHint === msg) bcHint = ""; }, 4000); }
+  function setBroadcast(on: boolean) {
+    if (!on) { publish({ on: false }); console.info("[charon] broadcast: off"); return; }
+    // Pressed here: this window's terminal is the source.
+    const here = active && tabs.some((t) => t.id === active && isTermTab(t)) ? active : null;
+    const source = here ?? bc.source;
+    if (!source) { flashHint("Broadcast: switch to a terminal tab first"); return; }
+    if (broadcastCount(bc.selected, source) < 2) { flashHint("Broadcast: tick the tabs to send to first (checkbox on each tab, or Broadcast to folder)"); return; }
+    publish({ on: true, source });
+    console.info(`[charon] broadcast: on → ${broadcastCount(bc.selected, source)} sessions`);
+    if (here) terms[here]?.focusTerm();
+  }
+  type FanEvent = { kind: "data"; data: string } | { kind: "paste"; text: string } | { kind: "sudo" };
+  /** Repeat the source's input on this window's ticked tabs. */
+  function fanLocal(from: string, e: FanEvent) {
+    const targets = broadcastTargets(tabs.filter(isTermTab).map((t) => ({ id: t.id, session: terms[t.id]?.sessionOf() ?? null })), bc.selected, from);
+    if (!targets.length) return;
+    if (e.kind === "data") {
+      for (const t of targets) terms[t.id]?.noteInput(e.data);
+      fanOut(targets.map((t) => t.session!), e.data, sessionWrite)
+        .then((errs) => errs.forEach((x) => console.warn(`[charon] broadcast: write to ${x.session} failed: ${x.error}`)));
+    } else if (e.kind === "paste") {
+      // The source's paste guard has been answered once; each target brackets it for its own shell.
+      for (const t of targets) terms[t.id]?.pasteBroadcast(e.text);
+      console.info(`[charon] broadcast: paste bytes=${e.text.length} to ${targets.length} session(s) in ${appWindow.label}`);
+    } else {
+      fanSudo(targets.map((t) => ({ session: t.session!, prompted: terms[t.id]?.atSudoPrompt() ?? false })), sudoSendPassword)
+        .then((r) => console.info(`[charon] broadcast: sudo ${r.map((x) => `${x.session.slice(0, 8)}=${x.sent ? "sent" : "skipped"}`).join(" ")}`));
+    }
+  }
+  // Idle auto-off: input in any window counts as activity.
+  let bcActivity = Date.now();
+  $effect(() => { if (bc.on) untrack(() => (bcActivity = Date.now())); });
+  $effect(() => {
+    const t = setInterval(() => {
+      if (bc.on && idleExpired(bcActivity, Date.now(), prefs.broadcastIdleMin)) {
+        publish({ on: false });
+        flashHint(`Broadcast turned off after ${prefs.broadcastIdleMin} min without input`);
+        console.info("[charon] broadcast: off (idle)");
+      }
+    }, 15_000);
+    return () => clearInterval(t);
+  });
+  function onFan(from: string, e: FanEvent) {
+    if (!broadcasting || from !== bc.source) return;
+    bcActivity = Date.now();
+    fanLocal(from, e);
+    bcInput({ ...e, from, window: appWindow.label } as BcInput).catch(() => {});
+  }
+  // Each window tells the backend its tabs' roles, for MCP list_sessions.
+  let sessionOfTab = $state<Record<string, string | null>>({});
+  $effect(() => {
+    const roles: Record<string, "source" | "target"> = {};
+    for (const t of tabs) {
+      const sid = sessionOfTab[t.id], r = bcRole(t.id);
+      if (sid && r) roles[sid] = r.role;
+    }
+    broadcastRoles(roles).catch(() => {});
+  });
+  function bcRole(id: string): { role: "source" | "target"; count: number } | null {
+    if (!broadcasting) return null;
+    if (id === bc.source) return { role: "source", count: bcCount };
+    return bc.selected.has(id) ? { role: "target", count: bcCount } : null;
+  }
+
+  // ---- Split view: the active tab and the ticked ones side by side; in a Split
+  // pop-out window, all of its tabs. Sized to the window (gridLayout); past the
+  // minimum pane size the grid scrolls by rows.
+  let gridOn = $state(false);
+  let popout = $state(false);
+  const gridIds = $derived(gridOn ? tabs.filter((t) => isTermTab(t) && (popout || bc.selected.has(t.id) || t.id === active)).map((t) => t.id) : []);
+  const gridActive = $derived(gridIds.length > 1 || (popout && gridIds.length > 0));
+  let panesEl = $state<HTMLDivElement | null>(null);
+  let panesW = $state(0), panesH = $state(0);
+  let cell = $state({ w: 8, h: 17 });
+  const layout = $derived(gridLayout(gridIds.length, panesW, panesH, cell));
+  const shown = (id: string) => (gridActive ? gridIds.includes(id) : active === id);
+  function setGrid(on: boolean) {
+    gridOn = on;
+    // Every pane shown grabs the keyboard as it appears; hand it back to the active one.
+    tick().then(() => requestAnimationFrame(() => terms[active ?? ""]?.focusTerm()));
+  }
+  // Character size for the grid: the active pane's (falls back to an estimate).
+  $effect(() => {
+    if (!gridActive) return;
+    void prefs;
+    tick().then(() => { const c = terms[active ?? ""]?.cellSize() ?? terms[gridIds[0]]?.cellSize(); if (c) cell = c; });
+  });
+  // Split collapses each pane's Files panel and gives it back on the way out
+  // (or when the tab leaves the grid); `splitSaved` = state from before Split.
+  let splitSaved: Record<string, boolean> = {};
+  $effect(() => {
+    const ids = gridActive ? gridIds : [];
+    untrack(() => {
+      const r = syncSplitFiles(splitSaved, ids, (id) => terms[id]?.filesShown() ?? false);
+      splitSaved = r.saved;
+      for (const [id, v] of Object.entries(r.set)) terms[id]?.setFiles(v);
+    });
+  });
+  /** The top bar's Files button in Split: every pane at once. */
+  function toggleAllFiles() {
+    const on = filesAllTarget(gridIds.map((id) => !!filesOpen[id]));
+    for (const id of gridIds) terms[id]?.setFiles(on);
+  }
+  // A scrolling grid keeps the pane with the keyboard in view.
+  $effect(() => {
+    const a = active;
+    if (!gridActive || !layout.scroll) return;
+    tick().then(() => panesEl?.querySelector<HTMLElement>(`[data-pane="${a}"]`)?.scrollIntoView({ block: "nearest" }));
+  });
+
+  /** ⧉: the Split panes move to a window of their own; the main window keeps a
+   *  placeholder tab for each. Closing that window brings them back. */
+  async function popOut() {
+    const ids = [...gridIds];
+    if (!isMain || !ids.length) return;
+    moveError = "";
+    // The first tab opens the window and carries the others' tokens.
+    const order = [...ids.slice(1), ids[0]];
+    const done: { id: string; token: string }[] = [];
+    try {
+      for (const id of order) {
+        const t = tabs.find((x) => x.id === id)!;
+        const snap = await terms[id]!.detach();
+        const first = id === ids[0];
+        const json: Tab = { id, title: t.title, color: t.color, font: t.font, open: t.open, adopt: snap, filesBefore: splitSaved[id],
+          ...(first ? { popout: true as const, bundle: done.map((d) => d.token) } : {}) };
+        done.push({ id, token: await tabStash(JSON.stringify(json)) });
+      }
+      const pos = await appWindow.outerPosition();
+      const label = await tabWindowOpen(done.at(-1)!.token, pos.x + 140, pos.y + 70, window.innerWidth, window.innerHeight);
+      for (const id of ids) delete splitSaved[id];
+      tabs = tabs.map((t) => (ids.includes(t.id) ? { id: t.id, title: t.title, color: t.color, popped: label } : t));
+      gridOn = false;
+      active = tabs.find((t) => !t.popped)?.id ?? active;
+      console.info(`[charon] split: popped out ${ids.length} pane(s) to ${label}`);
+    } catch (e) {
+      console.warn("[charon] split: pop-out failed", e);
+      for (const d of done) { await tabTake(d.token).catch(() => {}); terms[d.id]?.undetach(); }
+      moveError = `could not pop out: ${String(e)}`; setTimeout(() => (moveError = ""), 4000);
+    }
+  }
+
+  /** "Broadcast to folder": open each host (reusing a tab already open on it) and tick them all. */
+  function broadcastFolder(hosts: { node: Node; color?: string; font?: SessionFont }[]) {
+    const ids: string[] = [];
+    for (const h of hosts) {
+      const open = tabs.find((t) => t.open?.nodeId === h.node.id);
+      if (open) { ids.push(open.id); continue; }
+      openNode(h.node, h.color, h.font);
+      ids.push(active!);
+    }
+    if (!ids.length) { flashHint("Broadcast to folder: no hosts in it"); return; }
+    publish({ selected: new Set([...bc.selected, ...ids]) });
+    active = ids[0];
+    flashHint(`Ticked ${ids.length} tab${ids.length === 1 ? "" : "s"}: Ctrl+Shift+B to broadcast`);
+  }
   let vault = $state<VaultStatus | null>(null);
 
   // The profile is owned here; Terminal/Sidebar get derived prefs and report
@@ -79,7 +269,7 @@
     prefs = prefsFromProfile(profile);
     persistProfile();
   }
-  function setRenderer(r: "webgl" | "canvas" | "dom") {
+  function setRenderer(r: "auto" | "webgl" | "canvas" | "dom") {
     if (!profile) return;
     profile.appearance.renderer = r;
     prefs = prefsFromProfile(profile);
@@ -223,9 +413,35 @@
     // Files dropped on a terminal or the editor tab open in the editor (the main
     // window's); a file pane inside a terminal takes its own drops (filedrop.ts).
     addDropTarget({ zone: "editor", drop: (paths) => { for (const p of paths) openFromUi(p, null, null); } });
+    // Broadcast state shared between windows; the main window answers newcomers.
+    await onBcState((s) => {
+      if (s.from === appWindow.label || s.rev <= bc.rev) return;
+      bc = { on: s.on, selected: new Set(s.selected), source: s.source, rev: s.rev };
+    });
+    await onBcInput((e) => {
+      bcActivity = Date.now();
+      if (e.window === appWindow.label || !broadcasting || e.from !== bc.source) return;
+      fanLocal(e.from, e);
+    });
+    if (isMain) await onBcHello(() => publish({}));
+    else bcHello().catch(() => {});
     // Tabs arriving from other windows; a new tab window starts with the one it was made for.
     await onTabAdopt((p) => adoptTab(p.token, p.x));
     if (!isMain) {
+      // Closing a Split pop-out sends its panes back to the main window; closing a
+      // torn-off window closes its tabs, which leave the broadcast.
+      let leaving = false;
+      await appWindow.onCloseRequested(async (e) => {
+        if (leaving) return;
+        leaving = true;
+        if (popout) {
+          e.preventDefault();
+          for (const t of tabs.filter((x) => x.open)) await moveTab(t.id, "main");
+          windowCloseSelf().catch(() => {});
+        } else if (tabs.some((t) => bc.selected.has(t.id))) {
+          publish({ selected: new Set([...bc.selected].filter((id) => !tabs.some((t) => t.id === id))) });
+        }
+      });
       await adoptTab(appWindow.label.slice("tab-".length), -1);
       tabsReady = true;
       return;
@@ -271,13 +487,16 @@
   }
   function onWindowKey(e: KeyboardEvent) {
     if (isMain && e.ctrlKey && e.shiftKey && (e.code === "KeyD")) { e.preventDefault(); docsView = !docsView; }
+    if (e.ctrlKey && e.shiftKey && e.code === "KeyB" && !e.repeat) { e.preventDefault(); setBroadcast(!bc.on); }
   }
   function closeTab(id: string) {
     if (id === EDITOR_TAB && editorPane?.hasUnsaved() && !confirm("The editor has unsaved changes. Close anyway?")) return;
     dropTab(id);
   }
-  function dropTab(id: string) {
+  /** `moved` = the tab went to another window: it stays ticked there. */
+  function dropTab(id: string, moved = false) {
     tabs = tabs.filter((t) => t.id !== id);
+    if (!moved && bc.selected.has(id)) toggleSelected(id, false);
     if (active === id) active = tabs.at(-1)?.id ?? null;
     // A tab window with no tabs left has nothing to show.
     if (!isMain && tabs.length === 0) windowCloseSelf().catch(() => {});
@@ -340,7 +559,9 @@
     let snap: TabSnapshot;
     try { snap = await term.detach(); }
     catch (e) { moveError = String(e instanceof Error ? e.message : e); setTimeout(() => (moveError = ""), 4000); return; }
-    const token = await tabStash(JSON.stringify({ id: t.id, title: t.title, color: t.color, font: t.font, open: t.open, adopt: snap } satisfies Tab));
+    // Its pre-Split Files state goes with it (the pane arrives collapsed).
+    const token = await tabStash(JSON.stringify({ id: t.id, title: t.title, color: t.color, font: t.font, open: t.open, adopt: snap, filesBefore: splitSaved[t.id] } satisfies Tab));
+    delete splitSaved[t.id];
     try {
       const tgt = await tabDropTarget(appWindow.label);
       const target = where === "main" ? "main" : where === "drop" ? tgt.window : null;
@@ -354,7 +575,7 @@
       moveError = `could not move the tab: ${String(e)}`; setTimeout(() => (moveError = ""), 4000);
       return;
     }
-    dropTab(id);
+    dropTab(id, true);
   }
 
   /** A tab handed to this window: take it from the stash and put it where it was
@@ -369,9 +590,20 @@
       const scale = await appWindow.scaleFactor().catch(() => window.devicePixelRatio || 1);
       if (pos) at = dropIndex(tabRects(), (x - pos.x) / scale);
     }
-    tabs.splice(at, 0, t);
+    const bundle = t.bundle ?? [];
+    const opensPopout = !!t.popout;
+    if (t.filesBefore !== undefined) splitSaved[t.id] = t.filesBefore;
+    delete t.bundle; delete t.popout; delete t.filesBefore;
+    // Back from a Split pop-out: the placeholder becomes the tab again.
+    const ph = tabs.findIndex((x) => x.id === t.id && x.popped);
+    if (ph >= 0) tabs[ph] = t; else tabs.splice(at, 0, t);
     active = t.id;
-    if (!isMain) appWindow.setTitle(`${t.title} — Charon`).catch(() => {});
+    if (opensPopout) { popout = true; gridOn = true; }
+    if (!isMain) appWindow.setTitle(popout ? "Split — Charon" : `${t.title} — Charon`).catch(() => {});
+    for (const tok of bundle) await adoptTab(tok, -1);
+    if (opensPopout) setGrid(true);
+    // All placeholders back: show them split again, as they were.
+    if (ph >= 0 && !tabs.some((x) => x.popped)) setGrid(true);
   }
   function tabMenuItems(id: string): MenuItem[] {
     const t = tabs.find((x) => x.id === id);
@@ -388,7 +620,7 @@
 <svelte:window onkeydown={onWindowKey} />
 <div class="shell" class:detached={!isMain} style:--sidebar="{sidebarWidth}px">
   {#if isMain}
-    <Sidebar onopen={openNode} onquick={quickConnect} onlocal={openLocal} oneditor={newInEditor} onmcp={() => (mcpOpen = true)} onsettings={() => (settingsOpen = true)}
+    <Sidebar onopen={openNode} onbroadcast={broadcastFolder} onquick={quickConnect} onlocal={openLocal} oneditor={newInEditor} onmcp={() => (mcpOpen = true)} onsettings={() => (settingsOpen = true)}
       bind:docsView {docsCommand} {docsSession} {vault} onunlock={() => (askMaster = true)} />
     <div class="splitter" role="separator" aria-orientation="vertical" aria-label="Resize sidebar" onpointerdown={startDrag}></div>
   {/if}
@@ -397,24 +629,48 @@
       {#each tabs as t (t.id)}
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div class="tab" class:active={active === t.id} class:dragging={drag?.moved && drag.id === t.id} class:tearing={drag?.out && drag.id === t.id}
+          class:bc-sel={bc.selected.has(t.id)} class:bc-live={broadcasting && (t.id === bc.source || bc.selected.has(t.id))} class:bc-any={bc.on || bc.selected.size > 0}
+          class:popped={!!t.popped}
           data-tab={t.id} style:--tab-color={t.color ?? "var(--accent)"}
           oncontextmenu={(e) => { e.preventDefault(); tabMenu = { x: e.clientX, y: e.clientY, id: t.id }; }}>
+          {#if isTermTab(t) || t.popped}
+            <input type="checkbox" class="bc-check" checked={bc.selected.has(t.id)} aria-label="Broadcast to {t.title}"
+              title="Include this tab in broadcast input (Ctrl+Shift+B toggles broadcasting)"
+              onchange={(e) => toggleSelected(t.id, e.currentTarget.checked)} />
+          {/if}
           <button type="button" class="tab-main" role="tab" aria-selected={active === t.id}
             title={canMove(t) ? "Drag to reorder; drag out of the window to open it in its own window" : undefined}
             onpointerdown={(e) => tabDown(e, t.id)} onpointermove={tabMove} onpointerup={tabUp} onpointercancel={() => (drag = null)}
-            onclick={() => { if (!swallowClick) active = t.id; }}>
-            <span class="dot"></span>{t.title}{#if t.editor && editorDirty}<span class="unsaved">•</span>{/if}{#if t.open?.admin}<span class="badge">admin</span>{/if}
+            onclick={() => { if (swallowClick) return; if (t.popped) { focusWindow(t.popped).catch(() => {}); return; } active = t.id; if (gridActive) terms[t.id]?.focusTerm(); }}>
+            <span class="dot"></span>{t.title}{#if t.editor && editorDirty}<span class="unsaved">•</span>{/if}{#if t.open?.admin}<span class="badge">admin</span>{/if}{#if t.popped}<span class="pop-badge" title="Shown in the Split window">⧉</span>{/if}
           </button>
-          <button type="button" class="x" aria-label="Close tab" onclick={() => closeTab(t.id)}>×</button>
+          {#if !t.popped}<button type="button" class="x" aria-label="Close tab" onclick={() => closeTab(t.id)}>×</button>{/if}
         </div>
       {/each}
       {#if moveError}<span class="move-error">{moveError}</span>{/if}
-      {#if activeTerm}
+      {#if bcHint}<span class="bc-hint">{bcHint}</span>{/if}
+      {#if bc.selected.size > 0 || bc.on || popout}
+        <button type="button" class="bc-toggle" class:on={broadcasting} onclick={() => setBroadcast(!bc.on)}
+          title="Send what is typed or pasted in the source tab (the one with the keyboard) to every ticked tab, in any window (Ctrl+Shift+B)">{broadcasting ? `Broadcasting → ${bcCount}` : "Broadcast"}</button>
+        {#if !popout}
+          <button type="button" class="grid-toggle" class:on={gridActive} disabled={!gridOn && tabs.filter((t) => isTermTab(t) && (bc.selected.has(t.id) || t.id === active)).length < 2}
+            onclick={() => setGrid(!gridOn)} title="Show the active tab and the ticked ones side by side">Split</button>
+          {#if isMain && gridActive}
+            <button type="button" class="pop-out" onclick={popOut} title="Open the Split panes in a window of their own (closing it brings them back)">⧉</button>
+          {/if}
+          <button type="button" class="bc-clear" onclick={() => { publish({ selected: new Set(), on: false }); gridOn = false; }} title="Untick every tab and stop broadcasting">Clear</button>
+        {/if}
+      {/if}
+      {#if gridActive}
+        <button type="button" class="files-toggle" class:on={gridIds.some((id) => !!filesOpen[id])} title="File pane in every Split pane (each pane's own files button opens just that one)"
+          onclick={toggleAllFiles}>Files</button>
+      {:else if activeTerm}
         <button type="button" class="files-toggle" class:on={!!filesOpen[activeTerm]} title="File pane for this tab (Ctrl+Shift+E)"
           onclick={() => terms[activeTerm!]?.toggleFiles()}>Files</button>
       {/if}
     </div>
-    <div class="panes">
+    <div class="panes" class:grid={gridActive} class:scroll={gridActive && layout.scroll} bind:this={panesEl} bind:clientWidth={panesW} bind:clientHeight={panesH}
+      style:--grid-cols={layout.cols} style:--pane-h="{layout.paneH}px">
       {#if tabs.length === 0}
         <div class="empty">
           <p>Pick a connection on the left, or type <code>user@host</code> in the quick-connect box.</p>
@@ -423,11 +679,17 @@
         </div>
       {/if}
       {#each tabs as t (t.id)}
-        <div class="pane" hidden={active !== t.id} data-drop="editor">
-          {#if t.editor}
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div class="pane" class:focused={gridActive && active === t.id} hidden={!shown(t.id)} data-drop="editor" data-pane={t.id}
+          onpointerdowncapture={() => { if (gridActive && active !== t.id) active = t.id; }} onfocusin={() => claimSource(t.id)}>
+          {#if t.popped}
+            <div class="empty"><p>This tab is in the Split window.</p>
+              <p><button type="button" onclick={() => focusWindow(t.popped!).catch(() => {})}>Show it</button></p></div>
+          {:else if t.editor}
             <EditorPane bind:this={editorPane} onsend={sendToSession} ondirty={(d) => (editorDirty = d)} />
           {:else if t.open}
-            <Terminal bind:this={terms[t.id]} open={t.open} adopt={t.adopt} color={t.color} font={t.font} {prefs} active={active === t.id} os={info?.os} osUser={info?.user} onfontsize={setFontSize} ontimestamps={setTimestamps} onclosed={() => {}} onabort={() => closeTab(t.id)}
+            <Terminal bind:this={terms[t.id]} open={t.open} adopt={t.adopt} color={t.color} font={t.font} {prefs} active={shown(t.id)}
+              broadcast={bcRole(t.id)} onfan={(e) => onFan(t.id, e)} onsession={(sid) => (sessionOfTab[t.id] = sid)} os={info?.os} osUser={info?.user} onfontsize={setFontSize} ontimestamps={setTimestamps} onclosed={() => { if (bc.selected.has(t.id)) { toggleSelected(t.id, false); flashHint(`Broadcast: ${t.title} closed, unticked`); } }} onabort={() => closeTab(t.id)}
               onopenfile={openFromUi} onfiles={(o) => (filesOpen[t.id] = o)} onfileslayout={setFilesLayout}
               oncommand={(cmd, sess) => { if (isMain && active === t.id) { docsCommand = cmd; docsSession = sess; } }} />
           {/if}
@@ -454,7 +716,7 @@
 {/if}
 {#if settingsOpen && profile}
   <SettingsPanel theme={(profile.appearance.theme || "charon-dark") as ThemePref} font={profile.appearance.font} fontSize={profile.appearance.font_size}
-    renderer={prefs.renderer} trace={profile.terminal.trace_output === true} restoreTabs={profile.ui.restore_tabs !== false}
+    renderer={prefs.rendererSetting} trace={profile.terminal.trace_output === true} restoreTabs={profile.ui.restore_tabs !== false}
     os={info?.os} linuxRepaint={(profile.terminal.linux_repaint || "off") as LinuxRepaint} onlinuxrepaint={setLinuxRepaint}
     ontheme={setTheme} onfont={setFont} onrenderer={setRenderer} ontrace={setTrace} onrestoretabs={setRestoreTabs} onclose={() => (settingsOpen = false)} />
 {/if}
@@ -464,12 +726,26 @@
 {#if approve}
   <div class="backdrop" role="presentation">
     <div class="approve">
-      <h3>MCP wants to run a command</h3>
-      <p class="who">tool <span class="mono">{approve.tool}</span> · session <span class="mono">{approve.session.slice(0, 8)}</span></p>
-      <pre class="cmd">{approve.command}</pre>
+      {#if approve.targets?.length}
+        {@const asked = approve.targets.filter((t) => t.decision === "approve").length}
+        <h3>MCP wants to run a command on {approve.targets.length} sessions</h3>
+        <pre class="cmd">{approve.command}</pre>
+        <ul class="targets">
+          {#each approve.targets as t (t.session)}
+            <li class={t.decision}><span class="mono">{t.title ?? t.session.slice(0, 8)}</span>{#if t.host}<span class="dim mono">{t.host}</span>{/if}
+              <span class="tier">{t.tier}</span>
+              <span class="what">{t.decision === "approve" ? "needs your approval" : t.decision === "allow" ? "runs (trusted / always)" : "refused (read tier)"}</span></li>
+          {/each}
+        </ul>
+        <p class="who">Approve applies to the {asked} session{asked === 1 ? "" : "s"} marked "needs your approval"; Deny runs none of them.</p>
+      {:else}
+        <h3>MCP wants to run a command</h3>
+        <p class="who">tool <span class="mono">{approve.tool}</span> · session <span class="mono">{approve.session.slice(0, 8)}</span></p>
+        <pre class="cmd">{approve.command}</pre>
+      {/if}
       {#if approve.tool === "run_command"}
-        <label class="sudo-opt" title="Let this command auto-answer a '[sudo] password for {'<you>'}:' prompt with the saved password. The password is never shown or logged.">
-          <input type="checkbox" bind:checked={allowSudo} /> allow sudo password
+        <label class="sudo-opt" title="A command starting with sudo runs as root on its own channel; Charon gives the saved password to sudo directly (never to the command, never shown or logged). Without this, a sudo command is refused.">
+          <input type="checkbox" bind:checked={allowSudo} /> may run as root (sudo)
         </label>
       {/if}
       <div class="row">
@@ -505,6 +781,23 @@
   .badge { font-size: 10px; font-weight: 600; letter-spacing: .03em; color: #fff; background: var(--danger); border-radius: 3px; padding: 0 4px; }
   .panes { flex: 1; position: relative; min-height: 0; }
   .pane { position: absolute; inset: 0; }
+  .panes.grid { display: grid; grid-template-columns: repeat(var(--grid-cols), minmax(0, 1fr)); grid-auto-rows: var(--pane-h); align-content: start; gap: 3px; background: var(--line); overflow-y: auto; }
+  .panes.grid.scroll { scroll-snap-type: y mandatory; }
+  .panes.grid .pane { position: relative; inset: auto; min-width: 0; min-height: 0; background: var(--bg); scroll-snap-align: start; }
+  .panes.grid .pane.focused { box-shadow: 0 0 0 2px var(--accent); z-index: 1; }
+  /* MultiExec: ticked tabs are striped; the live ones get an amber top edge. */
+  .tab .bc-check { display: none; margin: 0 0 0 6px; accent-color: var(--warn); }
+  .tab:hover .bc-check, .tab.bc-any .bc-check { display: block; }
+  .tab.bc-sel { background-image: repeating-linear-gradient(-45deg, color-mix(in srgb, var(--warn) 22%, transparent) 0 5px, transparent 5px 10px); }
+  .tab.bc-live { box-shadow: inset 0 3px 0 var(--warn); }
+  .bc-toggle, .grid-toggle, .bc-clear, .pop-out { margin-bottom: 4px; padding: 3px 10px; flex: none; }
+  .tab.popped { opacity: .6; font-style: italic; }
+  .pop-badge { color: var(--accent); font-style: normal; }
+  .bc-toggle { margin-left: auto; }
+  .bc-toggle.on { border-color: var(--warn); background: var(--warn); color: var(--bg); font-weight: 700; }
+  .grid-toggle.on { border-color: var(--accent); color: var(--fg); }
+  .bc-toggle ~ .files-toggle { margin-left: 0; }
+  .bc-hint { color: var(--warn); font-size: 12px; padding: 0 8px; white-space: nowrap; }
   .empty { height: 100%; display: grid; place-content: center; text-align: center; color: var(--fg-dim); }
   .meta { font-size: 12px; }
   .appbar { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--fg-dim); padding: 2px 8px; border-top: 1px solid var(--line); background: var(--bg-raised); }
@@ -522,4 +815,11 @@
   .approve .sudo-opt { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--warn); }
   .approve .mono { font-family: var(--font-mono); }
   .approve .primary { border-color: var(--accent); }
+  .approve .targets { list-style: none; margin: 0; padding: 0; max-height: 180px; overflow: auto; border: 1px solid var(--line); border-radius: 4px; font-size: 12px; }
+  .approve .targets li { display: flex; gap: 8px; align-items: baseline; padding: 3px 8px; border-left: 3px solid var(--warn); }
+  .approve .targets li.allow { border-left-color: var(--ok); }
+  .approve .targets li.deny { border-left-color: var(--danger); color: var(--fg-dim); }
+  .approve .targets .dim { color: var(--fg-dim); }
+  .approve .targets .tier { margin-left: auto; color: var(--fg-dim); }
+  .approve .targets .what { min-width: 150px; text-align: right; }
 </style>

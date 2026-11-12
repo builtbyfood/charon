@@ -22,7 +22,11 @@ pub type Sink = Box<dyn Fn(Msg) + Send + Sync>;
 
 enum Slot {
     Attached(Sink),
-    Pending { msgs: Vec<Msg>, bytes: usize, dropped: usize },
+    Pending {
+        msgs: Vec<Msg>,
+        bytes: usize,
+        dropped: usize,
+    },
 }
 
 /// How a message was routed (for the output trace).
@@ -43,14 +47,22 @@ impl Outbox {
     /// flushed) or after it, never both or neither.
     pub fn send(&self, id: &str, msg: Msg) -> Route {
         let mut m = self.0.lock().unwrap();
-        let slot = m.entry(id.to_string()).or_insert_with(|| Slot::Pending { msgs: vec![], bytes: 0, dropped: 0 });
+        let slot = m.entry(id.to_string()).or_insert_with(|| Slot::Pending {
+            msgs: vec![],
+            bytes: 0,
+            dropped: 0,
+        });
         let closing = matches!(msg, Msg::Closed { .. });
         let route = match slot {
             Slot::Attached(sink) => {
                 sink(msg);
                 Route::Sent
             }
-            Slot::Pending { msgs, bytes, dropped } => {
+            Slot::Pending {
+                msgs,
+                bytes,
+                dropped,
+            } => {
                 if let Msg::Data { bytes: b, .. } = &msg {
                     *bytes += b.len();
                 }
@@ -106,7 +118,11 @@ mod tests {
     use std::sync::Arc;
 
     fn data(seq: u64, s: &str) -> Msg {
-        Msg::Data { seq, t: 0.0, bytes: s.as_bytes().to_vec() }
+        Msg::Data {
+            seq,
+            t: 0.0,
+            bytes: s.as_bytes().to_vec(),
+        }
     }
     fn recorder() -> (Arc<Mutex<Vec<Msg>>>, Sink) {
         let got = Arc::new(Mutex::new(vec![]));
@@ -122,14 +138,22 @@ mod tests {
         let (got, sink) = recorder();
         assert_eq!(o.attach("s", sink), (2, 0));
         assert_eq!(o.send("s", data(2, "ls")), Route::Sent);
-        assert_eq!(*got.lock().unwrap(), vec![data(0, "banner"), data(1, "$ "), data(2, "ls")]);
+        assert_eq!(
+            *got.lock().unwrap(),
+            vec![data(0, "banner"), data(1, "$ "), data(2, "ls")]
+        );
     }
 
     #[test]
     fn a_close_before_attach_is_delivered_and_ends_the_session() {
         let o = Outbox::default();
         o.send("s", data(0, "bye"));
-        o.send("s", Msg::Closed { reason: "exit 0".into() });
+        o.send(
+            "s",
+            Msg::Closed {
+                reason: "exit 0".into(),
+            },
+        );
         let (got, sink) = recorder();
         o.attach("s", sink);
         assert_eq!(got.lock().unwrap().len(), 2);
@@ -146,7 +170,12 @@ mod tests {
         o.send("s", data(0, "x"));
         o.attach("s", sb);
         o.send("s", data(1, "y"));
-        o.send("s", Msg::Closed { reason: "gone".into() });
+        o.send(
+            "s",
+            Msg::Closed {
+                reason: "gone".into(),
+            },
+        );
         assert_eq!(a.lock().unwrap().len(), 1);
         assert_eq!(b.lock().unwrap().len(), 2);
         assert!(o.0.lock().unwrap().is_empty());
@@ -161,7 +190,15 @@ mod tests {
         assert_eq!(o.send("s", data(2, "tail")), Route::BufferedDropping);
         let (got, sink) = recorder();
         assert_eq!(o.attach("s", sink), (2, PENDING_CAP / 2));
-        let seqs: Vec<u64> = got.lock().unwrap().iter().map(|m| match m { Msg::Data { seq, .. } => *seq, _ => 99 }).collect();
+        let seqs: Vec<u64> = got
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|m| match m {
+                Msg::Data { seq, .. } => *seq,
+                _ => 99,
+            })
+            .collect();
         assert_eq!(seqs, vec![1, 2]);
     }
 }

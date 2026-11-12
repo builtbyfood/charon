@@ -54,11 +54,13 @@
   import { tldrPage, preloadTldr } from "./tldr";
   import { flagsFromHelp, flagsFromTldr, mergeFlags, matchFlags, runFlagAccept, PickerGate, type Flag } from "./flags";
   import { CommandTracker, InjectionSwallower, detectShell, injectionFor, hookTextFor, looksLikeShellPrompt, looksLikeSudoPrompt, sudoUserOf, sudoAutoEligible, promptUserOf } from "./osc133";
+  import { sudoAutoAllowed } from "./prompt";
   import { sudoHasPassword, sudoSendPassword, sessionShells, connectionSetRemoteShell, type HostShells } from "./api";
   import { gutterRows, type GutterRow } from "./stamps";
   import { clampPane, PANE_DEFAULT, type ColLayout } from "./filecols";
+  import { dangerousCommand, fansOut, tailLine, typedLine } from "./broadcast";
 
-  let { open, adopt, color, font, prefs, active = true, os, osUser, onfontsize, ontimestamps, onclosed, onabort, oncwd, onopenfile, onfiles, onfileslayout, oncommand }: {
+  let { open, adopt, color, font, prefs, active = true, os, osUser, onfontsize, ontimestamps, onclosed, onabort, oncwd, onopenfile, onfiles, onfileslayout, oncommand, broadcast = null, onfan, onsession }: {
     open: OpenTarget;
     /** Arrived from another window: restore this instead of connecting. */
     adopt?: TabSnapshot;
@@ -92,6 +94,14 @@
     onfileslayout?: (l: { width?: number; columns?: ColLayout }) => void;
     /** The command being typed changed (for the Docs pane): (command|null, session|null). */
     oncommand?: (command: string | null, session: string | null) => void;
+    /** MultiExec: "source" = the active tab whose input is fanned out, "target" = a
+     *  selected tab receiving it; `count` = sessions getting the input, source included. */
+    broadcast?: { role: "source" | "target"; count: number } | null;
+    /** Source only: typed input (after this tab's own write), a paste (after the
+     *  guard, once), or the sudo button, for the owner to repeat on the targets. */
+    onfan?: (e: { kind: "data"; data: string } | { kind: "paste"; text: string } | { kind: "sudo" }) => void;
+    /** The tab's session id changed (connected, reconnected, closed): for the owner's per-session bookkeeping. */
+    onsession?: (id: string | null) => void;
   } = $props();
 
   let el: HTMLDivElement;
@@ -127,10 +137,18 @@
   let injectDeadline = 0;
   let injectDone = false;
   const swallower = new InjectionSwallower();
+  let injectPending = false;         // a swallow started by inject() hasn't ended yet
+  let swallowTimer: ReturnType<typeof setInterval> | undefined;
   // Nested shells (sudo -i, su -, ssh) start without the hook: a prompt-looking
   // line while a command is still "running" triggers a re-injection, rate-limited.
   let integrationEnabled = false;    // per-session switch (chip menu)
   let lastInjectAt = 0;
+  // The size the remote PTY was last given, and when. The hook is typed only once
+  // it matches the (fitted) terminal: readline wraps and redraws the long echoed
+  // line by its own width, and a stale one shows through as `&&turturn;`.
+  let remoteSize = { cols: 0, rows: 0 };
+  let resizedAt = 0;
+  const RESIZE_SETTLE_MS = 300;
   let reinjects = 0;
   const MAX_REINJECTS = 10;
   // Shell-integration chip in the status bar: "bash · 133 on · 3 marks".
@@ -155,6 +173,15 @@
   const hasFiles = $derived(open.kind !== "serial");
   export function toggleFiles() { if (hasFiles) { filesOpen = !filesOpen; onfiles?.(filesOpen); if (!filesOpen) term?.focus(); } }
   export function filesShown(): boolean { return filesOpen; }
+  /** Show or hide this tab's Files pane (Split collapses them and gives them back). */
+  export function setFiles(on: boolean) { if (hasFiles && filesOpen !== on) { filesOpen = on; onfiles?.(on); } }
+  /** Character cell size in CSS px (Split sizes its grid from it); null before the first render. */
+  export function cellSize(): { w: number; h: number } | null {
+    try {
+      const c = (term as unknown as { _core: { _renderService: { dimensions: { css: { cell: { width: number; height: number } } } } } })._core._renderService.dimensions.css.cell;
+      return c.width > 0 && c.height > 0 ? { w: c.width, h: c.height } : null;
+    } catch { return null; }
+  }
   // Who the shell is vs who SFTP is: differ after sudo -i / su -, so the pane switches backend.
   let sshUser = $state<string | undefined>();
   // The login user for a sudo prompt: SSH login user, or the OS user for a local shell.
@@ -245,6 +272,42 @@
   let sudoPrompt = $state<{ user: string | null } | null>(null);
   let sudoHasPw = $state<boolean | null>(null);   // cached: does the session have a stored password?
   let sudoAutoTimer: ReturnType<typeof setTimeout> | undefined;
+  // One automatic sudo answer per command the user started (see sudoAutoAllowed):
+  // an Enter going to the shell from this tab arms it, a send or a new prompt disarms it.
+  let sudoArmed = false;
+  function noteEnter(d: string) { if (d.includes("\r") || d.includes("\n")) sudoArmed = true; }
+  /** OSC 133: a command is running (C seen, no D yet). */
+  function commandOpen(): boolean {
+    const m = tracker?.marks.at(-1);
+    return !!m && m.outputStartLine !== undefined && m.endLine === undefined;
+  }
+
+  // MultiExec. onData is routed by origin (`fansOut`): keyboard input goes to the
+  // targets; xterm's replies and mouse/focus reports don't; a paste's echo through
+  // term.paste doesn't either (`pasting`), since pastes are fanned out once,
+  // separately, so each target brackets them for its own shell.
+  let pasting = false;
+  // The source's line as typed (fallback when OSC 133 can't read it off the screen).
+  let typedBuf = "";
+  // An Enter held back because the broadcast line starts with a dangerous command.
+  let bcGuard = $state<{ line: string; hit: string } | null>(null);
+  /** The command line about to run in the source tab. */
+  function sourceLine(): string { return tracker?.inputToCursor() ?? typedBuf; }
+  function confirmBcEnter() {
+    if (!bcGuard) return;
+    bcGuard = null;
+    console.info("[charon] broadcast: dangerous command confirmed");
+    if (sessionId) sessionWrite(sessionId, "\r");
+    noteEnter("\r"); typedBuf = "";
+    fanData("\r");
+    term.focus();
+  }
+  function cancelBcEnter() { bcGuard = null; term.focus(); }
+  // Last output line while hidden (not parsed): lets a hidden target tell whether
+  // it is sitting at a sudo prompt when the source's sudo button is pressed.
+  let hiddenTail = "";
+  const fanSource = $derived(broadcast?.role === "source");
+  function fanData(d: string) { if (fanSource) onfan?.({ kind: "data", data: d }); }
 
   // Flag picker (P5): a popup of a command's options as the user types `<cmd> -…`.
   let flagPopup = $state<{ x: number; y: number; command: string; token: string } | null>(null);
@@ -258,6 +321,7 @@
   const pickerGate = new PickerGate();
 
   let sessionId = $state<string | null>(null);
+  $effect(() => { const id = sessionId; untrack(() => onsession?.(id)); });
   let status = $state<"connecting" | "auth" | "hostkey" | "up" | "closed">("connecting");
   // Host key prompt: payload carries the session id to answer with.
   let hostkey = $state<HostKeyPrompt | null>(null);
@@ -330,7 +394,7 @@
       color: color ?? currentTheme().ui.accent,
       onchange: () => { osc133 = true; markCount = tracker.marks.length; },
       // Re-evaluate who the shell is on every prompt (sudo -i / su - / exit), un-latched.
-      onprompt: (line) => { pickerGate.prompt(); const u = promptUserOf(line); if (u) promptUser = u; },
+      onprompt: (line) => { pickerGate.prompt(); sudoArmed = false; const u = promptUserOf(line); if (u) promptUser = u; },
     });
     // OSC 7: the hook reports the cwd after every command.
     attachOsc7(term, () => cwd, (dir) => {
@@ -371,6 +435,18 @@
     term.attachCustomKeyEventHandler((e) => {
       if (e.type !== "keydown") return true;
       const handled = (): false => { e.preventDefault(); return false; };
+      // A broadcast Enter is held: Enter sends it everywhere, Esc keeps it unsent.
+      if (bcGuard) {
+        if (e.code === "Enter" || e.code === "NumpadEnter") { confirmBcEnter(); return handled(); }
+        if (e.code === "Escape") { cancelBcEnter(); return handled(); }
+        return handled();
+      }
+      // Broadcasting, Enter on a dangerous command: ask first, nothing is sent yet.
+      if (fanSource && (e.code === "Enter" || e.code === "NumpadEnter") && !e.ctrlKey && !e.altKey && !e.shiftKey && !flagPopup && !pasteGuard) {
+        const line = sourceLine();
+        const hit = dangerousCommand(line, prefs.broadcastConfirm);
+        if (hit) { bcGuard = { line: line.trim(), hit }; return handled(); }
+      }
       // Paste guard is up: Enter confirms, Esc cancels; xterm keeps focus meanwhile.
       if (pasteGuard) {
         if (e.code === "Enter" || e.code === "NumpadEnter") { confirmPaste(); return handled(); }
@@ -394,6 +470,8 @@
       if (e.ctrlKey && e.shiftKey && e.code === "KeyF") { openSearch(); return handled(); }
       if (e.ctrlKey && e.shiftKey && e.code === "KeyE") { toggleFiles(); return handled(); }
       if (e.ctrlKey && e.shiftKey && e.code === "KeyP" && sudoPrompt) { sendSudo(); return handled(); }
+      // Broadcast toggle: the window handler (App) owns it; keep ^B away from the shell.
+      if (e.ctrlKey && e.shiftKey && e.code === "KeyB") { e.preventDefault(); return false; }
       if (e.ctrlKey && !e.shiftKey && e.code === "KeyC" && prefs.ctrlCCopiesWhenSelected && term.hasSelection()) { copySelection(); return handled(); }
       if (e.ctrlKey && (e.code === "Equal" || e.code === "NumpadAdd")) { zoom(1); return handled(); }
       if (e.ctrlKey && (e.code === "Minus" || e.code === "NumpadSubtract")) { zoom(-1); return handled(); }
@@ -427,8 +505,18 @@
       }
     }, { capture: true });
 
-    term.onData((d) => { pickerGate.input(d); if (sessionId) sessionWrite(sessionId, d); });
-    term.onResize(({ cols, rows }) => { if (sessionId) sessionResize(sessionId, cols, rows); });
+    term.onData((d) => {
+      pickerGate.input(d);
+      if (sessionId) sessionWrite(sessionId, d);
+      if (fansOut(d, false)) { noteEnter(d); typedBuf = typedLine(typedBuf, d); }
+      if (fanSource && fansOut(d, pasting)) fanData(d);
+    });
+    term.onResize(({ cols, rows }) => {
+      if (!sessionId) return; // still connecting: `connect` sends it once the session is up
+      resizeRemote(sessionId, cols, rows);
+      // bash prints nothing on SIGWINCH, so a hook waiting for the size wouldn't hear about it.
+      if (integrationEnabled && !injectDone) scheduleQuietCheck(sessionId);
+    });
     perfTimer = setInterval(logPerf, 5000);
 
     if (adopt) await restore(adopt);
@@ -492,7 +580,8 @@
       status = "up";
       await listenSession(a.sessionId);
       await sessionRelease(a.sessionId);
-      if (term.cols !== a.cols || term.rows !== a.rows) sessionResize(a.sessionId, term.cols, term.rows);
+      remoteSize = { cols: a.cols, rows: a.rows };
+      if (term.cols !== a.cols || term.rows !== a.rows) resizeRemote(a.sessionId, term.cols, term.rows);
     } else {
       status = "closed";
     }
@@ -525,6 +614,7 @@
       hostkey = p; status = "hostkey";
     });
     console.info("[charon] connecting", { id, host: open.host, nodeId: open.nodeId, withPassword: pw !== undefined });
+    const sent = { cols: term.cols, rows: term.rows };
     try {
       const info = open.kind === "local"
         ? await openLocal({ id, node_id: open.nodeId, admin: open.admin, cols: term.cols, rows: term.rows })
@@ -535,6 +625,9 @@
             password: pw, cols: term.cols, rows: term.rows, remote_shell: shellOverride,
           });
       sessionId = info.id;
+      remoteSize = sent; resizedAt = Date.now();
+      // A resize while the connect was pending (auth prompt, layout settling) had no session to go to.
+      if (term.cols !== sent.cols || term.rows !== sent.rows) resizeRemote(info.id, term.cols, term.rows);
       status = "up";
       program = info.title;
       if (open.kind === "ssh") { sshUser = info.title.split("@")[0]; startedShell = info.remote_shell ?? ""; }
@@ -580,23 +673,8 @@ ${HIDE_CURSOR}`); onclosed(r); }, data: (raw, m) => {
       evCount++; byteCount += raw.length;
       // While the injected hook is being echoed back, show nothing until its end sentinel.
       const b = swallower.filter(raw);
-      if (!b.length) return;
-      // Hidden tab: don't run the parser/renderer; buffer and flush on activation.
-      if (!active) { bufferHidden(b); return; }
-      // Leaving the alternate screen (vim, htop) can leave a stale cursor cell in
-      // the WebGL atlas; redraw everything once the bytes are processed.
-      const leftAlt = webgl && exitsAltScreen(b);
-      // Run post-parse work in the write callback: term.write is async, so the
-      // buffer (and thus lastLine()) only reflects `b` once this fires. Reading
-      // it synchronously here would see the previous prompt, not a sudo one.
-      term.write(b, () => {
-        if (leftAlt) { webgl?.clearTextureAtlas(); term.refresh(0, term.rows - 1); }
-        maybeSudoPrompt(b);
-        if (diag.trace) { console.info(`[charon] out: parsed session=${id} seq=${m.seq} lag=${(epochMs() - m.t).toFixed(1)}ms`); tracePaint = { seq: m.seq, t: m.t }; }
-      });
-      // An injected/hidden command just stopped being swallowed: release queued pastes.
-      if (pendingPaste.length && !swallower.swallowing) flushPendingPaste();
-      if (integrationEnabled) scheduleQuietCheck(id);
+      if (injectPending && !swallower.swallowing) injectEnded(id);
+      if (b.length) show(id, b, m);
     } }));
     // MCP read_scrollback: only the Terminal that owns this session answers.
     unlisteners.push(await onMcpScrollback((p) => {
@@ -668,6 +746,7 @@ ${HIDE_CURSOR}`); onclosed(r); }, data: (raw, m) => {
   onDestroy(() => {
     unwatchTheme();
     clearTimeout(injectTimer);
+    clearInterval(swallowTimer);
     clearTimeout(flagEvalTimer);
     clearTimeout(selTimer);
     clearInterval(perfTimer);
@@ -746,7 +825,8 @@ ${HIDE_CURSOR}`); onclosed(r); }, data: (raw, m) => {
     const ctx = input !== null ? cmdContext(input) : null;
     const prefix = ctx?.token ?? flagPopup?.token ?? "";
     const r = runFlagAccept(prefix, flagList, index, {
-      send: (s) => { if (sessionId) sessionWrite(sessionId, s); },
+      // The picker runs here only; what it types goes to the targets like typing would.
+      send: (s) => { if (sessionId) sessionWrite(sessionId, s); fanData(s); },
       focus: () => term.focus(),
       close: closeFlagPicker,
     });
@@ -796,16 +876,86 @@ ${HIDE_CURSOR}`); onclosed(r); }, data: (raw, m) => {
     for (let i = b.baseY + b.cursorY; i >= 0 && !line; i--) line = b.getLine(i)?.translateToString(true) ?? "";
     return line;
   }
+  /** Session output that made it past the swallower: to the screen, or held while the tab is hidden. */
+  function show(id: string, b: Uint8Array, m?: { seq: number; t: number }) {
+    // Hidden tab: don't run the parser/renderer; buffer and flush on activation.
+    if (!active) {
+      bufferHidden(b);
+      if (broadcast) hiddenTail = tailLine(hiddenTail, new TextDecoder().decode(b));
+      return;
+    }
+    // Leaving the alternate screen (vim, htop) can leave a stale cursor cell in
+    // the WebGL atlas; redraw everything once the bytes are processed.
+    const leftAlt = webgl && exitsAltScreen(b);
+    // Run post-parse work in the write callback: term.write is async, so the
+    // buffer (and thus lastLine()) only reflects `b` once this fires. Reading
+    // it synchronously here would see the previous prompt, not a sudo one.
+    term.write(b, () => {
+      if (leftAlt) { webgl?.clearTextureAtlas(); term.refresh(0, term.rows - 1); }
+      maybeSudoPrompt(b);
+      if (diag.trace && m) { console.info(`[charon] out: parsed session=${id} seq=${m.seq} lag=${(epochMs() - m.t).toFixed(1)}ms`); tracePaint = { seq: m.seq, t: m.t }; }
+    });
+    // An injected/hidden command just stopped being swallowed: release queued pastes.
+    if (pendingPaste.length && !swallower.swallowing) flushPendingPaste();
+    if (integrationEnabled) scheduleQuietCheck(id);
+  }
   function inject(id: string, detected: Shell) {
     shell = detected;
     promptUser = promptUserOf(lastLine()) ?? promptUser;
     sessionSetShell(id, detected).catch(() => {});
-    swallower.start();
+    const text = injectionFor(detected);
+    swallower.start(text);
+    injectPending = true;
     lastInjectAt = Date.now();
-    sessionWrite(id, injectionFor(detected));
+    // The swallow also ends on inactivity (`inject.ts`): nothing else would wake
+    // us once the remote goes quiet without sending the marker.
+    clearInterval(swallowTimer);
+    swallowTimer = setInterval(() => {
+      const left = swallower.expire();
+      if (swallower.swallowing) return;
+      if (injectPending) injectEnded(id);
+      if (left?.length) show(id, left);
+    }, 250);
+    sessionWrite(id, text);
+  }
+  /**
+   * The injected block's marker arrived (or the swallow gave up). `skip`: the
+   * shell's own `$BASH_VERSION` / `$ZSH_VERSION` said the prompt detector was
+   * wrong (BusyBox ash, dash), so no hook was installed and the tab has no shell.
+   */
+  function injectEnded(id: string) {
+    injectPending = false;
+    clearInterval(swallowTimer);
+    const r = swallower.result;
+    console.info(`[charon] 133: injection ended: ${r}`);
+    if (r !== "skip") return;
+    reason = `the shell isn't ${shell ?? "bash/zsh"} (no ${shell === "zsh" ? "$ZSH_VERSION" : "$BASH_VERSION"}), hook skipped`;
+    shell = undefined;
+    sessionSetShell(id, null).catch(() => {});
+  }
+  function resizeRemote(id: string, cols: number, rows: number) {
+    remoteSize = { cols, rows }; resizedAt = Date.now();
+    sessionResize(id, cols, rows);
+  }
+  /**
+   * Can the hook be typed now? Not in a hidden tab (it isn't fitted yet), not
+   * before the remote has the terminal's size, and not right after a resize
+   * (the shell applies SIGWINCH asynchronously). A later quiet check retries.
+   */
+  function sizeSettled(): boolean {
+    if (!active) return false;
+    if (sessionId && (remoteSize.cols !== term.cols || remoteSize.rows !== term.rows)) {
+      resizeRemote(sessionId, term.cols, term.rows);
+      scheduleQuietCheck(sessionId);
+      return false;
+    }
+    const wait = RESIZE_SETTLE_MS - (Date.now() - resizedAt);
+    if (wait > 0 && sessionId) { scheduleQuietCheck(sessionId); return false; }
+    return true;
   }
   function tryInjection(id: string) {
     if (injectDone || !sessionId) return;
+    if (!sizeSettled()) return;
     const finish = (r: string, detected?: string, injected = false) => {
       injectDone = true; reason = injected ? "" : r;
       console.info(`[charon] 133: detected=${detected ?? "none"} injected=${injected} reason=${r}`);
@@ -829,6 +979,7 @@ ${HIDE_CURSOR}`); onclosed(r); }, data: (raw, m) => {
    */
   function maybeReinject(id: string) {
     if (!sessionId || swallower.swallowing || reinjects >= MAX_REINJECTS || Date.now() - lastInjectAt < 3000) return;
+    if (!sizeSettled()) return;
     const running = tracker.marks.at(-1);
     if (!running || running.outputStartLine === undefined || running.endLine !== undefined) return;
     const line = lastLine();
@@ -1042,12 +1193,19 @@ ${HIDE_CURSOR}`); onclosed(r); }, data: (raw, m) => {
     // characters, or `$ `-prefixed doc lines. An ordinary one-line paste goes
     // straight through. Inline, non-modal bar (xterm keeps focus; Enter/Esc resolve).
     const warns = pasteWarnings(text, prefs.pasteGuardLines);
+    // Broadcasting a paste with a dangerous command in it always asks.
+    if (fanSource) {
+      const hit = dangerousCommand(cleaned, prefs.broadcastConfirm);
+      if (hit) warns.unshift(`a "${hit}" command to ${broadcast?.count ?? "several"} sessions`);
+    }
     if (warns.length) { pasteGuard = { cleaned, warns, route }; return; }
     sendPaste(cleaned, route);
   }
   /** Send a (sanitised) paste, or queue it behind an in-flight hidden/injected command. */
-  function sendPaste(cleaned: string, route: string) {
+  function sendPaste(cleaned: string, route: string, focus = true) {
     if (!sessionId) return;
+    // Broadcasting: the guard (if any) has been answered here, once; the targets take it as is.
+    if (fanSource && route !== "broadcast") onfan?.({ kind: "paste", text: cleaned });
     const bracketed = !!term.modes.bracketedPasteMode;
     // A hidden command's echo is being swallowed → don't interleave; queue and flush
     // when it ends (the backend also queues writes during its Capture window).
@@ -1055,22 +1213,44 @@ ${HIDE_CURSOR}`); onclosed(r); }, data: (raw, m) => {
     console.info(`[charon] paste: route=${route} bytes=${cleaned.length} bracketed=${bracketed} queued=${queued}`);
     if (queued) { pendingPaste.push({ cleaned, route }); return; }
     writePaste(cleaned, bracketed);
-    term.focus();
+    if (focus) term.focus();
   }
   function writePaste(cleaned: string, bracketed: boolean) {
     pickerGate.send(() => writePasteNow(cleaned, bracketed));
   }
   function writePasteNow(cleaned: string, bracketed: boolean) {
-    // Bracketed + "auto" + trailing newline: paste the body inside the 200~/201~
-    // markers, then send the newline *after* 201~ so the shell executes it instead
-    // of leaving it highlighted. Otherwise xterm's paste keeps the newline inside.
-    if (bracketed && prefs.pasteRun === "auto" && /\n$/.test(cleaned)) {
-      term.paste(cleaned.replace(/\r?\n$/, ""));
-      if (sessionId) sessionWrite(sessionId, "\r");
-    } else {
-      term.paste(cleaned);
-    }
+    // term.paste comes back through onData: not typed input, so not fanned out again.
+    pasting = true;
+    try {
+      // Bracketed + "auto" + trailing newline: paste the body inside the 200~/201~
+      // markers, then send the newline *after* 201~ so the shell executes it instead
+      // of leaving it highlighted. Otherwise xterm's paste keeps the newline inside.
+      if (bracketed && prefs.pasteRun === "auto" && /\n$/.test(cleaned)) {
+        term.paste(cleaned.replace(/\r?\n$/, ""));
+        if (sessionId) sessionWrite(sessionId, "\r");
+        noteEnter("\r");
+      } else {
+        term.paste(cleaned);
+      }
+    } finally { pasting = false; }
   }
+  /** MultiExec target: a paste from the source tab, already sanitised and past its guard.
+   *  Bracketed for this tab's shell; queued like any paste while a hook echo is swallowed. */
+  export function pasteBroadcast(cleaned: string) { sendPaste(cleaned, "broadcast", false); }
+  /** This tab's session (MultiExec writes typed input to it directly: no flag picker
+   *  or capture runs on a target; the backend queues writes behind a hidden command). */
+  export function sessionOf(): string | null { return sessionId; }
+  /** MultiExec target: input from the source tab went to this session (an Enter in
+   *  it starts a command here too, for the sudo auto-send gate). */
+  export function noteInput(d: string) { noteEnter(d); }
+  /** At a sudo/su password prompt (detected on screen, or on the hidden tail):
+   *  only then may the source's sudo button send this session's password. */
+  export function atSudoPrompt(): boolean {
+    if (status !== "up" || winLocalNoSudo) return false;
+    return active ? !!sudoPrompt : looksLikeSudoPrompt(hiddenTail);
+  }
+  /** Put the keyboard here (split view: several tabs are shown, one has the keys). */
+  export function focusTerm() { focusShown(); }
   function flushPendingPaste() {
     if (!pendingPaste.length) return;
     const items = pendingPaste; pendingPaste = [];
@@ -1118,15 +1298,19 @@ ${HIDE_CURSOR}`); onclosed(r); }, data: (raw, m) => {
     // Auto-send only for the login user's own sudo prompt; a bare `Password:` (su)
     // or another user's prompt shows the button but never auto-sends.
     const eligible = sudoAutoEligible(line, loginUser);
-    const auto = !!sudoHasPw && prefs.sudoAutoSend && eligible;
+    const open = commandOpen();
+    const auto = sudoAutoAllowed({ pref: prefs.sudoAutoSend, hasPassword: !!sudoHasPw, eligible, integration: osc133, commandOpen: open, armed: sudoArmed });
     // One diagnostic line (no secret): hasPassword drives the button; eligible +
     // autoSend drive auto-send; loginUser is the credential owner we'd send.
-    console.info(`[charon] sudo: prompt detected user=${user ?? "?"} loginUser=${loginUser ?? "?"} hasPassword=${sudoHasPw} autoSend=${prefs.sudoAutoSend} eligible=${eligible} button=${!!sudoHasPw} sent=${auto}`);
-    if (auto) sudoAutoTimer = setTimeout(() => sendSudo(), 300);
+    console.info(`[charon] sudo: prompt detected user=${user ?? "?"} loginUser=${loginUser ?? "?"} hasPassword=${sudoHasPw} autoSend=${prefs.sudoAutoSend} eligible=${eligible} integration=${osc133} commandOpen=${open} armed=${sudoArmed} button=${!!sudoHasPw} sent=${auto}`);
+    if (auto) { sudoArmed = false; sudoAutoTimer = setTimeout(() => sendSudo(false), 300); }
   }
-  async function sendSudo() {
+  async function sendSudo(manual = true) {
     clearTimeout(sudoAutoTimer);
     if (!sessionId || !sudoPrompt) return;
+    // Broadcasting, button pressed: every target at a prompt answers with its own
+    // credential too. Auto-send stays this tab's own (its eligibility rules are per prompt).
+    if (fanSource && manual) onfan?.({ kind: "sudo" });
     let ok = false;
     try { ok = await sudoSendPassword(sessionId); } catch { ok = false; }
     console.info(`[charon] sudo: password send requested sent=${ok}`);
@@ -1291,7 +1475,7 @@ ${HIDE_CURSOR}`); onclosed(r); }, data: (raw, m) => {
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="wrap" style:--session-color={color ?? "var(--accent)"}>
+<div class="wrap" class:bc-source={broadcast?.role === "source"} class:bc-target={broadcast?.role === "target"} style:--session-color={color ?? "var(--accent)"}>
   <div class="split" bind:clientWidth={splitW}>
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div class="termbox" oncontextmenu={onContextMenu}>
@@ -1375,6 +1559,15 @@ ${HIDE_CURSOR}`); onclosed(r); }, data: (raw, m) => {
       {/if}
     </div>
   {/if}
+  {#if bcGuard}
+    <div class="pasteguard bcguard" role="alert">
+      <span class="pg-icon">⚠</span>
+      <span class="pg-msg">Run <code>{bcGuard.line}</code> on {broadcast?.count ?? "every"} sessions?</span>
+      <span class="pg-hint">“{bcGuard.hit}” · Enter to run everywhere · Esc to cancel</span>
+      <button type="button" class="primary" onclick={confirmBcEnter}>Run on all</button>
+      <button type="button" onclick={cancelBcEnter}>Cancel</button>
+    </div>
+  {/if}
   {#if pasteGuard}
     <div class="pasteguard" role="alert">
       <span class="pg-icon">⚠</span>
@@ -1404,12 +1597,17 @@ ${HIDE_CURSOR}`); onclosed(r); }, data: (raw, m) => {
     </form>
   {/if}
   <div class="status" class:up={status === "up"} class:closed={status === "closed"}>
+    {#if broadcast?.role === "source"}
+      <span class="bc-chip" role="status" title="Everything typed or pasted here also goes to the selected tabs (Ctrl+Shift+B to stop)">BROADCAST → {broadcast.count} {broadcast.count === 1 ? "session" : "sessions"}</span>
+    {:else if broadcast?.role === "target"}
+      <span class="bc-chip target" title="This tab receives input broadcast from the active tab">receiving broadcast</span>
+    {/if}
     <span class="dot"></span>{status}{error ? ` — ${error}` : ""}
     {#if status === "closed"}
       <button type="button" class="chip reconnect" onclick={reconnect} title="Reconnect reusing this connection's host and credentials">reconnect</button>
     {/if}
     {#if sudoPrompt && sudoHasPw && status === "up"}
-      <button type="button" class="chip sudo" onclick={sendSudo}
+      <button type="button" class="chip sudo" onclick={() => sendSudo()}
         title="Send the saved password to the {sudoPrompt.user ? `sudo prompt for ${sudoPrompt.user}` : 'password prompt'} (Ctrl+Shift+P). Not echoed.">
         send saved password
       </button>
@@ -1432,6 +1630,11 @@ ${HIDE_CURSOR}`); onclosed(r); }, data: (raw, m) => {
 <style>
   .wrap { position: relative; height: 100%; display: flex; flex-direction: column; border-left: 3px solid var(--session-color); }
   .split { flex: 1; min-height: 0; display: flex; }
+  /* MultiExec: the tab whose keys go to N sessions can't be mistaken for an ordinary one. */
+  .wrap.bc-source { outline: 3px solid var(--warn); outline-offset: -3px; }
+  .wrap.bc-target { outline: 2px dashed var(--warn); outline-offset: -2px; }
+  .bc-chip { font-weight: 700; letter-spacing: .04em; color: var(--bg); background: var(--warn); border-radius: 3px; padding: 0 6px; }
+  .bc-chip.target { font-weight: 600; color: var(--warn); background: transparent; border: 1px dashed var(--warn); }
   .termbox { flex: 1; min-height: 0; min-width: 0; position: relative; display: flex; }
   .vsplit { width: 4px; cursor: col-resize; background: var(--line); }
   .vsplit:hover, .vsplit:active { background: var(--session-color); }
@@ -1449,6 +1652,8 @@ ${HIDE_CURSOR}`); onclosed(r); }, data: (raw, m) => {
   .pasteguard .pg-icon { color: var(--warn); font-size: 14px; }
   .pasteguard .pg-msg { font-weight: 600; }
   .pasteguard .pg-hint { margin-right: auto; color: var(--fg-dim); }
+  .bcguard { border-top-color: var(--danger); background: color-mix(in srgb, var(--danger) 14%, transparent); }
+  .bcguard code { font-family: var(--font-mono); }
   .auth { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 6px 8px; background: var(--bg-raised); border-top: 1px solid var(--line); }
   .auth .who { font-family: var(--font-mono); color: var(--fg-dim); }
   .auth input[type="password"] { width: 180px; font-family: var(--font-mono); }

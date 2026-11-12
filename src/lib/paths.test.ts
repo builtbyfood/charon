@@ -16,13 +16,13 @@ test("crumbs", () => {
     { label: "/", path: "/" }, { label: "home", path: "/home" }, { label: "admin", path: "/home/admin" },
   ]);
   assert.deepEqual(crumbsOf("/"), [{ label: "/", path: "/" }]);
-  assert.deepEqual(crumbsOf("C:\\Users\\travis"), [
-    { label: "C:\\", path: "C:\\" }, { label: "Users", path: "C:\\Users" }, { label: "travis", path: "C:\\Users\\travis" },
+  assert.deepEqual(crumbsOf("C:\\Users\\alice"), [
+    { label: "C:\\", path: "C:\\" }, { label: "Users", path: "C:\\Users" }, { label: "alice", path: "C:\\Users\\alice" },
   ]);
 });
 
 test("osc7ToLocal undoes the pwsh hook's /C:/ spelling", () => {
-  assert.equal(osc7ToLocal("/C:/Users/travis"), "C:\\Users\\travis");
+  assert.equal(osc7ToLocal("/C:/Users/alice"), "C:\\Users\\alice");
   assert.equal(osc7ToLocal("/C:"), "C:\\");
   assert.equal(osc7ToLocal("/home/x"), "/home/x");
 });

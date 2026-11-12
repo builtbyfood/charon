@@ -67,10 +67,22 @@ static MODE: AtomicU8 = AtomicU8::new(0);
 /// Apply the profile's value (at start and whenever the profile is saved).
 pub fn configure(profile: &str) -> Mode {
     let env = std::env::var("CHARON_REPAINT").ok();
-    let m = if cfg!(target_os = "linux") { effective(profile, env.as_deref()) } else { Mode::Off };
+    let m = if cfg!(target_os = "linux") {
+        effective(profile, env.as_deref())
+    } else {
+        Mode::Off
+    };
     let old = Mode::from_u8(MODE.swap(m as u8, Ordering::Relaxed));
     if old != m {
-        tracing::info!("[charon] repaint: mode={}{}", m.name(), if env.is_some() { " (CHARON_REPAINT)" } else { "" });
+        tracing::info!(
+            "[charon] repaint: mode={}{}",
+            m.name(),
+            if env.is_some() {
+                " (CHARON_REPAINT)"
+            } else {
+                ""
+            }
+        );
     }
     m
 }
@@ -80,7 +92,8 @@ pub fn mode() -> Mode {
 }
 
 #[cfg(target_os = "linux")]
-static TX: std::sync::OnceLock<std::sync::mpsc::SyncSender<&'static str>> = std::sync::OnceLock::new();
+static TX: std::sync::OnceLock<std::sync::mpsc::SyncSender<&'static str>> =
+    std::sync::OnceLock::new();
 
 /// Something changed on screen (`why`: "output", "ticker"): repaint soon.
 pub fn poke(why: &'static str) {
@@ -103,25 +116,34 @@ pub fn start(app: tauri::AppHandle) {
     if TX.set(tx).is_err() {
         return;
     }
-    let spawned = std::thread::Builder::new().name("repaint".into()).spawn(move || {
-        let (mut fired, mut since) = (0u64, Instant::now());
-        let mut sizes = Sizes::new();
-        while let Ok(why) = rx.recv() {
-            let m = mode();
-            if m == Mode::Off {
-                continue;
+    let spawned = std::thread::Builder::new()
+        .name("repaint".into())
+        .spawn(move || {
+            let (mut fired, mut since) = (0u64, Instant::now());
+            let mut sizes = Sizes::new();
+            while let Ok(why) = rx.recv() {
+                let m = mode();
+                if m == Mode::Off {
+                    continue;
+                }
+                repaint_all(&app, m, &mut sizes);
+                fired += 1;
+                if crate::session::TRACE.load(Ordering::Relaxed) {
+                    tracing::info!(
+                        "[charon] repaint: fired mode={} why={why} n={fired}",
+                        m.name()
+                    );
+                } else if since.elapsed() >= Duration::from_secs(5) {
+                    tracing::info!(
+                        "[charon] repaint: mode={} fired {fired} times in {:.0} s",
+                        m.name(),
+                        since.elapsed().as_secs_f64()
+                    );
+                    (fired, since) = (0, Instant::now());
+                }
+                std::thread::sleep(Duration::from_millis(16));
             }
-            repaint_all(&app, m, &mut sizes);
-            fired += 1;
-            if crate::session::TRACE.load(Ordering::Relaxed) {
-                tracing::info!("[charon] repaint: fired mode={} why={why} n={fired}", m.name());
-            } else if since.elapsed() >= Duration::from_secs(5) {
-                tracing::info!("[charon] repaint: mode={} fired {fired} times in {:.0} s", m.name(), since.elapsed().as_secs_f64());
-                (fired, since) = (0, Instant::now());
-            }
-            std::thread::sleep(Duration::from_millis(16));
-        }
-    });
+        });
     if let Err(e) = spawned {
         tracing::warn!("repaint thread: {e}");
     }
@@ -153,7 +175,11 @@ fn repaint_all(app: &tauri::AppHandle, m: Mode, sizes: &mut Sizes) {
             // window may have been resized by the user, so read it afresh.
             let now = std::time::Instant::now();
             let size = match sizes.get(w.label()) {
-                Some((s, last)) if now.duration_since(*last) < std::time::Duration::from_secs(1) => Some(*s),
+                Some((s, last))
+                    if now.duration_since(*last) < std::time::Duration::from_secs(1) =>
+                {
+                    Some(*s)
+                }
                 _ => w.inner_size().ok(),
             };
             if let Some(size) = size {

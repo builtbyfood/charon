@@ -21,11 +21,17 @@ use std::collections::BTreeSet;
 use std::sync::LazyLock;
 
 pub fn parse(s: &str) -> BTreeSet<String> {
-    s.split(',').map(|f| f.trim().to_ascii_lowercase()).filter(|f| !f.is_empty()).collect()
+    s.split(',')
+        .map(|f| f.trim().to_ascii_lowercase())
+        .filter(|f| !f.is_empty())
+        .collect()
 }
 
-static FLAGS: LazyLock<BTreeSet<String>> =
-    LazyLock::new(|| std::env::var("CHARON_BISECT").map(|s| parse(&s)).unwrap_or_default());
+static FLAGS: LazyLock<BTreeSet<String>> = LazyLock::new(|| {
+    std::env::var("CHARON_BISECT")
+        .map(|s| parse(&s))
+        .unwrap_or_default()
+});
 
 pub fn active() -> bool {
     !FLAGS.is_empty()
@@ -42,7 +48,10 @@ pub fn describe() -> String {
 
 /// `window.__CHARON_BISECT__ = [...]` for the page.
 pub fn init_script() -> String {
-    format!("window.__CHARON_BISECT__ = {};", serde_json::to_string(&*FLAGS).unwrap_or_else(|_| "[]".into()))
+    format!(
+        "window.__CHARON_BISECT__ = {};",
+        serde_json::to_string(&*FLAGS).unwrap_or_else(|_| "[]".into())
+    )
 }
 
 #[cfg(test)]
@@ -52,7 +61,10 @@ mod tests {
     #[test]
     fn parses_a_comma_list() {
         let f = parse(" DMABUF, page=bare ,,nofocus");
-        assert_eq!(f.into_iter().collect::<Vec<_>>(), vec!["dmabuf", "nofocus", "page=bare"]);
+        assert_eq!(
+            f.into_iter().collect::<Vec<_>>(),
+            vec!["dmabuf", "nofocus", "page=bare"]
+        );
         assert!(parse("").is_empty());
     }
 }

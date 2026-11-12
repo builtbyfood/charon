@@ -4,6 +4,174 @@ All notable changes to Charon are recorded here. Versions follow semver; the
 canonical version lives in `src-tauri/tauri.conf.json` and is propagated to
 `package.json` and `Cargo.toml` by `npm run bump` (`scripts/bump-version.mjs`).
 
+## 0.4.0
+
+First public release. Security and robustness pass before going public.
+
+### Security
+- **russh 0.65** (was 0.45): fixes the client-side advisories
+  RUSTSEC-2026-0153/0154/0492/0493/0494/0496 (pre-authentication allocations,
+  oversized packets, handler callbacks for channels the client never opened).
+  RSA keys sign with the strongest rsa-sha2 hash the server lists. rusqlite 0.39.
+- **MCP and sudo.** A `run_command` that starts with `sudo` is no longer typed
+  into the terminal: the rest runs as root on its own channel, with the stored
+  password given to sudo's stdin and nothing else (`sudo -S -k`, the command's
+  stdin is /dev/null, no password at all when sudo doesn't need one). Charon no
+  longer watches command output for password prompts, so a fake prompt gets
+  nothing. The approval dialog's checkbox now reads *may run as root*. `sudo -u`,
+  and sudo/su elsewhere in the command, are refused.
+- **Sudo auto-send in your own tabs** only fires while a command you started is
+  running (shell integration on, an Enter typed in that tab since the prompt),
+  once per command; any other password prompt shows the button.
+- **Hidden-command sentinels** carry a random value per command, so output can't
+  fake the end of a capture or inject data.
+- **MCP token file** is restricted to your user before the token is written
+  (0600 on Linux/macOS, a user-only ACL on Windows); the bearer check is
+  constant-time.
+- **Vault:** decrypted secrets are wiped from memory when dropped and never
+  printed by debug output.
+- Patch updates for rustls, webpki, tokio, rustix, clipboard-win; the tldr
+  archive's entries are read with a size cap.
+- `SECURITY.md`: report vulnerabilities through GitHub's private reporting.
+
+### Broadcast input
+- **Safety:** broadcast switches itself off after 10 minutes without input, and
+  Enter on `rm`, `dd`, `mkfs`, `shutdown`, `reboot`, `poweroff`, `halt` or
+  `systemctl stop` (also in a paste) asks before it goes to every session.
+  `[broadcast]` in the profile sets the minutes and the list.
+- A tab whose session closes drops out of the broadcast.
+
+### Platform
+- **Linux renderer:** the default is now *Automatic*: the DOM renderer on Linux
+  (WebKitGTK), WebGL elsewhere. WebGL stays selectable.
+- **Portable on Linux** keeps the webview's data in `data/` too (the main window
+  is now created in code with its profile directory). macOS's webview can't be
+  moved.
+
+### Fixes
+- Picking a free "name (n)" on a remote folder no longer loops forever on a
+  server that reports every name as existing.
+
+### Development
+- `ssh.rs` split into `ssh/` (connect, channel, exec); `cargo fmt` and
+  `cargo clippy -D warnings` clean; an end-to-end SSH test (connect, hidden
+  command, SFTP, sudo-sftp, root commands) runs against a containerised sshd in
+  CI; `docs/TESTING.md` updated for 0.4.
+
+## 0.3.13
+
+### MultiExec
+- **Broadcast no longer drops or splits keystrokes.** Typed input was told
+  apart from xterm's own replies by timing (a key event in the last 50 ms), but
+  xterm's key handlers run before Charon's, so the first key after any pause
+  failed the check: targets got fragments (`tes`) or nothing, and the half
+  lines left their command marks misaligned. Input is now routed by where it
+  comes from: keys and flag-picker inserts go to the targets; a paste goes once,
+  through the paste guard; xterm's replies (cursor reports, mouse, focus) never
+  do. No clock is involved.
+- **Writes reach each session in order.** Every keystroke was a separate async
+  call to the backend, and two close together could land swapped (`ehco`). Writes
+  to a session now go one at a time, what arrives meanwhile joined into the next.
+  Tested: a 20-character line typed at 1 ms and at 200 ms intervals reaches four
+  targets byte for byte, with exactly one `
+` for the Enter.
+
+### MCP
+- **`list_sessions` shows `broadcast`**: `source`, `target` or `off` for each
+  session.
+
+## 0.3.12
+
+### Split view
+- **Fits the window.** The grid's rows and columns come from the number of
+  panes and the space available, so every pane is fully visible and keeps at
+  least 24×60 characters. With more panes than fit, the grid scrolls vertically,
+  snapping to whole rows, and the pane with the keyboard scrolls into view.
+- **Files panels.** Entering Split collapses every pane's Files panel. The top
+  bar's Files button then opens or closes them in all panes at once; each
+  pane's own `files` button in its status bar still does just that pane.
+  Leaving Split (or unticking a tab) gives every tab its Files state back.
+- **Pop-out (⧉).** Opens the Split panes in a window of their own; the main
+  window keeps a placeholder tab for each (⧉, click to bring the window
+  forward). Closing the pop-out moves the panes back into the main window, in
+  Split again.
+- **Click a pane to type in it.** One click gives a pane the keyboard and makes
+  it the broadcast source; the amber border and the `BROADCAST → N` chip move
+  with it.
+
+### MultiExec
+- **Broadcast across windows.** The ticked tabs, the on/off switch and the
+  source are shared by every Charon window, so a broadcast reaches ticked tabs
+  in torn-off and pop-out windows too (it was limited to one window). The source
+  is the terminal that last had the keyboard, in whichever window.
+
+## 0.3.11
+
+### MultiExec (broadcast input)
+- **Type once, send to several sessions.** Tick tabs with the checkbox in the
+  tab strip (it shows on hover), or use **Broadcast to folder** on a tree folder
+  (right-click, or the ⇶ button): that opens every host under it, reusing tabs
+  already open, and ticks them. **Ctrl+Shift+B** (or the Broadcast button)
+  then sends every keystroke and paste in the active tab to each ticked tab's
+  session too. The active tab is the source wherever it is; switching tabs
+  moves the source.
+- **Hard to miss.** Ticked tabs are striped; while broadcasting the active
+  terminal has an amber border and a `BROADCAST → N sessions` chip in its status
+  bar, the receiving tabs a dashed amber border and "receiving broadcast", and
+  the tab-bar button reads `Broadcasting → N`.
+- **Rules.** The paste guard asks once, in the active tab; the paste then goes
+  to each target bracketed for that target's shell. The sudo button answers
+  every target that is at a password prompt with that session's own stored
+  password, and sends nothing to a target that isn't (auto-send stays per tab).
+  The flag picker and hidden-command capture run only in the active tab (what
+  the picker inserts is sent to the targets like typing). xterm's own replies
+  (cursor reports, mouse and focus reports) never go to other sessions.
+- **Split view.** The Split button shows the active tab and the ticked ones
+  side by side, 2×2 up to four and 3×2 up to six; click a pane to give it the
+  keyboard.
+
+### MCP
+- **`run_command` takes `sessions: [...]`** to run the same command on each.
+  Every session's own tier gates it (read refuses it, exec-approve asks, trusted
+  and "always" sessions run); one approval dialog lists all targets with what
+  each will get; one log line per target; the result has one entry per session,
+  in the order given. The dialog's sudo opt-in covers only the targets it asked
+  about.
+
+## 0.3.10
+
+### Shell integration
+- **No "can only `return'" error when the hook meets a shell that already has
+  it.** The bash and zsh hooks started with `[ -n "$CHARON_HOOKED" ] && return`,
+  but they arrive through `eval`, where a top-level `return` is an error: bash
+  printed it and loaded the hook again (`PROMPT_COMMAND` ran the prompt hook
+  twice). The body is now inside `if [ -z "$CHARON_HOOKED" ]; then … fi`.
+- **The injected hook always ends with its marker, whatever the shell.** A
+  prompt that looked like bash on a BusyBox `ash` (or dash) host got the bash
+  hook; if the shell didn't get as far as the closing `printf`, Charon never
+  saw the end marker and the swallowed echo was shown after 5 s. The injection
+  is now behind `case "${BASH_VERSION-}" in "") … ;; *) eval … ;; esac`
+  (`$ZSH_VERSION` for zsh), so the shell itself confirms the prompt detector's
+  guess in the same round trip. Any other shell skips the hook and prints a
+  `7770;skip` marker; the tab then shows "the shell isn't bash … hook skipped"
+  and has no shell set. Injection code moved to `src/lib/inject.ts` (node-tested
+  against a real bash).
+- **The hook's echo stays hidden on slow links.** Charon hid the echo for a
+  fixed 5 s, then showed everything, the whole `eval "$(cat <<'CHARON_EOF' …`
+  included. Now it keeps hiding while the echo is still coming in: it gives up
+  after 1.5 s without new output, or 20 s in all. If it gives up, it shows what
+  isn't the echo (an error message, the new prompt) and drops the lines that
+  repeat the injected text, including readline's redraws of them.
+- **The hook is typed only once the remote has the terminal's real size.**
+  Readline wraps and redraws the long injected line by the width it was told;
+  when that differed from xterm's, the redraw showed through as garbled echo
+  (`&& return;` drawn as `&&turturn;`). Two ways it went stale: a resize while
+  the connect was still pending (auth prompt, layout settling) was dropped, as
+  there was no session yet to send it to, and a tab reopened in the background
+  had the hook typed before it was ever fitted. Charon now sends the size again
+  once the session is up if it changed, waits for a visible (fitted) tab, and
+  leaves 300 ms after a resize before typing the hook.
+
 ## 0.3.9
 
 ### MCP (PowerShell fixes; the 0.3.8 CI failures)

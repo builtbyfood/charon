@@ -76,7 +76,7 @@ the webview on Windows.
 One SSH connection carries several channels; which one a feature uses matters.
 
 - **Interactive shell** (the terminal). *Hidden commands* (`hidden.rs`,
-  `Session::exec_hidden`) are typed into it, wrapped in OSC 7771 sentinels, and their
+  `Session::exec_hidden`) are typed into it, wrapped in OSC 7771 sentinels (with a fresh random nonce per command, so printed output cannot forge them), and their
   echo and output are swallowed. They see the shell as the user has it, including
   after `sudo -i`, so the root shell backend (`ShellFs`, Files pane and `#`
   documents) and MCP `run_command` use them. Because they are keystrokes, the SSH
@@ -128,7 +128,7 @@ only the fields the user typed. The backend merges them into the stored secret
 ### 1 — Terminal + connections (Round 1, shipped)
 - [x] Tauri 2 project, portable-mode detection, CI matrix
 - [x] Connection tree model with folder inheritance (`connections.rs`)
-- [x] SSH session over russh with password/key auth (`ssh.rs`), jump hosts, host keys
+- [x] SSH session over russh with password/key auth (`ssh/`), jump hosts, host keys
 - [x] xterm.js tab, sidebar tree, quick-connect bar, host/folder editor
 - [x] Local PTY (incl. elevated via Windows sudo / `sudo -i`), serial (untested on hardware)
 - [x] Credential vault (keyring/age), PuTTY `.ppk` keys

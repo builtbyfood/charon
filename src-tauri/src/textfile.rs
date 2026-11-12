@@ -54,7 +54,12 @@ pub fn decode(bytes: &[u8]) -> TextFile {
         _ => Eol::Lf,
     };
     let text = raw.replace("\r\n", "\n").replace('\r', "\n");
-    TextFile { text, encoding, eol, size }
+    TextFile {
+        text,
+        encoding,
+        eol,
+        size,
+    }
 }
 
 pub fn encode(text: &str, encoding: Encoding, eol: Eol) -> Vec<u8> {
@@ -71,7 +76,10 @@ pub fn encode(text: &str, encoding: Encoding, eol: Eol) -> Vec<u8> {
             v
         }
         // Characters outside Latin-1 become '?', as Notepad++ does.
-        Encoding::Latin1 => with_eol.chars().map(|c| if (c as u32) < 256 { c as u8 } else { b'?' }).collect(),
+        Encoding::Latin1 => with_eol
+            .chars()
+            .map(|c| if (c as u32) < 256 { c as u8 } else { b'?' })
+            .collect(),
     }
 }
 
@@ -82,9 +90,15 @@ mod tests {
     #[test]
     fn detects_encoding_and_eol() {
         let t = decode(b"a\r\nb\r\n");
-        assert_eq!((t.encoding, t.eol, t.text.as_str()), (Encoding::Utf8, Eol::Crlf, "a\nb\n"));
+        assert_eq!(
+            (t.encoding, t.eol, t.text.as_str()),
+            (Encoding::Utf8, Eol::Crlf, "a\nb\n")
+        );
         let t = decode(b"\xEF\xBB\xBFx\ny");
-        assert_eq!((t.encoding, t.eol, t.text.as_str()), (Encoding::Utf8Bom, Eol::Lf, "x\ny"));
+        assert_eq!(
+            (t.encoding, t.eol, t.text.as_str()),
+            (Encoding::Utf8Bom, Eol::Lf, "x\ny")
+        );
         let t = decode(b"caf\xE9\n");
         assert_eq!((t.encoding, t.text.as_str()), (Encoding::Latin1, "café\n"));
         let t = decode(b"no newline");
@@ -95,10 +109,19 @@ mod tests {
 
     #[test]
     fn wire_names_match_the_ui() {
-        assert_eq!(serde_json::to_string(&Encoding::Utf8Bom).unwrap(), "\"utf-8-bom\"");
-        assert_eq!(serde_json::to_string(&Encoding::Latin1).unwrap(), "\"latin-1\"");
+        assert_eq!(
+            serde_json::to_string(&Encoding::Utf8Bom).unwrap(),
+            "\"utf-8-bom\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Encoding::Latin1).unwrap(),
+            "\"latin-1\""
+        );
         assert_eq!(serde_json::to_string(&Eol::Crlf).unwrap(), "\"crlf\"");
-        assert_eq!(serde_json::from_str::<Encoding>("\"utf-8\"").unwrap(), Encoding::Utf8);
+        assert_eq!(
+            serde_json::from_str::<Encoding>("\"utf-8\"").unwrap(),
+            Encoding::Utf8
+        );
     }
 
     #[test]
@@ -107,8 +130,14 @@ mod tests {
         let t = decode(src);
         assert_eq!(encode(&t.text, t.encoding, t.eol), src);
         assert_eq!(encode(&t.text, Encoding::Utf8, Eol::Lf), b"one\ntwo\n");
-        assert_eq!(encode("x\n", Encoding::Utf8Bom, Eol::Lf), b"\xEF\xBB\xBFx\n");
-        assert_eq!(encode("café ✓\n", Encoding::Latin1, Eol::Crlf), b"caf\xE9 ?\r\n");
+        assert_eq!(
+            encode("x\n", Encoding::Utf8Bom, Eol::Lf),
+            b"\xEF\xBB\xBFx\n"
+        );
+        assert_eq!(
+            encode("café ✓\n", Encoding::Latin1, Eol::Crlf),
+            b"caf\xE9 ?\r\n"
+        );
         let l = decode(b"\xE9\xFF");
         assert_eq!(encode(&l.text, Encoding::Latin1, Eol::Lf), b"\xE9\xFF");
     }

@@ -104,13 +104,17 @@ pub trait Fs: Send + Sync {
                 if e.kind == "dir" {
                     stack.push(e.path);
                 } else {
-                    self.delete(&e.path, false).await.with_context(|| format!("delete {}", e.path))?;
+                    self.delete(&e.path, false)
+                        .await
+                        .with_context(|| format!("delete {}", e.path))?;
                 }
             }
             dirs.push(d);
         }
         for d in dirs.iter().rev() {
-            self.delete(d, true).await.with_context(|| format!("delete {d}"))?;
+            self.delete(d, true)
+                .await
+                .with_context(|| format!("delete {d}"))?;
         }
         Ok(())
     }
@@ -138,15 +142,29 @@ pub struct Progress {
 }
 
 impl Transfer {
-    pub fn new(id: String, on_progress: Option<Box<dyn Fn(Progress) + Send + Sync>>, cancel: Arc<AtomicBool>) -> Self {
-        Self { id, on_progress, cancel }
+    pub fn new(
+        id: String,
+        on_progress: Option<Box<dyn Fn(Progress) + Send + Sync>>,
+        cancel: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            id,
+            on_progress,
+            cancel,
+        }
     }
     pub fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
     }
     pub fn report(&self, done: u64, total: u64, state: &'static str, error: Option<String>) {
         if let Some(f) = &self.on_progress {
-            f(Progress { id: self.id.clone(), done, total, state, error });
+            f(Progress {
+                id: self.id.clone(),
+                done,
+                total,
+                state,
+                error,
+            });
         }
     }
     /// Stop early with a clean status if the user cancelled.
@@ -219,7 +237,9 @@ pub struct SftpFs {
 impl SftpFs {
     pub fn new(sftp: SftpSession) -> Self {
         sftp.set_timeout(SFTP_REQUEST_TIMEOUT_SECS);
-        SftpFs { sftp: Arc::new(sftp) }
+        SftpFs {
+            sftp: Arc::new(sftp),
+        }
     }
 }
 
@@ -315,7 +335,11 @@ impl Fs for SftpFs {
     }
 
     async fn list(&self, path: &str) -> Result<Listing> {
-        let canon = self.sftp.canonicalize(path).await.unwrap_or_else(|_| path.to_string());
+        let canon = self
+            .sftp
+            .canonicalize(path)
+            .await
+            .unwrap_or_else(|_| path.to_string());
         let mut entries = Vec::new();
         for e in self.sftp.read_dir(&canon).await? {
             let name = e.file_name();
@@ -326,11 +350,21 @@ impl Fs for SftpFs {
             let mut entry = entry_from(name, full.clone(), &e.metadata());
             if entry.kind == "symlink" {
                 // What it points at decides whether double-click navigates or opens.
-                entry.target_kind = Some(self.sftp.metadata(&full).await.map(|m| kind_of(&m)).unwrap_or("other"));
+                entry.target_kind = Some(
+                    self.sftp
+                        .metadata(&full)
+                        .await
+                        .map(|m| kind_of(&m))
+                        .unwrap_or("other"),
+                );
             }
             entries.push(entry);
         }
-        Ok(Listing { parent: posix_parent(&canon), path: canon, entries })
+        Ok(Listing {
+            parent: posix_parent(&canon),
+            path: canon,
+            entries,
+        })
     }
 
     async fn stat(&self, path: &str) -> Result<Entry> {
@@ -338,7 +372,13 @@ impl Fs for SftpFs {
         let name = path.rsplit('/').next().unwrap_or(path).to_string();
         let mut e = entry_from(name, path.to_string(), &a);
         if e.kind == "symlink" {
-            e.target_kind = Some(self.sftp.metadata(path).await.map(|m| kind_of(&m)).unwrap_or("other"));
+            e.target_kind = Some(
+                self.sftp
+                    .metadata(path)
+                    .await
+                    .map(|m| kind_of(&m))
+                    .unwrap_or("other"),
+            );
         }
         Ok(e)
     }
@@ -368,7 +408,9 @@ impl Fs for SftpFs {
     async fn read(&self, path: &str, limit: u64) -> Result<Vec<u8>> {
         let size = self.sftp.metadata(path).await?.size.unwrap_or(0);
         if size > limit {
-            return Err(anyhow!("{path} is {size} bytes; the editor limit is {limit}"));
+            return Err(anyhow!(
+                "{path} is {size} bytes; the editor limit is {limit}"
+            ));
         }
         let mut f = self.sftp.open(path).await?;
         let mut out = Vec::with_capacity(size as usize);
@@ -382,7 +424,10 @@ impl Fs for SftpFs {
         let orig = self.sftp.metadata(path).await.ok();
         let mut f = self
             .sftp
-            .open_with_flags(&tmp, OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE)
+            .open_with_flags(
+                &tmp,
+                OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
+            )
             .await?;
         f.write_all(data).await?;
         f.shutdown().await?;
@@ -392,7 +437,10 @@ impl Fs for SftpFs {
             // SFTP v3 rename refuses to clobber an existing file.
             let _ = self.sftp.remove_file(path).await;
         }
-        self.sftp.rename(&tmp, path).await.with_context(|| format!("rename {tmp} over {path}"))?;
+        self.sftp
+            .rename(&tmp, path)
+            .await
+            .with_context(|| format!("rename {tmp} over {path}"))?;
         if let Some(a) = &orig {
             // chown before chmod: chown clears setuid/setgid, chmod puts them back.
             // Only root (sudo-sftp) can give a file away; as the login user the file
@@ -415,7 +463,9 @@ impl Fs for SftpFs {
     async fn download(&self, path: &str, local: &Path, t: &Transfer) -> Result<()> {
         let total = self.sftp.metadata(path).await?.size.unwrap_or(0);
         let mut src = self.sftp.open(path).await?;
-        let mut dst = tokio::fs::File::create(local).await.with_context(|| format!("create {}", local.display()))?;
+        let mut dst = tokio::fs::File::create(local)
+            .await
+            .with_context(|| format!("create {}", local.display()))?;
         let r = match pump(&mut src, &mut dst, total, t).await {
             Ok(_) => dst.flush().await.map_err(Into::into),
             Err(e) => Err(e),
@@ -427,11 +477,16 @@ impl Fs for SftpFs {
     }
 
     async fn upload(&self, local: &Path, path: &str, t: &Transfer) -> Result<()> {
-        let mut src = tokio::fs::File::open(local).await.with_context(|| format!("open {}", local.display()))?;
+        let mut src = tokio::fs::File::open(local)
+            .await
+            .with_context(|| format!("open {}", local.display()))?;
         let total = src.metadata().await?.len();
         let mut dst = self
             .sftp
-            .open_with_flags(path, OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE)
+            .open_with_flags(
+                path,
+                OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
+            )
             .await?;
         // shutdown waits for every write ack and closes the handle; its error is the
         // upload's error (a failed write surfaces here, not in pump).
@@ -453,7 +508,10 @@ impl Fs for SftpFs {
         let mut src = self.sftp.open(from).await?;
         let mut dst = self
             .sftp
-            .open_with_flags(to, OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE)
+            .open_with_flags(
+                to,
+                OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
+            )
             .await?;
         let r = match pump(&mut src, &mut dst, total, t).await {
             Ok(_) => dst.shutdown().await.context("finish copy"),
@@ -513,9 +571,17 @@ fn local_entry(path: &Path) -> Result<Entry> {
     };
     #[cfg(not(unix))]
     let mode = 0;
-    let mtime = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     Ok(Entry {
-        name: path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string_lossy().into_owned()),
+        name: path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned()),
         path: path.to_string_lossy().into_owned(),
         kind,
         target_kind,
@@ -530,7 +596,10 @@ fn local_entry(path: &Path) -> Result<Entry> {
 #[async_trait]
 impl Fs for LocalFs {
     async fn home(&self) -> Result<String> {
-        Ok(dirs::home_dir().ok_or_else(|| anyhow!("no home directory"))?.to_string_lossy().into_owned())
+        Ok(dirs::home_dir()
+            .ok_or_else(|| anyhow!("no home directory"))?
+            .to_string_lossy()
+            .into_owned())
     }
 
     async fn list(&self, path: &str) -> Result<Listing> {
@@ -545,8 +614,15 @@ impl Fs for LocalFs {
                     entries.push(entry);
                 }
             }
-            let parent = dir.parent().map(|p| p.to_string_lossy().into_owned()).filter(|p| !p.is_empty());
-            Ok(Listing { path: dir.to_string_lossy().into_owned(), parent, entries })
+            let parent = dir
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .filter(|p| !p.is_empty());
+            Ok(Listing {
+                path: dir.to_string_lossy().into_owned(),
+                parent,
+                entries,
+            })
         })
         .await?
     }
@@ -565,7 +641,10 @@ impl Fs for LocalFs {
             Ok(()) => Ok(()),
             // Another drive / filesystem (Windows ERROR_NOT_SAME_DEVICE, Unix EXDEV):
             // copy, then remove the original.
-            Err(e) if matches!(e.raw_os_error(), Some(17) if cfg!(windows)) || matches!(e.raw_os_error(), Some(18) if cfg!(unix)) => {
+            Err(e)
+                if matches!(e.raw_os_error(), Some(17) if cfg!(windows))
+                    || matches!(e.raw_os_error(), Some(18) if cfg!(unix)) =>
+            {
                 let (from, to) = (PathBuf::from(from), PathBuf::from(to));
                 tokio::task::spawn_blocking(move || -> Result<()> {
                     copy_local_tree(&from, &to)?;
@@ -589,7 +668,10 @@ impl Fs for LocalFs {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            Ok(tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777)).await?)
+            Ok(
+                tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777))
+                    .await?,
+            )
         }
         #[cfg(not(unix))]
         {
@@ -601,19 +683,25 @@ impl Fs for LocalFs {
     async fn read(&self, path: &str, limit: u64) -> Result<Vec<u8>> {
         let size = tokio::fs::metadata(path).await?.len();
         if size > limit {
-            return Err(anyhow!("{path} is {size} bytes; the editor limit is {limit}"));
+            return Err(anyhow!(
+                "{path} is {size} bytes; the editor limit is {limit}"
+            ));
         }
         Ok(tokio::fs::read(path).await?)
     }
 
     async fn write(&self, path: &str, data: &[u8]) -> Result<()> {
         let tmp = format!("{path}.charon-tmp");
-        tokio::fs::write(&tmp, data).await.with_context(|| format!("write {tmp}"))?;
+        tokio::fs::write(&tmp, data)
+            .await
+            .with_context(|| format!("write {tmp}"))?;
         #[cfg(unix)]
         if let Ok(m) = tokio::fs::metadata(path).await {
             let _ = tokio::fs::set_permissions(&tmp, m.permissions()).await;
         }
-        tokio::fs::rename(&tmp, path).await.with_context(|| format!("rename {tmp} over {path}"))?;
+        tokio::fs::rename(&tmp, path)
+            .await
+            .with_context(|| format!("rename {tmp} over {path}"))?;
         Ok(())
     }
 
@@ -632,7 +720,8 @@ impl Fs for LocalFs {
     }
 
     async fn upload(&self, local: &Path, path: &str, t: &Transfer) -> Result<()> {
-        self.download(&local.to_string_lossy(), Path::new(path), t).await
+        self.download(&local.to_string_lossy(), Path::new(path), t)
+            .await
     }
 
     async fn copy_file(&self, from: &str, to: &str, t: &Transfer) -> Result<()> {
@@ -677,7 +766,8 @@ fn copy_local_tree(from: &Path, to: &Path) -> Result<()> {
             copy_local_tree(&e.path(), &to.join(e.file_name()))?;
         }
     } else {
-        std::fs::copy(from, to).with_context(|| format!("copy {} to {}", from.display(), to.display()))?;
+        std::fs::copy(from, to)
+            .with_context(|| format!("copy {} to {}", from.display(), to.display()))?;
     }
     Ok(())
 }
@@ -703,9 +793,13 @@ impl ShellFs {
     async fn run(&self, cmd: &str) -> Result<String> {
         let (out, code) = self.session.exec_hidden(cmd).await?;
         // The 133;C preexec marker fires inside the capture window; strip all escapes.
-        let text = crate::hidden::strip_escapes(&String::from_utf8_lossy(&out)).replace("\r\n", "\n");
+        let text =
+            crate::hidden::strip_escapes(&String::from_utf8_lossy(&out)).replace("\r\n", "\n");
         if code != 0 {
-            return Err(anyhow!("{}", text.trim().lines().last().unwrap_or("command failed")));
+            return Err(anyhow!(
+                "{}",
+                text.trim().lines().last().unwrap_or("command failed")
+            ));
         }
         Ok(text)
     }
@@ -746,7 +840,11 @@ pub fn parse_ls_line(line: &str, dir: &str) -> Option<Entry> {
     let _ = link;
     Some(Entry {
         name: name.to_string(),
-        path: if name.starts_with('/') { name.to_string() } else { posix_join(dir, name) },
+        path: if name.starts_with('/') {
+            name.to_string()
+        } else {
+            posix_join(dir, name)
+        },
         kind,
         target_kind: None,
         size,
@@ -773,9 +871,15 @@ pub fn mode_from_perms(p: &str) -> u32 {
             _ => {}
         }
     }
-    if matches!(b[2], b's' | b'S') { m |= 0o4000; }
-    if matches!(b[5], b's' | b'S') { m |= 0o2000; }
-    if matches!(b[8], b't' | b'T') { m |= 0o1000; }
+    if matches!(b[2], b's' | b'S') {
+        m |= 0o4000;
+    }
+    if matches!(b[5], b's' | b'S') {
+        m |= 0o2000;
+    }
+    if matches!(b[8], b't' | b'T') {
+        m |= 0o1000;
+    }
     m
 }
 
@@ -786,80 +890,143 @@ impl Fs for ShellFs {
     }
 
     async fn list(&self, path: &str) -> Result<Listing> {
-        let canon = self.run(&format!("cd -- {} && pwd -P", sq(path))).await?.trim().to_string();
+        let canon = self
+            .run(&format!("cd -- {} && pwd -P", sq(path)))
+            .await?
+            .trim()
+            .to_string();
         // `command` + --color=never: root's login shell often aliases ls to --color=auto,
         // whose CSI codes would otherwise land mid-line.
-        let out = self.run(&format!("command ls -la --color=never --time-style=+%s -- {} 2>&1", sq(&canon))).await?;
-        let mut entries: Vec<Entry> = out.lines().filter_map(|l| parse_ls_line(l, &canon)).collect();
+        let out = self
+            .run(&format!(
+                "command ls -la --color=never --time-style=+%s -- {} 2>&1",
+                sq(&canon)
+            ))
+            .await?;
+        let mut entries: Vec<Entry> = out
+            .lines()
+            .filter_map(|l| parse_ls_line(l, &canon))
+            .collect();
         // Symlink targets: one extra command for the lot.
-        let links: Vec<String> = entries.iter().filter(|e| e.kind == "symlink").map(|e| e.path.clone()).collect();
+        let links: Vec<String> = entries
+            .iter()
+            .filter(|e| e.kind == "symlink")
+            .map(|e| e.path.clone())
+            .collect();
         if !links.is_empty() {
             let cmd = format!("for f in {}; do if [ -d \"$f\" ]; then echo d; elif [ -f \"$f\" ]; then echo f; else echo o; fi; done", links.iter().map(|l| sq(l)).collect::<Vec<_>>().join(" "));
-            let kinds: Vec<&'static str> = self.run(&cmd).await?.lines().map(|l| match l.trim() { "d" => "dir", "f" => "file", _ => "other" }).collect();
-            let mut i = 0;
-            for e in entries.iter_mut().filter(|e| e.kind == "symlink") {
+            let kinds: Vec<&'static str> = self
+                .run(&cmd)
+                .await?
+                .lines()
+                .map(|l| match l.trim() {
+                    "d" => "dir",
+                    "f" => "file",
+                    _ => "other",
+                })
+                .collect();
+            for (i, e) in entries
+                .iter_mut()
+                .filter(|e| e.kind == "symlink")
+                .enumerate()
+            {
                 e.target_kind = Some(kinds.get(i).copied().unwrap_or("other"));
-                i += 1;
             }
         }
-        Ok(Listing { parent: posix_parent(&canon), path: canon, entries })
+        Ok(Listing {
+            parent: posix_parent(&canon),
+            path: canon,
+            entries,
+        })
     }
 
     async fn stat(&self, path: &str) -> Result<Entry> {
-        let out = self.run(&format!("command stat -c '%A %h %U %G %s %Y %n' -- {}", sq(path))).await?;
+        let out = self
+            .run(&format!(
+                "command stat -c '%A %h %U %G %s %Y %n' -- {}",
+                sq(path)
+            ))
+            .await?;
         let dir = posix_parent(path).unwrap_or_else(|| "/".into());
-        parse_ls_line(out.trim(), &dir).ok_or_else(|| anyhow!("cannot parse stat output for {path}"))
+        parse_ls_line(out.trim(), &dir)
+            .ok_or_else(|| anyhow!("cannot parse stat output for {path}"))
     }
 
     async fn mkdir(&self, path: &str) -> Result<()> {
-        self.run(&format!("mkdir -- {}", sq(path))).await.map(|_| ())
+        self.run(&format!("mkdir -- {}", sq(path)))
+            .await
+            .map(|_| ())
     }
 
     async fn rename(&self, from: &str, to: &str) -> Result<()> {
-        self.run(&format!("mv -f -- {} {}", sq(from), sq(to))).await.map(|_| ())
+        self.run(&format!("mv -f -- {} {}", sq(from), sq(to)))
+            .await
+            .map(|_| ())
     }
 
     async fn delete(&self, path: &str, is_dir: bool) -> Result<()> {
         let cmd = if is_dir { "rmdir" } else { "rm -f" };
-        self.run(&format!("{cmd} -- {}", sq(path))).await.map(|_| ())
+        self.run(&format!("{cmd} -- {}", sq(path)))
+            .await
+            .map(|_| ())
     }
 
     async fn chmod(&self, path: &str, mode: u32) -> Result<()> {
-        self.run(&format!("chmod {:o} -- {}", mode & 0o7777, sq(path))).await.map(|_| ())
+        self.run(&format!("chmod {:o} -- {}", mode & 0o7777, sq(path)))
+            .await
+            .map(|_| ())
     }
 
     async fn read(&self, path: &str, limit: u64) -> Result<Vec<u8>> {
         let e = self.stat(path).await?;
         let limit = limit.min(SHELL_READ_LIMIT);
         if e.size > limit {
-            return Err(anyhow!("{path} is {} bytes; the shell backend limit is {limit}", e.size));
+            return Err(anyhow!(
+                "{path} is {} bytes; the shell backend limit is {limit}",
+                e.size
+            ));
         }
-        let b64 = self.run(&format!("base64 < {} | tr -d '\\n'", sq(path))).await?;
+        let b64 = self
+            .run(&format!("base64 < {} | tr -d '\\n'", sq(path)))
+            .await?;
         use base64::Engine;
         Ok(base64::engine::general_purpose::STANDARD.decode(b64.trim())?)
     }
 
     async fn write(&self, path: &str, data: &[u8]) -> Result<()> {
         if data.len() as u64 > SHELL_WRITE_LIMIT {
-            return Err(anyhow!("{} bytes is too large to type through the shell (limit {SHELL_WRITE_LIMIT})", data.len()));
+            return Err(anyhow!(
+                "{} bytes is too large to type through the shell (limit {SHELL_WRITE_LIMIT})",
+                data.len()
+            ));
         }
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD.encode(data);
-        let body: Vec<&str> = b64.as_bytes().chunks(76).map(|c| std::str::from_utf8(c).unwrap()).collect();
-        self.run(&shell_write_cmd(path, &body.join("\n"))).await.map(|_| ())
+        let body: Vec<&str> = b64
+            .as_bytes()
+            .chunks(76)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect();
+        self.run(&shell_write_cmd(path, &body.join("\n")))
+            .await
+            .map(|_| ())
     }
 
     async fn download(&self, path: &str, local: &Path, t: &Transfer) -> Result<()> {
         t.report(0, 0, "running", None);
         let bytes = self.read(path, SHELL_READ_LIMIT).await?;
         t.check()?;
-        tokio::fs::write(local, &bytes).await.with_context(|| format!("write {}", local.display()))?;
+        tokio::fs::write(local, &bytes)
+            .await
+            .with_context(|| format!("write {}", local.display()))?;
         t.report(bytes.len() as u64, bytes.len() as u64, "running", None);
         Ok(())
     }
 
     async fn upload(&self, local: &Path, path: &str, t: &Transfer) -> Result<()> {
-        let bytes = tokio::fs::read(local).await.with_context(|| format!("read {}", local.display()))?;
+        let bytes = tokio::fs::read(local)
+            .await
+            .with_context(|| format!("read {}", local.display()))?;
         t.report(0, bytes.len() as u64, "running", None);
         self.write(path, &bytes).await?;
         t.check()?;
@@ -868,16 +1035,22 @@ impl Fs for ShellFs {
     }
 
     async fn set_times(&self, path: &str, mtime: u64) -> Result<()> {
-        self.run(&format!("touch -d @{mtime} -- {}", sq(path))).await.map(|_| ())
+        self.run(&format!("touch -d @{mtime} -- {}", sq(path)))
+            .await
+            .map(|_| ())
     }
 
     async fn copy_file(&self, from: &str, to: &str, t: &Transfer) -> Result<()> {
         t.report(0, 0, "running", None);
-        self.run(&format!("cp -f -- {} {}", sq(from), sq(to))).await.map(|_| ())
+        self.run(&format!("cp -f -- {} {}", sq(from), sq(to)))
+            .await
+            .map(|_| ())
     }
 
     async fn remove_tree(&self, path: &str) -> Result<()> {
-        self.run(&format!("rm -rf -- {}", sq(path))).await.map(|_| ())
+        self.run(&format!("rm -rf -- {}", sq(path)))
+            .await
+            .map(|_| ())
     }
 
     async fn download_dir_tar(&self, remote: &str, limit: u64) -> Result<Option<Vec<u8>>> {
@@ -894,10 +1067,16 @@ impl Fs for ShellFs {
             return Ok(None); // too big to buffer as base64 — fall back to per-file
         }
         let b64 = self
-            .run(&format!("cd -- {} && tar -cf - -- {} | base64 | tr -d '
-'", sq(&parent), sq(&name)))
+            .run(&format!(
+                "cd -- {} && tar -cf - -- {} | base64 | tr -d '
+'",
+                sq(&parent),
+                sq(&name)
+            ))
             .await?;
-        Ok(Some(base64::engine::general_purpose::STANDARD.decode(b64.trim())?))
+        Ok(Some(
+            base64::engine::general_purpose::STANDARD.decode(b64.trim())?,
+        ))
     }
 
     fn join(&self, dir: &str, name: &str) -> String {
@@ -919,12 +1098,19 @@ fn strip_verbatim(p: PathBuf) -> PathBuf {
 /// (SFTP v3). Every request is logged so tests can check the order of operations.
 #[cfg(test)]
 mod memsftp {
-    use russh_sftp::protocol::{Attrs, Data, FileAttributes, Handle, OpenFlags, Status, StatusCode, Version};
+    use russh_sftp::protocol::{
+        Attrs, Data, FileAttributes, Handle, OpenFlags, Status, StatusCode, Version,
+    };
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Debug, PartialEq)]
-    pub struct MemFile { pub data: Vec<u8>, pub uid: u32, pub gid: u32, pub mode: u32 }
+    pub struct MemFile {
+        pub data: Vec<u8>,
+        pub uid: u32,
+        pub gid: u32,
+        pub mode: u32,
+    }
 
     #[derive(Default)]
     pub struct State {
@@ -936,13 +1122,20 @@ mod memsftp {
     }
 
     impl State {
-        pub fn handles_open(&self) -> usize { self.handles.len() }
+        pub fn handles_open(&self) -> usize {
+            self.handles.len()
+        }
     }
 
     pub struct Server(pub Arc<Mutex<State>>);
 
     fn ok(id: u32) -> Status {
-        Status { id, status_code: StatusCode::Ok, error_message: "Ok".into(), language_tag: "en-US".into() }
+        Status {
+            id,
+            status_code: StatusCode::Ok,
+            error_message: "Ok".into(),
+            language_tag: "en-US".into(),
+        }
     }
     fn attrs_of(f: &MemFile) -> FileAttributes {
         let mut a = FileAttributes::empty();
@@ -955,14 +1148,35 @@ mod memsftp {
 
     impl russh_sftp::server::Handler for Server {
         type Error = StatusCode;
-        fn unimplemented(&self) -> Self::Error { StatusCode::OpUnsupported }
-        async fn init(&mut self, _v: u32, _e: HashMap<String, String>) -> Result<Version, Self::Error> { Ok(Version::new()) }
-        async fn open(&mut self, id: u32, path: String, flags: OpenFlags, _a: FileAttributes) -> Result<Handle, Self::Error> {
+        fn unimplemented(&self) -> Self::Error {
+            StatusCode::OpUnsupported
+        }
+        async fn init(
+            &mut self,
+            _v: u32,
+            _e: HashMap<String, String>,
+        ) -> Result<Version, Self::Error> {
+            Ok(Version::new())
+        }
+        async fn open(
+            &mut self,
+            id: u32,
+            path: String,
+            flags: OpenFlags,
+            _a: FileAttributes,
+        ) -> Result<Handle, Self::Error> {
             let mut s = self.0.lock().unwrap();
             s.log.push(format!("open {path}"));
             if flags.contains(OpenFlags::CREATE) {
-                let f = s.files.entry(path.clone()).or_insert(MemFile { data: vec![], uid: 0, gid: 0, mode: 0o644 });
-                if flags.contains(OpenFlags::TRUNCATE) { f.data.clear(); }
+                let f = s.files.entry(path.clone()).or_insert(MemFile {
+                    data: vec![],
+                    uid: 0,
+                    gid: 0,
+                    mode: 0o644,
+                });
+                if flags.contains(OpenFlags::TRUNCATE) {
+                    f.data.clear();
+                }
             } else if !s.files.contains_key(&path) {
                 return Err(StatusCode::NoSuchFile);
             }
@@ -970,24 +1184,45 @@ mod memsftp {
             s.handles.insert(h.clone(), path);
             Ok(Handle { id, handle: h })
         }
-        async fn write(&mut self, id: u32, handle: String, offset: u64, data: Vec<u8>) -> Result<Status, Self::Error> {
+        async fn write(
+            &mut self,
+            id: u32,
+            handle: String,
+            offset: u64,
+            data: Vec<u8>,
+        ) -> Result<Status, Self::Error> {
             let mut s = self.0.lock().unwrap();
             let path = s.handles.get(&handle).cloned().ok_or(StatusCode::Failure)?;
-            if s.fail_writes_from.is_some_and(|at| offset >= at) { return Err(StatusCode::Failure); }
+            if s.fail_writes_from.is_some_and(|at| offset >= at) {
+                return Err(StatusCode::Failure);
+            }
             let f = s.files.get_mut(&path).ok_or(StatusCode::NoSuchFile)?;
             let end = offset as usize + data.len();
-            if f.data.len() < end { f.data.resize(end, 0); }
+            if f.data.len() < end {
+                f.data.resize(end, 0);
+            }
             f.data[offset as usize..end].copy_from_slice(&data);
             Ok(ok(id))
         }
-        async fn read(&mut self, id: u32, handle: String, offset: u64, len: u32) -> Result<Data, Self::Error> {
+        async fn read(
+            &mut self,
+            id: u32,
+            handle: String,
+            offset: u64,
+            len: u32,
+        ) -> Result<Data, Self::Error> {
             let s = self.0.lock().unwrap();
             let path = s.handles.get(&handle).ok_or(StatusCode::Failure)?;
             let f = s.files.get(path).ok_or(StatusCode::NoSuchFile)?;
             let start = (offset as usize).min(f.data.len());
-            if start == f.data.len() { return Err(StatusCode::Eof); }
+            if start == f.data.len() {
+                return Err(StatusCode::Eof);
+            }
             let end = (start + len as usize).min(f.data.len());
-            Ok(Data { id, data: f.data[start..end].to_vec() })
+            Ok(Data {
+                id,
+                data: f.data[start..end].to_vec(),
+            })
         }
         async fn close(&mut self, id: u32, handle: String) -> Result<Status, Self::Error> {
             self.0.lock().unwrap().handles.remove(&handle);
@@ -995,20 +1230,44 @@ mod memsftp {
         }
         async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
             let s = self.0.lock().unwrap();
-            s.files.get(&path).map(|f| Attrs { id, attrs: attrs_of(f) }).ok_or(StatusCode::NoSuchFile)
+            s.files
+                .get(&path)
+                .map(|f| Attrs {
+                    id,
+                    attrs: attrs_of(f),
+                })
+                .ok_or(StatusCode::NoSuchFile)
         }
-        async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> { self.stat(id, path).await }
-        async fn fstat(&mut self, id: u32, handle: String) -> Result<Attrs, Self::Error> {
-            let path = self.0.lock().unwrap().handles.get(&handle).cloned().ok_or(StatusCode::Failure)?;
+        async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
             self.stat(id, path).await
         }
-        async fn setstat(&mut self, id: u32, path: String, a: FileAttributes) -> Result<Status, Self::Error> {
+        async fn fstat(&mut self, id: u32, handle: String) -> Result<Attrs, Self::Error> {
+            let path = self
+                .0
+                .lock()
+                .unwrap()
+                .handles
+                .get(&handle)
+                .cloned()
+                .ok_or(StatusCode::Failure)?;
+            self.stat(id, path).await
+        }
+        async fn setstat(
+            &mut self,
+            id: u32,
+            path: String,
+            a: FileAttributes,
+        ) -> Result<Status, Self::Error> {
             let mut s = self.0.lock().unwrap();
             let f = s.files.get_mut(&path).ok_or(StatusCode::NoSuchFile)?;
             let mut what = Vec::new();
-            if let Some(p) = a.permissions { f.mode = p & 0o7777; what.push(format!("chmod {:o}", f.mode)); }
+            if let Some(p) = a.permissions {
+                f.mode = p & 0o7777;
+                what.push(format!("chmod {:o}", f.mode));
+            }
             if let (Some(u), Some(g)) = (a.uid, a.gid) {
-                f.uid = u; f.gid = g;
+                f.uid = u;
+                f.gid = g;
                 f.mode &= !0o6000; // like chown(2): setuid/setgid dropped
                 what.push(format!("chown {u}:{g}"));
             }
@@ -1019,12 +1278,22 @@ mod memsftp {
         async fn remove(&mut self, id: u32, path: String) -> Result<Status, Self::Error> {
             let mut s = self.0.lock().unwrap();
             s.log.push(format!("remove {path}"));
-            s.files.remove(&path).map(|_| ok(id)).ok_or(StatusCode::NoSuchFile)
+            s.files
+                .remove(&path)
+                .map(|_| ok(id))
+                .ok_or(StatusCode::NoSuchFile)
         }
-        async fn rename(&mut self, id: u32, from: String, to: String) -> Result<Status, Self::Error> {
+        async fn rename(
+            &mut self,
+            id: u32,
+            from: String,
+            to: String,
+        ) -> Result<Status, Self::Error> {
             let mut s = self.0.lock().unwrap();
             s.log.push(format!("rename {from} {to}"));
-            if s.files.contains_key(&to) { return Err(StatusCode::Failure); }
+            if s.files.contains_key(&to) {
+                return Err(StatusCode::Failure);
+            }
             let f = s.files.remove(&from).ok_or(StatusCode::NoSuchFile)?;
             s.files.insert(to, f);
             Ok(ok(id))
@@ -1034,10 +1303,14 @@ mod memsftp {
     /// An `SftpFs` talking to a fresh in-memory server holding `files`.
     pub async fn fs_with(files: Vec<(&str, MemFile)>) -> (super::SftpFs, Arc<Mutex<State>>) {
         let state = Arc::new(Mutex::new(State::default()));
-        for (p, f) in files { state.lock().unwrap().files.insert(p.to_string(), f); }
+        for (p, f) in files {
+            state.lock().unwrap().files.insert(p.to_string(), f);
+        }
         let (client, server) = tokio::io::duplex(64 * 1024);
         russh_sftp::server::run(server, Server(state.clone())).await;
-        let sftp = russh_sftp::client::SftpSession::new(client).await.expect("handshake");
+        let sftp = russh_sftp::client::SftpSession::new(client)
+            .await
+            .expect("handshake");
         (super::SftpFs::new(sftp), state)
     }
 }
@@ -1050,19 +1323,41 @@ mod tests {
     async fn save_as_sudo_preserves_owner_and_mode() {
         use memsftp::MemFile;
         // A root-run sftp-server (sudo-sftp) editing a setuid file owned by 1000:33.
-        let orig = MemFile { data: b"old\n".to_vec(), uid: 1000, gid: 33, mode: 0o4750 };
+        let orig = MemFile {
+            data: b"old\n".to_vec(),
+            uid: 1000,
+            gid: 33,
+            mode: 0o4750,
+        };
         let (fs, state) = memsftp::fs_with(vec![("/etc/app.conf", orig.clone())]).await;
-        fs.write("/etc/app.conf", b"new contents\n").await.expect("write");
+        fs.write("/etc/app.conf", b"new contents\n")
+            .await
+            .expect("write");
 
         let s = state.lock().unwrap();
         let f = s.files.get("/etc/app.conf").expect("file still there");
         assert_eq!(f.data, b"new contents\n");
-        assert_eq!((f.uid, f.gid), (1000, 33), "owner restored (the temp file was created 0:0)");
+        assert_eq!(
+            (f.uid, f.gid),
+            (1000, 33),
+            "owner restored (the temp file was created 0:0)"
+        );
         assert_eq!(f.mode, 0o4750, "mode restored, setuid included");
-        assert!(!s.files.contains_key("/etc/app.conf.charon-tmp"), "temp file renamed away");
+        assert!(
+            !s.files.contains_key("/etc/app.conf.charon-tmp"),
+            "temp file renamed away"
+        );
         // Written to a temp file first, renamed over, then chown before chmod.
-        let pos = |needle: &str| s.log.iter().position(|l| l.starts_with(needle)).unwrap_or_else(|| panic!("no {needle:?} in {:?}", s.log));
-        assert!(pos("open /etc/app.conf.charon-tmp") < pos("rename /etc/app.conf.charon-tmp /etc/app.conf"));
+        let pos = |needle: &str| {
+            s.log
+                .iter()
+                .position(|l| l.starts_with(needle))
+                .unwrap_or_else(|| panic!("no {needle:?} in {:?}", s.log))
+        };
+        assert!(
+            pos("open /etc/app.conf.charon-tmp")
+                < pos("rename /etc/app.conf.charon-tmp /etc/app.conf")
+        );
         assert!(pos("rename") < pos("setstat /etc/app.conf chown 1000:33"));
         assert!(pos("setstat /etc/app.conf chown") < pos("setstat /etc/app.conf chmod 4750"));
     }
@@ -1074,7 +1369,11 @@ mod tests {
         let s = state.lock().unwrap();
         let f = s.files.get("/tmp/new.txt").unwrap();
         assert_eq!((f.uid, f.gid, f.mode), (0, 0, 0o644));
-        assert!(!s.log.iter().any(|l| l.starts_with("setstat")), "nothing to restore: {:?}", s.log);
+        assert!(
+            !s.log.iter().any(|l| l.starts_with("setstat")),
+            "nothing to restore: {:?}",
+            s.log
+        );
     }
 
     #[tokio::test]
@@ -1089,15 +1388,25 @@ mod tests {
         fs.upload(&src, "/srv/big.bin", &t).await.expect("upload");
         {
             let s = state.lock().unwrap();
-            assert_eq!(s.files.get("/srv/big.bin").unwrap().data, body, "every chunk landed in order");
+            assert_eq!(
+                s.files.get("/srv/big.bin").unwrap().data,
+                body,
+                "every chunk landed in order"
+            );
             assert_eq!(s.handles_open(), 0, "handle closed");
         }
 
         // A write the server refuses mid-file fails the upload (not swallowed by the
         // close) and the partial remote file is removed.
         state.lock().unwrap().fail_writes_from = Some(CHUNK as u64);
-        let err = fs.upload(&src, "/srv/part.bin", &t).await.expect_err("server refused a write");
-        assert!(!state.lock().unwrap().files.contains_key("/srv/part.bin"), "partial file removed: {err:#}");
+        let err = fs
+            .upload(&src, "/srv/part.bin", &t)
+            .await
+            .expect_err("server refused a write");
+        assert!(
+            !state.lock().unwrap().files.contains_key("/srv/part.bin"),
+            "partial file removed: {err:#}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1105,13 +1414,20 @@ mod tests {
     fn shell_write_restores_owner_then_mode_after_the_rename() {
         let cmd = shell_write_cmd("/etc/it's", "Zm9v");
         let first = cmd.lines().next().unwrap();
-        let at = |n: &str| first.find(n).unwrap_or_else(|| panic!("no {n:?} in {first}"));
+        let at = |n: &str| {
+            first
+                .find(n)
+                .unwrap_or_else(|| panic!("no {n:?} in {first}"))
+        };
         // stat before anything is written; mv before chown; chown before the final chmod.
         assert!(at("stat -c %u:%g -- '/etc/it'\\''s'") < at("base64 -d"));
         assert!(at("mv -f --") < at("chown \"$__o\" -- '/etc/it'\\''s'"));
         assert!(at("chown \"$__o\"") < first.rfind("chmod \"$__m\" -- '/etc/it'\\''s'").unwrap());
         // The heredoc body and terminator follow the one command line.
-        assert_eq!(cmd.lines().skip(1).collect::<Vec<_>>(), vec!["Zm9v", "CHARON_B64"]);
+        assert_eq!(
+            cmd.lines().skip(1).collect::<Vec<_>>(),
+            vec!["Zm9v", "CHARON_B64"]
+        );
     }
 
     #[test]
@@ -1140,7 +1456,10 @@ mod tests {
         let l = fs.list(&root).await.unwrap();
         let names: Vec<&str> = l.entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"a.txt") && names.contains(&"sub"));
-        assert_eq!(l.entries.iter().find(|e| e.name == "sub").unwrap().kind, "dir");
+        assert_eq!(
+            l.entries.iter().find(|e| e.name == "sub").unwrap().kind,
+            "dir"
+        );
         assert!(l.parent.is_some());
 
         // download = copy with progress; cancel flag stops it.
@@ -1150,7 +1469,10 @@ mod tests {
         let flag = Arc::new(AtomicBool::new(false));
         let t = Transfer::new("t1".into(), None, flag.clone());
         fs.download(&big, &out, &t).await.unwrap();
-        assert_eq!(std::fs::metadata(&out).unwrap().len(), (CHUNK * 3 + 10) as u64);
+        assert_eq!(
+            std::fs::metadata(&out).unwrap().len(),
+            (CHUNK * 3 + 10) as u64
+        );
 
         flag.store(true, Ordering::Relaxed);
         let out2 = dir.path().join("copy2.bin");
@@ -1167,11 +1489,24 @@ mod tests {
     #[test]
     fn ls_lines_parse_into_entries() {
         let e = parse_ls_line("drwxr-xr-x 5 root root 4096 1700000000 .config", "/root").unwrap();
-        assert_eq!((e.kind, e.path.as_str(), e.mode, e.mtime, e.user.as_deref()), ("dir", "/root/.config", 0o755, 1700000000, Some("root")));
-        let e = parse_ls_line("-rw-r----- 1 admin adm 12 1700000001 my file.txt", "/home/admin").unwrap();
-        assert_eq!((e.kind, e.name.as_str(), e.size, e.mode), ("file", "my file.txt", 12, 0o640));
+        assert_eq!(
+            (e.kind, e.path.as_str(), e.mode, e.mtime, e.user.as_deref()),
+            ("dir", "/root/.config", 0o755, 1700000000, Some("root"))
+        );
+        let e = parse_ls_line(
+            "-rw-r----- 1 admin adm 12 1700000001 my file.txt",
+            "/home/admin",
+        )
+        .unwrap();
+        assert_eq!(
+            (e.kind, e.name.as_str(), e.size, e.mode),
+            ("file", "my file.txt", 12, 0o640)
+        );
         let e = parse_ls_line("lrwxrwxrwx 1 root root 7 1700000002 bin -> usr/bin", "/").unwrap();
-        assert_eq!((e.kind, e.name.as_str(), e.path.as_str()), ("symlink", "bin", "/bin"));
+        assert_eq!(
+            (e.kind, e.name.as_str(), e.path.as_str()),
+            ("symlink", "bin", "/bin")
+        );
         assert!(parse_ls_line("total 48", "/").is_none());
         assert!(parse_ls_line("drwxr-xr-x 5 root root 4096 1700000000 .", "/").is_none());
         // stat -c output names the full path
@@ -1194,11 +1529,23 @@ mod tests {
             "\x1b]133;C\x07",
         );
         let text = crate::hidden::strip_escapes(raw).replace("\r\n", "\n");
-        let entries: Vec<Entry> = text.lines().filter_map(|l| parse_ls_line(l, "/root")).collect();
+        let entries: Vec<Entry> = text
+            .lines()
+            .filter_map(|l| parse_ls_line(l, "/root"))
+            .collect();
         assert_eq!(entries.len(), 3);
-        assert_eq!((entries[0].name.as_str(), entries[0].kind, entries[0].mode), (".config", "dir", 0o755));
-        assert_eq!((entries[1].name.as_str(), entries[1].kind, entries[1].size), ("secret.txt", "file", 33));
-        assert_eq!((entries[2].name.as_str(), entries[2].kind), ("latest", "symlink"));
+        assert_eq!(
+            (entries[0].name.as_str(), entries[0].kind, entries[0].mode),
+            (".config", "dir", 0o755)
+        );
+        assert_eq!(
+            (entries[1].name.as_str(), entries[1].kind, entries[1].size),
+            ("secret.txt", "file", 33)
+        );
+        assert_eq!(
+            (entries[2].name.as_str(), entries[2].kind),
+            ("latest", "symlink")
+        );
     }
 
     #[tokio::test]
@@ -1222,12 +1569,17 @@ mod tests {
             server.read_exact(&mut init).await.unwrap();
             assert_eq!(init[4], 1, "expected SSH_FXP_INIT");
             // 3. reply SSH_FXP_VERSION (v3, no extensions)
-            server.write_all(&[0, 0, 0, 5, 2, 0, 0, 0, 3]).await.unwrap();
+            server
+                .write_all(&[0, 0, 0, 5, 2, 0, 0, 0, 3])
+                .await
+                .unwrap();
             server.flush().await.unwrap();
             // keep the pipe open so the client side stays usable
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         });
-        let fs = sudo_sftp_over(client, "s3cret").await.expect("sftp handshake");
+        let fs = sudo_sftp_over(client, "s3cret")
+            .await
+            .expect("sftp handshake");
         drop(fs);
         srv.await.unwrap();
     }

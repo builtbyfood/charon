@@ -44,11 +44,17 @@ pub fn parse_sessions(sessions: Vec<RawSession>) -> Parsed {
         if name == "Default Settings" {
             continue;
         }
-        let get = |k: &str| s.values.iter().find(|(key, _)| key.eq_ignore_ascii_case(k)).map(|(_, v)| v.as_str());
+        let get = |k: &str| {
+            s.values
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(k))
+                .map(|(_, v)| v.as_str())
+        };
 
         let proto = get("Protocol").unwrap_or("ssh");
         if proto != "ssh" {
-            out.warnings.push(format!("{name}: skipped ({proto} session)"));
+            out.warnings
+                .push(format!("{name}: skipped ({proto} session)"));
             continue;
         }
         let host_field = get("HostName").unwrap_or("").trim();
@@ -64,16 +70,28 @@ pub fn parse_sessions(sessions: Vec<RawSession>) -> Parsed {
         if let Some(u) = get("UserName").map(str::trim).filter(|u| !u.is_empty()) {
             user = Some(u.to_string());
         }
-        let port = get("PortNumber").and_then(|p| p.trim().parse::<u16>().ok()).filter(|p| *p != 0);
-        let identity_file = get("PublicKeyFile").map(str::trim).filter(|p| !p.is_empty()).map(str::to_string);
-        if identity_file.as_deref().is_some_and(|p| p.to_ascii_lowercase().ends_with(".ppk")) {
-            out.warnings.push(format!("{name}: uses a .ppk key; if it has a passphrase, add it to the vault entry"));
+        let port = get("PortNumber")
+            .and_then(|p| p.trim().parse::<u16>().ok())
+            .filter(|p| *p != 0);
+        let identity_file = get("PublicKeyFile")
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string);
+        if identity_file
+            .as_deref()
+            .is_some_and(|p| p.to_ascii_lowercase().ends_with(".ppk"))
+        {
+            out.warnings.push(format!(
+                "{name}: uses a .ppk key; if it has a passphrase, add it to the vault entry"
+            ));
         }
         let (font, font_size) = match parse_font(get("Font"), get("FontHeight")) {
             FontSetting::Use(f, px) => (Some(f), px),
             FontSetting::Default => (None, None),
             FontSetting::Unusable(f) => {
-                out.warnings.push(format!("{name}: font \"{f}\" is an X11 server font; the default terminal font is used"));
+                out.warnings.push(format!(
+                    "{name}: font \"{f}\" is an X11 server font; the default terminal font is used"
+                ));
                 (None, None)
             }
         };
@@ -115,8 +133,14 @@ fn parse_font(font: Option<&str>, height: Option<&str>) -> FontSetting {
     if let Some(x11) = raw.strip_prefix("server:") {
         return FontSetting::Unusable(x11.to_string());
     }
-    let mut family = raw.strip_prefix("client:").unwrap_or(raw).trim().to_string();
-    let mut points = height.and_then(|h| h.trim().parse::<f32>().ok()).filter(|p| *p > 0.0);
+    let mut family = raw
+        .strip_prefix("client:")
+        .unwrap_or(raw)
+        .trim()
+        .to_string();
+    let mut points = height
+        .and_then(|h| h.trim().parse::<f32>().ok())
+        .filter(|p| *p > 0.0);
     if raw.starts_with("client:") {
         // Pango: "Family [Style…] Size"; the size is the last word when numeric.
         if let Some((rest, last)) = family.rsplit_once(' ') {
@@ -125,7 +149,9 @@ fn parse_font(font: Option<&str>, height: Option<&str>) -> FontSetting {
                 family = rest.trim().to_string();
             }
         }
-        for style in [" Bold", " Italic", " Oblique", " Regular", " Medium", " Light"] {
+        for style in [
+            " Bold", " Italic", " Oblique", " Regular", " Medium", " Light",
+        ] {
             while let Some(f) = family.strip_suffix(style) {
                 family = f.to_string();
             }
@@ -145,20 +171,31 @@ fn parse_font(font: Option<&str>, height: Option<&str>) -> FontSetting {
 pub fn parse_session_file(file_name: &str, text: &str) -> RawSession {
     let values = text
         .lines()
-        .filter_map(|l| l.split_once('=').map(|(k, v)| (k.trim().to_string(), v.trim().to_string())))
+        .filter_map(|l| {
+            l.split_once('=')
+                .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        })
         .collect();
-    RawSession { name: file_name.to_string(), values }
+    RawSession {
+        name: file_name.to_string(),
+        values,
+    }
 }
 
 pub fn load_dir(dir: &Path) -> Result<Parsed> {
     let mut sessions = Vec::new();
-    for entry in std::fs::read_dir(dir).map_err(|e| anyhow::anyhow!("read {}: {e}", dir.display()))? {
+    for entry in
+        std::fs::read_dir(dir).map_err(|e| anyhow::anyhow!("read {}: {e}", dir.display()))?
+    {
         let entry = entry?;
         if !entry.file_type()?.is_file() {
             continue;
         }
         let text = std::fs::read_to_string(entry.path())?;
-        sessions.push(parse_session_file(&entry.file_name().to_string_lossy(), &text));
+        sessions.push(parse_session_file(
+            &entry.file_name().to_string_lossy(),
+            &text,
+        ));
     }
     Ok(parse_sessions(sessions))
 }
@@ -221,16 +258,30 @@ mod tests {
     fn parses_session_files() {
         let files = [
             ("web%20prod", include_str!("fixtures/putty/web%20prod")),
-            ("Default%20Settings", include_str!("fixtures/putty/Default%20Settings")),
-            ("serial%20console", include_str!("fixtures/putty/serial%20console")),
+            (
+                "Default%20Settings",
+                include_str!("fixtures/putty/Default%20Settings"),
+            ),
+            (
+                "serial%20console",
+                include_str!("fixtures/putty/serial%20console"),
+            ),
             ("keyed", include_str!("fixtures/putty/keyed")),
             ("x11", include_str!("fixtures/putty/x11")),
         ];
-        let p = parse_sessions(files.iter().map(|(n, t)| parse_session_file(n, t)).collect());
+        let p = parse_sessions(
+            files
+                .iter()
+                .map(|(n, t)| parse_session_file(n, t))
+                .collect(),
+        );
         let names: Vec<_> = p.hosts.iter().map(|h| h.name.as_str()).collect();
         assert_eq!(names, vec!["web prod", "keyed", "x11"]);
         assert_eq!(p.hosts[2].font, None);
-        assert!(p.warnings.iter().any(|w| w.starts_with("x11: font \"fixed\"")));
+        assert!(p
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("x11: font \"fixed\"")));
 
         let web = &p.hosts[0];
         assert_eq!(web.host, "web.example.com");
@@ -245,7 +296,10 @@ mod tests {
         assert_eq!(keyed.host, "10.1.1.1");
         assert_eq!(keyed.user.as_deref(), Some("root"));
         assert_eq!(keyed.identity_file.as_deref(), Some("C:\\keys\\lab.ppk"));
-        assert_eq!(keyed.font, None, "Courier New 10 is PuTTY's default, not a choice");
+        assert_eq!(
+            keyed.font, None,
+            "Courier New 10 is PuTTY's default, not a choice"
+        );
         assert!(p.warnings.iter().any(|w| w.contains(".ppk")));
         assert!(p.warnings.iter().any(|w| w.contains("serial session")));
     }
@@ -254,18 +308,42 @@ mod tests {
     fn reads_fonts() {
         use FontSetting::*;
         // Windows registry: family + points.
-        assert_eq!(parse_font(Some("Consolas"), Some("12")), Use("Consolas".into(), Some(16)));
-        assert_eq!(parse_font(Some("Lucida Console"), None), Use("Lucida Console".into(), None));
+        assert_eq!(
+            parse_font(Some("Consolas"), Some("12")),
+            Use("Consolas".into(), Some(16))
+        );
+        assert_eq!(
+            parse_font(Some("Lucida Console"), None),
+            Use("Lucida Console".into(), None)
+        );
         // PuTTY's factory default is left to Charon's default.
         assert_eq!(parse_font(Some("Courier New"), Some("10")), Default);
-        assert_eq!(parse_font(Some("Courier New"), Some("14")), Use("Courier New".into(), Some(19)));
+        assert_eq!(
+            parse_font(Some("Courier New"), Some("14")),
+            Use("Courier New".into(), Some(19))
+        );
         assert_eq!(parse_font(None, Some("10")), Default);
         // Unix PuTTY: Pango description, size inside the string.
-        assert_eq!(parse_font(Some("client:DejaVu Sans Mono 11"), None), Use("DejaVu Sans Mono".into(), Some(15)));
-        assert_eq!(parse_font(Some("client:Fira Code Bold 10"), None), Use("Fira Code".into(), Some(13)));
-        assert_eq!(parse_font(Some("client:Monospace"), None), Use("Monospace".into(), None));
-        assert_eq!(parse_font(Some("server:fixed"), None), Unusable("fixed".into()));
+        assert_eq!(
+            parse_font(Some("client:DejaVu Sans Mono 11"), None),
+            Use("DejaVu Sans Mono".into(), Some(15))
+        );
+        assert_eq!(
+            parse_font(Some("client:Fira Code Bold 10"), None),
+            Use("Fira Code".into(), Some(13))
+        );
+        assert_eq!(
+            parse_font(Some("client:Monospace"), None),
+            Use("Monospace".into(), None)
+        );
+        assert_eq!(
+            parse_font(Some("server:fixed"), None),
+            Unusable("fixed".into())
+        );
         // Absurd sizes are clamped to what the UI accepts.
-        assert_eq!(parse_font(Some("Hack"), Some("72")), Use("Hack".into(), Some(40)));
+        assert_eq!(
+            parse_font(Some("Hack"), Some("72")),
+            Use("Hack".into(), Some(40))
+        );
     }
 }

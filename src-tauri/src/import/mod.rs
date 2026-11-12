@@ -80,14 +80,20 @@ pub struct Duplicate {
 /// An existing SSH node is a duplicate of `h` if it has the same name, or the
 /// same host and (effective) user. Folder-scoped name matching would let the
 /// same box in twice under different import folders, hence tree-wide.
-fn find_duplicate<'a>(existing: &'a [(Node, Settings)], h: &ImportedHost) -> Option<(&'a Node, &'static str)> {
+fn find_duplicate<'a>(
+    existing: &'a [(Node, Settings)],
+    h: &ImportedHost,
+) -> Option<(&'a Node, &'static str)> {
     if let Some((n, _)) = existing.iter().find(|(n, _)| n.name == h.name) {
         return Some((n, "same name"));
     }
     let host = h.host.to_ascii_lowercase();
     existing
         .iter()
-        .find(|(_, eff)| eff.host.as_deref().map(|x| x.to_ascii_lowercase()) == Some(host.clone()) && eff.user == h.user)
+        .find(|(_, eff)| {
+            eff.host.as_deref().map(|x| x.to_ascii_lowercase()) == Some(host.clone())
+                && eff.user == h.user
+        })
         .map(|(n, _)| (n, "same host+user"))
 }
 
@@ -105,7 +111,10 @@ fn existing_hosts(store: &Store) -> Result<Vec<(Node, Settings)>> {
                 chain.push(p);
                 cur = p.parent_id.as_deref().and_then(|p| by_id.get(p).copied());
             }
-            let eff = chain.iter().rev().fold(Settings::default(), |acc, n| acc.merged_with(&n.settings));
+            let eff = chain
+                .iter()
+                .rev()
+                .fold(Settings::default(), |acc, n| acc.merged_with(&n.settings));
             (n.clone(), eff)
         })
         .collect())
@@ -114,10 +123,18 @@ fn existing_hosts(store: &Store) -> Result<Vec<(Node, Settings)>> {
 /// Dry run: nothing is written.
 pub fn preview(store: &Store, parsed: &Parsed) -> Result<ImportPreview> {
     let existing = existing_hosts(store)?;
-    let mut p = ImportPreview { warnings: parsed.warnings.clone(), ..Default::default() };
+    let mut p = ImportPreview {
+        warnings: parsed.warnings.clone(),
+        ..Default::default()
+    };
     for h in &parsed.hosts {
         match find_duplicate(&existing, h) {
-            Some((n, reason)) => p.duplicates.push(Duplicate { name: h.name.clone(), host: h.host.clone(), existing: n.name.clone(), reason }),
+            Some((n, reason)) => p.duplicates.push(Duplicate {
+                name: h.name.clone(),
+                host: h.host.clone(),
+                existing: n.name.clone(),
+                reason,
+            }),
             None => p.new.push(h.name.clone()),
         }
     }
@@ -158,7 +175,8 @@ pub fn load(source: Source, path: Option<&Path>) -> Result<Parsed> {
         Source::SshConfig => {
             let path = match path {
                 Some(p) => p.to_path_buf(),
-                None => ssh_config::default_path().ok_or_else(|| anyhow::anyhow!("no home directory"))?,
+                None => ssh_config::default_path()
+                    .ok_or_else(|| anyhow::anyhow!("no home directory"))?,
             };
             let text = std::fs::read_to_string(&path)
                 .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
@@ -177,8 +195,17 @@ pub fn load(source: Source, path: Option<&Path>) -> Result<Parsed> {
 /// Write parsed hosts into the store under a folder named after the source.
 /// Duplicates (see `find_duplicate`) are handled per `policy`; with the default
 /// `Skip`, re-importing is safe.
-pub fn apply(store: &Store, vault: &dyn Vault, source: Source, parsed: Parsed, policy: DupPolicy) -> Result<ImportReport> {
-    let mut report = ImportReport { warnings: parsed.warnings, ..Default::default() };
+pub fn apply(
+    store: &Store,
+    vault: &dyn Vault,
+    source: Source,
+    parsed: Parsed,
+    policy: DupPolicy,
+) -> Result<ImportReport> {
+    let mut report = ImportReport {
+        warnings: parsed.warnings,
+        ..Default::default()
+    };
     let root = ensure_folder(store, None, source.folder_name())?;
     let mut vault_warned = false;
     let existing = existing_hosts(store)?;
@@ -199,7 +226,9 @@ pub fn apply(store: &Store, vault: &dyn Vault, source: Source, parsed: Parsed, p
                 Ok(name) => Some(name),
                 Err(e) => {
                     if !vault_warned {
-                        report.warnings.push(format!("identity files not saved to vault: {e}"));
+                        report
+                            .warnings
+                            .push(format!("identity files not saved to vault: {e}"));
                         vault_warned = true;
                     }
                     None
@@ -220,7 +249,10 @@ pub fn apply(store: &Store, vault: &dyn Vault, source: Source, parsed: Parsed, p
         };
         if let (Some(n), DupPolicy::Overwrite) = (dup, policy) {
             // Keep id, place, name, colour, tags…; imported fields win where the import has them.
-            store.upsert(&Node { settings: n.settings.merged_with(&imported), ..n })?;
+            store.upsert(&Node {
+                settings: n.settings.merged_with(&imported),
+                ..n
+            })?;
             report.updated += 1;
             continue;
         }
@@ -277,12 +309,23 @@ fn key_credential(vault: &dyn Vault, path: &str) -> Result<String> {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "key".into());
     for i in 0.. {
-        let name = if i == 0 { stem.clone() } else { format!("{stem} ({i})") };
+        let name = if i == 0 {
+            stem.clone()
+        } else {
+            format!("{stem} ({i})")
+        };
         match vault.get(&name)? {
             Some(s) if s.kind == SecretKind::Key && s.value == path => return Ok(name),
             Some(_) => continue,
             None => {
-                vault.set(&name, &Secret { kind: SecretKind::Key, value: path.to_string(), key_passphrase: None })?;
+                vault.set(
+                    &name,
+                    &Secret {
+                        kind: SecretKind::Key,
+                        value: path.to_string(),
+                        key_passphrase: None,
+                    },
+                )?;
                 return Ok(name);
             }
         }
@@ -318,8 +361,21 @@ mod tests {
 
         let parsed = Parsed {
             hosts: vec![
-                ImportedHost { name: "web".into(), host: "10.0.0.1".into(), user: Some("ops".into()), identity_file: Some("/k/id_ed25519".into()), ..Default::default() },
-                ImportedHost { name: "db".into(), host: "10.0.0.2".into(), folder: vec!["prod".into(), "eu".into()], font: Some("Hack".into()), font_size: Some(15), ..Default::default() },
+                ImportedHost {
+                    name: "web".into(),
+                    host: "10.0.0.1".into(),
+                    user: Some("ops".into()),
+                    identity_file: Some("/k/id_ed25519".into()),
+                    ..Default::default()
+                },
+                ImportedHost {
+                    name: "db".into(),
+                    host: "10.0.0.2".into(),
+                    folder: vec!["prod".into(), "eu".into()],
+                    font: Some("Hack".into()),
+                    font_size: Some(15),
+                    ..Default::default()
+                },
             ],
             warnings: vec!["w".into()],
         };
@@ -328,30 +384,65 @@ mod tests {
         assert_eq!(r.warnings, vec!["w"]);
 
         let all = store.all().unwrap();
-        let root = all.iter().find(|n| n.name == "ssh config" && n.kind == Kind::Folder).unwrap();
+        let root = all
+            .iter()
+            .find(|n| n.name == "ssh config" && n.kind == Kind::Folder)
+            .unwrap();
         let web = all.iter().find(|n| n.name == "web").unwrap();
         assert_eq!(web.parent_id.as_deref(), Some(root.id.as_str()));
         assert_eq!(web.settings.credential.as_deref(), Some("id_ed25519"));
-        assert_eq!(vault.get("id_ed25519").unwrap().unwrap().value, "/k/id_ed25519");
-        let eu = all.iter().find(|n| n.name == "eu" && n.kind == Kind::Folder).unwrap();
+        assert_eq!(
+            vault.get("id_ed25519").unwrap().unwrap().value,
+            "/k/id_ed25519"
+        );
+        let eu = all
+            .iter()
+            .find(|n| n.name == "eu" && n.kind == Kind::Folder)
+            .unwrap();
         let db = all.iter().find(|n| n.name == "db").unwrap();
         assert_eq!(db.parent_id.as_deref(), Some(eu.id.as_str()));
-        assert_eq!((db.settings.font.as_deref(), db.settings.font_size), (Some("Hack"), Some(15)));
+        assert_eq!(
+            (db.settings.font.as_deref(), db.settings.font_size),
+            (Some("Hack"), Some(15))
+        );
 
         // Second import of the same thing: nothing added, folder reused.
         let again = || Parsed {
-            hosts: vec![ImportedHost { name: "web".into(), host: "x".into(), user: Some("root".into()), ..Default::default() }],
+            hosts: vec![ImportedHost {
+                name: "web".into(),
+                host: "x".into(),
+                user: Some("root".into()),
+                ..Default::default()
+            }],
             warnings: vec![],
         };
         let r = apply(&store, &vault, Source::SshConfig, again(), DupPolicy::Skip).unwrap();
         assert_eq!((r.added, r.skipped, r.updated), (0, 1, 0));
-        assert_eq!(store.all().unwrap().iter().filter(|n| n.name == "ssh config").count(), 1);
+        assert_eq!(
+            store
+                .all()
+                .unwrap()
+                .iter()
+                .filter(|n| n.name == "ssh config")
+                .count(),
+            1
+        );
 
         // Overwrite: same node id, imported fields replaced, the rest kept.
-        let r = apply(&store, &vault, Source::SshConfig, again(), DupPolicy::Overwrite).unwrap();
+        let r = apply(
+            &store,
+            &vault,
+            Source::SshConfig,
+            again(),
+            DupPolicy::Overwrite,
+        )
+        .unwrap();
         assert_eq!((r.added, r.skipped, r.updated), (0, 0, 1));
         let web2 = store.get(&web.id).unwrap().unwrap();
-        assert_eq!((web2.settings.host.as_deref(), web2.settings.user.as_deref()), (Some("x"), Some("root")));
+        assert_eq!(
+            (web2.settings.host.as_deref(), web2.settings.user.as_deref()),
+            (Some("x"), Some("root"))
+        );
         assert_eq!(web2.settings.credential.as_deref(), Some("id_ed25519")); // not in the import → kept
 
         // Copy: added beside it with a suffixed name.
@@ -363,20 +454,52 @@ mod tests {
     #[test]
     fn preview_flags_same_name_and_same_host_user_tree_wide() {
         let store = Store::open(Path::new(":memory:")).unwrap();
-        store.upsert(&Node {
-            id: "f".into(), parent_id: None, kind: Kind::Folder, name: "prod".into(), sort: 0,
-            settings: Settings { user: Some("ops".into()), ..Default::default() },
-        }).unwrap();
-        store.upsert(&Node {
-            id: "a".into(), parent_id: Some("f".into()), kind: Kind::Ssh, name: "alpha".into(), sort: 0,
-            settings: Settings { host: Some("10.0.0.1".into()), ..Default::default() },
-        }).unwrap();
+        store
+            .upsert(&Node {
+                id: "f".into(),
+                parent_id: None,
+                kind: Kind::Folder,
+                name: "prod".into(),
+                sort: 0,
+                settings: Settings {
+                    user: Some("ops".into()),
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+        store
+            .upsert(&Node {
+                id: "a".into(),
+                parent_id: Some("f".into()),
+                kind: Kind::Ssh,
+                name: "alpha".into(),
+                sort: 0,
+                settings: Settings {
+                    host: Some("10.0.0.1".into()),
+                    ..Default::default()
+                },
+            })
+            .unwrap();
         let parsed = Parsed {
             hosts: vec![
-                ImportedHost { name: "alpha".into(), host: "1.1.1.1".into(), ..Default::default() },
+                ImportedHost {
+                    name: "alpha".into(),
+                    host: "1.1.1.1".into(),
+                    ..Default::default()
+                },
                 // user inherited from the folder counts
-                ImportedHost { name: "other".into(), host: "10.0.0.1".into(), user: Some("ops".into()), ..Default::default() },
-                ImportedHost { name: "fresh".into(), host: "10.0.0.1".into(), user: Some("someone-else".into()), ..Default::default() },
+                ImportedHost {
+                    name: "other".into(),
+                    host: "10.0.0.1".into(),
+                    user: Some("ops".into()),
+                    ..Default::default()
+                },
+                ImportedHost {
+                    name: "fresh".into(),
+                    host: "10.0.0.1".into(),
+                    user: Some("someone-else".into()),
+                    ..Default::default()
+                },
             ],
             warnings: vec![],
         };
@@ -385,8 +508,18 @@ mod tests {
         assert_eq!(
             p.duplicates,
             vec![
-                Duplicate { name: "alpha".into(), host: "1.1.1.1".into(), existing: "alpha".into(), reason: "same name" },
-                Duplicate { name: "other".into(), host: "10.0.0.1".into(), existing: "alpha".into(), reason: "same host+user" },
+                Duplicate {
+                    name: "alpha".into(),
+                    host: "1.1.1.1".into(),
+                    existing: "alpha".into(),
+                    reason: "same name"
+                },
+                Duplicate {
+                    name: "other".into(),
+                    host: "10.0.0.1".into(),
+                    existing: "alpha".into(),
+                    reason: "same host+user"
+                },
             ]
         );
         assert!(store.all().unwrap().iter().all(|n| n.name != "fresh")); // dry run
@@ -409,7 +542,12 @@ mod tests {
         let vault = FileVault::open(dir.path()); // locked
         let parsed = Parsed {
             hosts: (0..2)
-                .map(|i| ImportedHost { name: format!("h{i}"), host: "h".into(), identity_file: Some("/k".into()), ..Default::default() })
+                .map(|i| ImportedHost {
+                    name: format!("h{i}"),
+                    host: "h".into(),
+                    identity_file: Some("/k".into()),
+                    ..Default::default()
+                })
                 .collect(),
             warnings: vec![],
         };

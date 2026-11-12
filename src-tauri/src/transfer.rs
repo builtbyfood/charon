@@ -37,7 +37,13 @@ pub struct TreeOpts {
 
 impl Default for TreeOpts {
     fn default() -> Self {
-        Self { parallel: 4, follow_symlinks: true, preserve_mode: false, preserve_mtime: true, conflict: Conflict::Overwrite }
+        Self {
+            parallel: 4,
+            follow_symlinks: true,
+            preserve_mode: false,
+            preserve_mtime: true,
+            conflict: Conflict::Overwrite,
+        }
     }
 }
 
@@ -54,13 +60,30 @@ pub struct PlanFile {
 pub enum TreeEvent {
     /// The walk is done: the file list and total bytes. `dest` is the resolved
     /// top-level name (may differ from the source after a Rename).
-    Plan { files: Vec<PlanFile>, bytes_total: u64, dest: String },
+    Plan {
+        files: Vec<PlanFile>,
+        bytes_total: u64,
+        dest: String,
+    },
     /// A file's state changed. `state`: "running" | "done" | "failed" | "skipped".
-    File { rel: String, done: u64, total: u64, state: &'static str, error: Option<String> },
+    File {
+        rel: String,
+        done: u64,
+        total: u64,
+        state: &'static str,
+        error: Option<String>,
+    },
     /// A non-fatal problem (unreadable entry, skipped symlink…).
     Warn { message: String },
     /// The whole item finished.
-    Done { files_done: u64, files_total: u64, bytes_done: u64, bytes_total: u64, failed: Vec<String>, cancelled: bool },
+    Done {
+        files_done: u64,
+        files_total: u64,
+        bytes_done: u64,
+        bytes_total: u64,
+        failed: Vec<String>,
+        cancelled: bool,
+    },
 }
 
 pub type Reporter = Arc<dyn Fn(TreeEvent) + Send + Sync>;
@@ -85,7 +108,11 @@ struct Counts {
 }
 
 fn base_name(path: &str) -> String {
-    path.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or(path).to_string()
+    path.trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(path)
+        .to_string()
 }
 
 /// Split "name.ext" into ("name", ".ext"); a dotfile or extensionless name keeps
@@ -124,40 +151,81 @@ pub async fn download_tree(
     report: Reporter,
     only: Option<&HashSet<String>>,
 ) -> Result<()> {
-    let root = fs.stat(remote_root).await.with_context(|| format!("stat {remote_root}"))?;
-    let root_is_dir = root.kind == "dir" || (root.kind == "symlink" && root.target_kind == Some("dir"));
+    let root = fs
+        .stat(remote_root)
+        .await
+        .with_context(|| format!("stat {remote_root}"))?;
+    let root_is_dir =
+        root.kind == "dir" || (root.kind == "symlink" && root.target_kind == Some("dir"));
 
     // Resolve the top-level destination name against the conflict policy.
     let top = base_name(remote_root);
     let dest_top = match resolve_conflict(&top, opts.conflict, |n| dest_dir.join(n).exists()) {
         Some(name) => name,
         None => {
-            report(TreeEvent::Warn { message: format!("{top}: exists, skipped") });
-            report(TreeEvent::Done { files_done: 0, files_total: 0, bytes_done: 0, bytes_total: 0, failed: vec![], cancelled: false });
+            report(TreeEvent::Warn {
+                message: format!("{top}: exists, skipped"),
+            });
+            report(TreeEvent::Done {
+                files_done: 0,
+                files_total: 0,
+                bytes_done: 0,
+                bytes_total: 0,
+                failed: vec![],
+                cancelled: false,
+            });
             return Ok(());
         }
     };
 
     // ShellFs fast path: a whole directory as one tar stream.
     if root_is_dir && only.is_none() {
-        if let Some(tar) = fs.download_dir_tar(remote_root, TAR_LIMIT).await.unwrap_or(None) {
+        if let Some(tar) = fs
+            .download_dir_tar(remote_root, TAR_LIMIT)
+            .await
+            .unwrap_or(None)
+        {
             // Decode + extract off the async reactor: it is synchronous file I/O.
-            let (dest_dir, dest_top, opts, report) = (dest_dir.to_path_buf(), dest_top.clone(), *opts, report.clone());
-            return tokio::task::spawn_blocking(move || extract_tar(tar, &dest_dir, &dest_top, &opts, &report)).await?;
+            let (dest_dir, dest_top, opts, report) = (
+                dest_dir.to_path_buf(),
+                dest_top.clone(),
+                *opts,
+                report.clone(),
+            );
+            return tokio::task::spawn_blocking(move || {
+                extract_tar(tar, &dest_dir, &dest_top, &opts, &report)
+            })
+            .await?;
         }
     }
 
     // Walk the remote tree into a flat plan.
     let mut files = Vec::new();
     let mut dirs = Vec::new();
-    walk_remote(fs.as_ref(), &root, remote_root, &dest_top, opts, &report, &mut files, &mut dirs).await;
+    walk_remote(
+        fs.as_ref(),
+        &root,
+        remote_root,
+        &dest_top,
+        opts,
+        &report,
+        &mut files,
+        &mut dirs,
+    )
+    .await;
     if let Some(only) = only {
         files.retain(|f| only.contains(&f.rel));
     }
 
     let bytes_total: u64 = files.iter().map(|f| f.size).sum();
     report(TreeEvent::Plan {
-        files: files.iter().map(|f| PlanFile { rel: f.rel.clone(), size: f.size }).collect(),
+        files: files
+            .iter()
+            .map(|f| PlanFile {
+                rel: f.rel.clone(),
+                size: f.size,
+            })
+            .collect(),
         bytes_total,
         dest: dest_top.clone(),
     });
@@ -170,9 +238,18 @@ pub async fn download_tree(
         let _ = tokio::fs::create_dir_all(dest_dir.join(&dest_top)).await;
     }
 
-    let counts = Arc::new(Counts { files_done: AtomicU64::new(0), bytes_done: AtomicU64::new(0) });
+    let counts = Arc::new(Counts {
+        files_done: AtomicU64::new(0),
+        bytes_done: AtomicU64::new(0),
+    });
     let failed = run_pool(opts.parallel, cancel.clone(), files, |f| {
-        let (fs, report, counts, cancel, dest_dir) = (fs.clone(), report.clone(), counts.clone(), cancel.clone(), dest_dir.to_path_buf());
+        let (fs, report, counts, cancel, dest_dir) = (
+            fs.clone(),
+            report.clone(),
+            counts.clone(),
+            cancel.clone(),
+            dest_dir.to_path_buf(),
+        );
         async move {
             let local = dest_dir.join(&f.rel);
             if let Some(parent) = local.parent() {
@@ -189,13 +266,27 @@ pub async fn download_tree(
                     }
                     counts.files_done.fetch_add(1, Ordering::Relaxed);
                     counts.bytes_done.fetch_add(f.size, Ordering::Relaxed);
-                    report(TreeEvent::File { rel: f.rel.clone(), done: f.size, total: f.size, state: "done", error: None });
+                    report(TreeEvent::File {
+                        rel: f.rel.clone(),
+                        done: f.size,
+                        total: f.size,
+                        state: "done",
+                        error: None,
+                    });
                     None
                 }
                 Err(e) => {
                     let msg = format!("{e:#}");
-                    report(TreeEvent::File { rel: f.rel.clone(), done: 0, total: f.size, state: "failed", error: Some(msg.clone()) });
-                    report(TreeEvent::Warn { message: format!("{}: {msg}", f.rel) });
+                    report(TreeEvent::File {
+                        rel: f.rel.clone(),
+                        done: 0,
+                        total: f.size,
+                        state: "failed",
+                        error: Some(msg.clone()),
+                    });
+                    report(TreeEvent::Warn {
+                        message: format!("{}: {msg}", f.rel),
+                    });
                     Some(f.rel.clone())
                 }
             }
@@ -226,15 +317,26 @@ pub async fn upload_tree(
     report: Reporter,
     only: Option<&HashSet<String>>,
 ) -> Result<()> {
-    let meta = tokio::fs::symlink_metadata(local_root).await.with_context(|| format!("stat {}", local_root.display()))?;
+    let meta = tokio::fs::symlink_metadata(local_root)
+        .await
+        .with_context(|| format!("stat {}", local_root.display()))?;
     let root_is_dir = meta.is_dir();
     let top = base_name(&local_root.to_string_lossy());
 
     let dest_top = match resolve_remote(fs.as_ref(), dest_remote_dir, &top, opts.conflict).await {
         Some(name) => name,
         None => {
-            report(TreeEvent::Warn { message: format!("{top}: exists on the remote, skipped") });
-            report(TreeEvent::Done { files_done: 0, files_total: 0, bytes_done: 0, bytes_total: 0, failed: vec![], cancelled: false });
+            report(TreeEvent::Warn {
+                message: format!("{top}: exists on the remote, skipped"),
+            });
+            report(TreeEvent::Done {
+                files_done: 0,
+                files_total: 0,
+                bytes_done: 0,
+                bytes_total: 0,
+                failed: vec![],
+                cancelled: false,
+            });
             return Ok(());
         }
     };
@@ -247,7 +349,13 @@ pub async fn upload_tree(
     }
     let bytes_total: u64 = files.iter().map(|f| f.size).sum();
     report(TreeEvent::Plan {
-        files: files.iter().map(|f| PlanFile { rel: f.rel.clone(), size: f.size }).collect(),
+        files: files
+            .iter()
+            .map(|f| PlanFile {
+                rel: f.rel.clone(),
+                size: f.size,
+            })
+            .collect(),
         bytes_total,
         dest: dest_top.clone(),
     });
@@ -257,13 +365,23 @@ pub async fn upload_tree(
         let _ = fs.mkdir(&fs.join(dest_remote_dir, &dest_top)).await;
     }
     for d in &dirs {
-        let _ = fs.mkdir(&remote_join(fs.as_ref(), dest_remote_dir, &d.rel)).await;
+        let _ = fs
+            .mkdir(&remote_join(fs.as_ref(), dest_remote_dir, &d.rel))
+            .await;
     }
 
-    let counts = Arc::new(Counts { files_done: AtomicU64::new(0), bytes_done: AtomicU64::new(0) });
+    let counts = Arc::new(Counts {
+        files_done: AtomicU64::new(0),
+        bytes_done: AtomicU64::new(0),
+    });
     let failed = run_pool(opts.parallel, cancel.clone(), files, |f| {
-        let (fs, report, counts, cancel, dest_remote_dir) =
-            (fs.clone(), report.clone(), counts.clone(), cancel.clone(), dest_remote_dir.to_string());
+        let (fs, report, counts, cancel, dest_remote_dir) = (
+            fs.clone(),
+            report.clone(),
+            counts.clone(),
+            cancel.clone(),
+            dest_remote_dir.to_string(),
+        );
         async move {
             let remote = remote_join(fs.as_ref(), &dest_remote_dir, &f.rel);
             let t = file_transfer(&f.rel, report.clone(), cancel.clone());
@@ -277,13 +395,27 @@ pub async fn upload_tree(
                     }
                     counts.files_done.fetch_add(1, Ordering::Relaxed);
                     counts.bytes_done.fetch_add(f.size, Ordering::Relaxed);
-                    report(TreeEvent::File { rel: f.rel.clone(), done: f.size, total: f.size, state: "done", error: None });
+                    report(TreeEvent::File {
+                        rel: f.rel.clone(),
+                        done: f.size,
+                        total: f.size,
+                        state: "done",
+                        error: None,
+                    });
                     None
                 }
                 Err(e) => {
                     let msg = format!("{e:#}");
-                    report(TreeEvent::File { rel: f.rel.clone(), done: 0, total: f.size, state: "failed", error: Some(msg.clone()) });
-                    report(TreeEvent::Warn { message: format!("{}: {msg}", f.rel) });
+                    report(TreeEvent::File {
+                        rel: f.rel.clone(),
+                        done: 0,
+                        total: f.size,
+                        state: "failed",
+                        error: Some(msg.clone()),
+                    });
+                    report(TreeEvent::Warn {
+                        message: format!("{}: {msg}", f.rel),
+                    });
                     Some(f.rel.clone())
                 }
             }
@@ -324,30 +456,60 @@ pub async fn copy_tree(
     only: Option<&HashSet<String>>,
 ) -> Result<()> {
     let root = fs.stat(src).await.with_context(|| format!("stat {src}"))?;
-    let root_is_dir = root.kind == "dir" || (root.kind == "symlink" && root.target_kind == Some("dir"));
+    let root_is_dir =
+        root.kind == "dir" || (root.kind == "symlink" && root.target_kind == Some("dir"));
     if root_is_dir && is_within(src, dest_dir) {
         anyhow::bail!("cannot copy a folder into itself");
     }
     let top = base_name(src);
-    let policy = if fs.join(dest_dir, &top) == src { Conflict::Rename } else { opts.conflict };
+    let policy = if fs.join(dest_dir, &top) == src {
+        Conflict::Rename
+    } else {
+        opts.conflict
+    };
     let dest_top = match resolve_remote(fs.as_ref(), dest_dir, &top, policy).await {
         Some(name) => name,
         None => {
-            report(TreeEvent::Warn { message: format!("{top}: exists, skipped") });
-            report(TreeEvent::Done { files_done: 0, files_total: 0, bytes_done: 0, bytes_total: 0, failed: vec![], cancelled: false });
+            report(TreeEvent::Warn {
+                message: format!("{top}: exists, skipped"),
+            });
+            report(TreeEvent::Done {
+                files_done: 0,
+                files_total: 0,
+                bytes_done: 0,
+                bytes_total: 0,
+                failed: vec![],
+                cancelled: false,
+            });
             return Ok(());
         }
     };
 
     let mut files = Vec::new();
     let mut dirs = Vec::new();
-    walk_remote(fs.as_ref(), &root, src, &dest_top, opts, &report, &mut files, &mut dirs).await;
+    walk_remote(
+        fs.as_ref(),
+        &root,
+        src,
+        &dest_top,
+        opts,
+        &report,
+        &mut files,
+        &mut dirs,
+    )
+    .await;
     if let Some(only) = only {
         files.retain(|f| only.contains(&f.rel));
     }
     let bytes_total: u64 = files.iter().map(|f| f.size).sum();
     report(TreeEvent::Plan {
-        files: files.iter().map(|f| PlanFile { rel: f.rel.clone(), size: f.size }).collect(),
+        files: files
+            .iter()
+            .map(|f| PlanFile {
+                rel: f.rel.clone(),
+                size: f.size,
+            })
+            .collect(),
         bytes_total,
         dest: dest_top.clone(),
     });
@@ -364,9 +526,18 @@ pub async fn copy_tree(
         }
     }
 
-    let counts = Arc::new(Counts { files_done: AtomicU64::new(0), bytes_done: AtomicU64::new(0) });
+    let counts = Arc::new(Counts {
+        files_done: AtomicU64::new(0),
+        bytes_done: AtomicU64::new(0),
+    });
     let failed = run_pool(opts.parallel, cancel.clone(), files, |f| {
-        let (fs, report, counts, cancel, dest_dir) = (fs.clone(), report.clone(), counts.clone(), cancel.clone(), dest_dir.to_string());
+        let (fs, report, counts, cancel, dest_dir) = (
+            fs.clone(),
+            report.clone(),
+            counts.clone(),
+            cancel.clone(),
+            dest_dir.to_string(),
+        );
         async move {
             let to = remote_join(fs.as_ref(), &dest_dir, &f.rel);
             let t = file_transfer(&f.rel, report.clone(), cancel.clone());
@@ -380,13 +551,27 @@ pub async fn copy_tree(
                     }
                     counts.files_done.fetch_add(1, Ordering::Relaxed);
                     counts.bytes_done.fetch_add(f.size, Ordering::Relaxed);
-                    report(TreeEvent::File { rel: f.rel.clone(), done: f.size, total: f.size, state: "done", error: None });
+                    report(TreeEvent::File {
+                        rel: f.rel.clone(),
+                        done: f.size,
+                        total: f.size,
+                        state: "done",
+                        error: None,
+                    });
                     None
                 }
                 Err(e) => {
                     let msg = format!("{e:#}");
-                    report(TreeEvent::File { rel: f.rel.clone(), done: 0, total: f.size, state: "failed", error: Some(msg.clone()) });
-                    report(TreeEvent::Warn { message: format!("{}: {msg}", f.rel) });
+                    report(TreeEvent::File {
+                        rel: f.rel.clone(),
+                        done: 0,
+                        total: f.size,
+                        state: "failed",
+                        error: Some(msg.clone()),
+                    });
+                    report(TreeEvent::Warn {
+                        message: format!("{}: {msg}", f.rel),
+                    });
                     Some(f.rel.clone())
                 }
             }
@@ -408,7 +593,12 @@ pub async fn copy_tree(
 /// Move `src` into `dest_dir` (a rename on the same filesystem). Returns the new
 /// path, or None when the conflict policy skipped it. Overwrite replaces whatever
 /// is at the target, folder or file.
-pub async fn move_item(fs: &dyn Fs, src: &str, dest_dir: &str, conflict: Conflict) -> Result<Option<String>> {
+pub async fn move_item(
+    fs: &dyn Fs,
+    src: &str,
+    dest_dir: &str,
+    conflict: Conflict,
+) -> Result<Option<String>> {
     let top = base_name(src);
     if fs.join(dest_dir, &top) == src {
         return Ok(Some(src.to_string())); // already there
@@ -417,16 +607,25 @@ pub async fn move_item(fs: &dyn Fs, src: &str, dest_dir: &str, conflict: Conflic
     if root.kind == "dir" && is_within(src, dest_dir) {
         anyhow::bail!("cannot move {top} into itself");
     }
-    let Some(name) = resolve_remote(fs, dest_dir, &top, conflict).await else { return Ok(None) };
+    let Some(name) = resolve_remote(fs, dest_dir, &top, conflict).await else {
+        return Ok(None);
+    };
     let target = fs.join(dest_dir, &name);
     if fs.stat(&target).await.is_ok() {
-        fs.remove_tree(&target).await.with_context(|| format!("replace {target}"))?;
+        fs.remove_tree(&target)
+            .await
+            .with_context(|| format!("replace {target}"))?;
     }
-    fs.rename(src, &target).await.with_context(|| format!("move {src} to {target}"))?;
+    fs.rename(src, &target)
+        .await
+        .with_context(|| format!("move {src} to {target}"))?;
     Ok(Some(target))
 }
 
 // ---------------------------------------------------------------- helpers
+
+/// Most "name (n)" candidates tried on a remote directory before giving up.
+const RENAME_TRIES: u32 = 10_000;
 
 /// `resolve_conflict` against a directory on `fs` (async stat per candidate).
 async fn resolve_remote(fs: &dyn Fs, dir: &str, name: &str, policy: Conflict) -> Option<String> {
@@ -437,14 +636,21 @@ async fn resolve_remote(fs: &dyn Fs, dir: &str, name: &str, policy: Conflict) ->
         Conflict::Overwrite => Some(name.to_string()),
         Conflict::Skip => None,
         Conflict::Rename => {
+            // Bounded: a server that answers every stat (hostile, or a broken
+            // mount) would otherwise keep this looping. Past the cap, skip it.
             let (stem, ext) = split_ext(name);
-            for i in 2.. {
+            for i in 2..=RENAME_TRIES {
                 let cand = format!("{stem} ({i}){ext}");
                 if fs.stat(&fs.join(dir, &cand)).await.is_err() {
                     return Some(cand);
                 }
             }
-            unreachable!()
+            tracing::warn!(
+                dir,
+                name,
+                "no free \"name (n)\" after {RENAME_TRIES} tries; skipped"
+            );
+            None
         }
     }
 }
@@ -467,7 +673,13 @@ fn file_transfer(rel: &str, report: Reporter, cancel: Arc<AtomicBool>) -> Transf
         rel.to_string(),
         Some(Box::new(move |p| {
             if p.state == "running" {
-                report(TreeEvent::File { rel: rel_owned.clone(), done: p.done, total: p.total, state: "running", error: None });
+                report(TreeEvent::File {
+                    rel: rel_owned.clone(),
+                    done: p.done,
+                    total: p.total,
+                    state: "running",
+                    error: None,
+                });
             }
         })),
         cancel,
@@ -476,7 +688,12 @@ fn file_transfer(rel: &str, report: Reporter, cancel: Arc<AtomicBool>) -> Transf
 
 /// Run `job` over `items` with at most `parallel` at once, stopping early on
 /// cancel; returns the rels that failed.
-async fn run_pool<F, Fut>(parallel: usize, cancel: Arc<AtomicBool>, items: Vec<FilePlan>, job: F) -> Vec<String>
+async fn run_pool<F, Fut>(
+    parallel: usize,
+    cancel: Arc<AtomicBool>,
+    items: Vec<FilePlan>,
+    job: F,
+) -> Vec<String>
 where
     F: Fn(FilePlan) -> Fut,
     Fut: std::future::Future<Output = Option<String>>,
@@ -500,6 +717,7 @@ where
 }
 
 /// BFS the remote tree, appending files and dirs (shallow-first).
+#[allow(clippy::too_many_arguments)] // the walk's state, passed down rather than bundled for one caller
 async fn walk_remote(
     fs: &dyn Fs,
     root: &crate::sftp::Entry,
@@ -510,9 +728,16 @@ async fn walk_remote(
     files: &mut Vec<FilePlan>,
     dirs: &mut Vec<FilePlan>,
 ) {
-    let root_is_dir = root.kind == "dir" || (root.kind == "symlink" && root.target_kind == Some("dir"));
+    let root_is_dir =
+        root.kind == "dir" || (root.kind == "symlink" && root.target_kind == Some("dir"));
     if !root_is_dir {
-        files.push(FilePlan { rel: dest_top.to_string(), src: root_path.to_string(), size: root.size, mode: root.mode, mtime: root.mtime });
+        files.push(FilePlan {
+            rel: dest_top.to_string(),
+            src: root_path.to_string(),
+            size: root.size,
+            mode: root.mode,
+            mtime: root.mtime,
+        });
         return;
     }
     // queue of (remote path, rel prefix)
@@ -521,7 +746,9 @@ async fn walk_remote(
         let listing = match fs.list(&dir).await {
             Ok(l) => l,
             Err(e) => {
-                report(TreeEvent::Warn { message: format!("{rel}: {e:#}") });
+                report(TreeEvent::Warn {
+                    message: format!("{rel}: {e:#}"),
+                });
                 continue;
             }
         };
@@ -529,35 +756,66 @@ async fn walk_remote(
             let child_rel = format!("{rel}/{}", e.name);
             let is_dir = e.kind == "dir" || (e.kind == "symlink" && e.target_kind == Some("dir"));
             if e.kind == "symlink" && !opts.follow_symlinks {
-                report(TreeEvent::Warn { message: format!("{child_rel}: symlink skipped") });
+                report(TreeEvent::Warn {
+                    message: format!("{child_rel}: symlink skipped"),
+                });
                 continue;
             }
             if e.kind == "other" {
-                report(TreeEvent::Warn { message: format!("{child_rel}: special file skipped") });
+                report(TreeEvent::Warn {
+                    message: format!("{child_rel}: special file skipped"),
+                });
                 continue;
             }
             if is_dir {
-                dirs.push(FilePlan { rel: child_rel.clone(), src: e.path.clone(), size: 0, mode: e.mode, mtime: e.mtime });
+                dirs.push(FilePlan {
+                    rel: child_rel.clone(),
+                    src: e.path.clone(),
+                    size: 0,
+                    mode: e.mode,
+                    mtime: e.mtime,
+                });
                 queue.push((e.path, child_rel));
             } else {
-                files.push(FilePlan { rel: child_rel, src: e.path, size: e.size, mode: e.mode, mtime: e.mtime });
+                files.push(FilePlan {
+                    rel: child_rel,
+                    src: e.path,
+                    size: e.size,
+                    mode: e.mode,
+                    mtime: e.mtime,
+                });
             }
         }
     }
 }
 
 /// Walk the local tree with std::fs; dirs shallow-first (BFS), matching walk_remote.
-fn walk_local(root: &Path, dest_top: &str, opts: &TreeOpts, report: &Reporter, files: &mut Vec<FilePlan>, dirs: &mut Vec<FilePlan>) {
+fn walk_local(
+    root: &Path,
+    dest_top: &str,
+    opts: &TreeOpts,
+    report: &Reporter,
+    files: &mut Vec<FilePlan>,
+    dirs: &mut Vec<FilePlan>,
+) {
     let root_meta = match std::fs::symlink_metadata(root) {
         Ok(m) => m,
         Err(e) => {
-            report(TreeEvent::Warn { message: format!("{}: {e}", root.display()) });
+            report(TreeEvent::Warn {
+                message: format!("{}: {e}", root.display()),
+            });
             return;
         }
     };
     if root_meta.is_file() {
         let (size, mtime, mode) = local_meta(root);
-        files.push(FilePlan { rel: dest_top.to_string(), src: root.to_string_lossy().into_owned(), size, mode, mtime });
+        files.push(FilePlan {
+            rel: dest_top.to_string(),
+            src: root.to_string_lossy().into_owned(),
+            size,
+            mode,
+            mtime,
+        });
         return;
     }
     // queue of (local dir, rel prefix)
@@ -566,7 +824,9 @@ fn walk_local(root: &Path, dest_top: &str, opts: &TreeOpts, report: &Reporter, f
         let rd = match std::fs::read_dir(&dir) {
             Ok(rd) => rd,
             Err(e) => {
-                report(TreeEvent::Warn { message: format!("{rel}: {e}") });
+                report(TreeEvent::Warn {
+                    message: format!("{rel}: {e}"),
+                });
                 continue;
             }
         };
@@ -574,7 +834,9 @@ fn walk_local(root: &Path, dest_top: &str, opts: &TreeOpts, report: &Reporter, f
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
-                    report(TreeEvent::Warn { message: format!("{rel}: {e}") });
+                    report(TreeEvent::Warn {
+                        message: format!("{rel}: {e}"),
+                    });
                     continue;
                 }
             };
@@ -584,28 +846,46 @@ fn walk_local(root: &Path, dest_top: &str, opts: &TreeOpts, report: &Reporter, f
             let link_meta = match std::fs::symlink_metadata(&path) {
                 Ok(m) => m,
                 Err(e) => {
-                    report(TreeEvent::Warn { message: format!("{child_rel}: {e}") });
+                    report(TreeEvent::Warn {
+                        message: format!("{child_rel}: {e}"),
+                    });
                     continue;
                 }
             };
             if link_meta.file_type().is_symlink() && !opts.follow_symlinks {
-                report(TreeEvent::Warn { message: format!("{child_rel}: symlink skipped") });
+                report(TreeEvent::Warn {
+                    message: format!("{child_rel}: symlink skipped"),
+                });
                 continue;
             }
             // Resolve through symlinks to classify (follow mode).
             let meta = match std::fs::metadata(&path) {
                 Ok(m) => m,
                 Err(e) => {
-                    report(TreeEvent::Warn { message: format!("{child_rel}: {e}") });
+                    report(TreeEvent::Warn {
+                        message: format!("{child_rel}: {e}"),
+                    });
                     continue;
                 }
             };
             let (size, mtime, mode) = local_meta(&path);
             if meta.is_dir() {
-                dirs.push(FilePlan { rel: child_rel.clone(), src: path.to_string_lossy().into_owned(), size: 0, mode, mtime });
+                dirs.push(FilePlan {
+                    rel: child_rel.clone(),
+                    src: path.to_string_lossy().into_owned(),
+                    size: 0,
+                    mode,
+                    mtime,
+                });
                 queue.push((path, child_rel));
             } else if meta.is_file() {
-                files.push(FilePlan { rel: child_rel, src: path.to_string_lossy().into_owned(), size, mode, mtime });
+                files.push(FilePlan {
+                    rel: child_rel,
+                    src: path.to_string_lossy().into_owned(),
+                    size,
+                    mode,
+                    mtime,
+                });
             }
         }
     }
@@ -616,7 +896,12 @@ fn local_meta(path: &Path) -> (u64, u64, u32) {
         Ok(m) => m,
         Err(_) => return (0, 0, 0),
     };
-    let mtime = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+    let mtime = m
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     #[cfg(unix)]
     let mode = {
         use std::os::unix::fs::PermissionsExt;
@@ -660,12 +945,21 @@ fn set_local_mode_sync(path: &Path, mode: u32) {
 
 async fn filetime_set(path: &Path, mtime: u64) -> Result<()> {
     let p = path.to_path_buf();
-    tokio::task::spawn_blocking(move || filetime::set_file_mtime(&p, filetime::FileTime::from_unix_time(mtime as i64, 0))).await??;
+    tokio::task::spawn_blocking(move || {
+        filetime::set_file_mtime(&p, filetime::FileTime::from_unix_time(mtime as i64, 0))
+    })
+    .await??;
     Ok(())
 }
 
 /// Extract a `tar` stream (ShellFs fast path) into `dest_dir/dest_top`.
-fn extract_tar(tar_bytes: Vec<u8>, dest_dir: &Path, dest_top: &str, opts: &TreeOpts, report: &Reporter) -> Result<()> {
+fn extract_tar(
+    tar_bytes: Vec<u8>,
+    dest_dir: &Path,
+    dest_top: &str,
+    opts: &TreeOpts,
+    report: &Reporter,
+) -> Result<()> {
     use std::io::Read;
     // The tar was `tar -cf - <name>`, so entries are prefixed with the source name;
     // strip that first component and re-root under dest_top.
@@ -678,7 +972,9 @@ fn extract_tar(tar_bytes: Vec<u8>, dest_dir: &Path, dest_top: &str, opts: &TreeO
         let mut entry = match entry {
             Ok(e) => e,
             Err(e) => {
-                report(TreeEvent::Warn { message: format!("tar entry: {e}") });
+                report(TreeEvent::Warn {
+                    message: format!("tar entry: {e}"),
+                });
                 continue;
             }
         };
@@ -701,12 +997,16 @@ fn extract_tar(tar_bytes: Vec<u8>, dest_dir: &Path, dest_top: &str, opts: &TreeO
         let mut buf = Vec::new();
         if let Err(e) = entry.read_to_end(&mut buf) {
             failed.push(sub.to_string_lossy().into_owned());
-            report(TreeEvent::Warn { message: format!("{}: {e}", sub.display()) });
+            report(TreeEvent::Warn {
+                message: format!("{}: {e}", sub.display()),
+            });
             continue;
         }
         if let Err(e) = std::fs::write(&out, &buf) {
             failed.push(sub.to_string_lossy().into_owned());
-            report(TreeEvent::Warn { message: format!("{}: {e}", out.display()) });
+            report(TreeEvent::Warn {
+                message: format!("{}: {e}", out.display()),
+            });
             continue;
         }
         let rel = format!("{dest_top}/{}", sub.to_string_lossy().replace('\\', "/"));
@@ -717,15 +1017,31 @@ fn extract_tar(tar_bytes: Vec<u8>, dest_dir: &Path, dest_top: &str, opts: &TreeO
         }
         if opts.preserve_mtime {
             if let Ok(mtime) = entry.header().mtime() {
-                let _ = filetime::set_file_mtime(&out, filetime::FileTime::from_unix_time(mtime as i64, 0));
+                let _ = filetime::set_file_mtime(
+                    &out,
+                    filetime::FileTime::from_unix_time(mtime as i64, 0),
+                );
             }
         }
         files_done += 1;
         bytes_done += buf.len() as u64;
-        plan.push(PlanFile { rel: rel.clone(), size: buf.len() as u64 });
-        report(TreeEvent::File { rel, done: buf.len() as u64, total: buf.len() as u64, state: "done", error: None });
+        plan.push(PlanFile {
+            rel: rel.clone(),
+            size: buf.len() as u64,
+        });
+        report(TreeEvent::File {
+            rel,
+            done: buf.len() as u64,
+            total: buf.len() as u64,
+            state: "done",
+            error: None,
+        });
     }
-    report(TreeEvent::Plan { files: plan, bytes_total: bytes_done, dest: dest_top.to_string() });
+    report(TreeEvent::Plan {
+        files: plan,
+        bytes_total: bytes_done,
+        dest: dest_top.to_string(),
+    });
     report(TreeEvent::Done {
         files_done,
         files_total: files_done + failed.len() as u64,

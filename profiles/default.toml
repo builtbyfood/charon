@@ -8,7 +8,7 @@ font = "JetBrains Mono"         # default terminal font; a connection can set it
 font_size = 13                  # Ctrl+= / Ctrl+- write back here
 theme = "charon-dark"           # "charon-light", or "system" to follow the OS (Settings → Appearance)
 scrollback = 50000
-renderer = "webgl"              # "canvas" or "dom" if WebGL glitches on your GPU (Settings → Terminal)
+renderer = "auto"               # DOM on Linux (WebKitGTK), WebGL elsewhere; or "webgl" / "canvas" / "dom" (Settings → Terminal)
 
 [terminal]
 timestamps = false              # gutter with the time each line was printed ("time" switch in the status bar)
@@ -41,6 +41,11 @@ keepalive_seconds = 30          # server-alive interval; 0 = off. No idle-discon
 
 [sudo]
 auto_send = false               # true: auto-send the saved password at a sudo/su prompt (300 ms debounce); else button / Ctrl+Shift+P
+
+[broadcast]                     # MultiExec (Ctrl+Shift+B)
+idle_off_minutes = 10           # broadcast switches itself off after this long without input; 0 = never
+confirm = true                  # Enter on a command starting with one of these asks first while broadcasting
+confirm_prefixes = ["rm", "dd", "mkfs", "shutdown", "reboot", "poweroff", "halt", "systemctl stop"]
 
 [local]
 credential = ""                 # vault entry whose password the bare Local shell offers to sudo (Unix); saved local nodes use their own credential

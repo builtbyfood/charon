@@ -14,9 +14,14 @@ pub async fn run() -> anyhow::Result<()> {
         if line.trim().is_empty() {
             continue;
         }
-        let id = serde_json::from_str::<serde_json::Value>(&line).ok().and_then(|v| v.get("id").cloned());
+        let id = serde_json::from_str::<serde_json::Value>(&line)
+            .ok()
+            .and_then(|v| v.get("id").cloned());
         let reply = match crate::mcp::read_endpoint(&paths.data_dir) {
-            None => Some(rpc_error(id, "Charon is not running (start the app to use its MCP server)")),
+            None => Some(rpc_error(
+                id,
+                "Charon is not running (start the app to use its MCP server)",
+            )),
             Some((port, token)) => match crate::mcp::http::post(port, &token, &line).await {
                 Ok(Some(resp)) => Some(resp),
                 Ok(None) => None, // notification: no reply

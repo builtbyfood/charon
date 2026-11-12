@@ -9,9 +9,12 @@
   import NodeEditor from "./NodeEditor.svelte";
   import ImportPanel from "./ImportPanel.svelte";
   import DocsPanel from "./DocsPanel.svelte";
+  import ContextMenu from "./ContextMenu.svelte";
 
-  let { onopen, onquick, onlocal, oneditor, onmcp, onsettings, docsView = $bindable(false), docsCommand, docsSession, vault, onunlock }: {
+  let { onopen, onbroadcast, onquick, onlocal, oneditor, onmcp, onsettings, docsView = $bindable(false), docsCommand, docsSession, vault, onunlock }: {
     onopen: (n: Node, color?: string, font?: SessionFont) => void;
+    /** "Broadcast to folder": every host under the folder (nested too), in tree order. */
+    onbroadcast?: (hosts: { node: Node; color?: string; font?: SessionFont }[]) => void;
     onquick: (t: string) => void;
     onlocal: (admin?: boolean) => void;
     oneditor: () => void;
@@ -116,6 +119,19 @@
     editing = null;
     await refresh();
   }
+  // Folder right-click menu.
+  let folderMenu = $state<{ x: number; y: number; node: Node } | null>(null);
+  /** Hosts under a folder, depth-first in tree order (the filter is ignored: it's the folder's hosts). */
+  function hostsUnder(id: string): Node[] {
+    const out: Node[] = [];
+    for (const n of nodes.filter((x) => x.parent_id === id)) {
+      if (n.kind === "folder") out.push(...hostsUnder(n.id)); else out.push(n);
+    }
+    return out;
+  }
+  function broadcastFolder(f: Node) {
+    onbroadcast?.(hostsUnder(f.id).map((n) => ({ node: n, color: inheritedColor(n), font: fontOf(nodes, n) })));
+  }
   async function remove(n: Node) {
     if (!confirm(`Delete ${n.name}${n.kind === "folder" ? " and everything in it" : ""}?`)) return;
     await deleteConnection(n.id); await refresh();
@@ -126,10 +142,12 @@
   {#each children(pid) as n (n.id)}
     <div class="row" style:padding-left="{8 + depth * 14}px" style:--c={inheritedColor(n) ?? "var(--line)"}>
       {#if n.kind === "folder"}
-        <button class="name folder" onclick={() => toggle(n.id)}>
+        <button class="name folder" onclick={() => toggle(n.id)}
+          oncontextmenu={(e) => { e.preventDefault(); folderMenu = { x: e.clientX, y: e.clientY, node: n }; }}>
           <span class="chev" class:closed={collapsed.has(n.id)}>▾</span>{n.name}
         </button>
         <span class="acts">
+          {#if onbroadcast}<button title="Broadcast to folder: open every host in it and tick them for broadcast input" onclick={() => broadcastFolder(n)}>⇶</button>{/if}
           <button title="Add host" onclick={() => startNew("ssh", n.id)}>+</button>
           <button title="Add folder" onclick={() => startNew("folder", n.id)}>▣</button>
           <button title="Edit" onclick={() => startEdit(n)}>✎</button>
@@ -253,6 +271,17 @@
   </section>
   {/if}
 </aside>
+{#if folderMenu}
+  {@const f = folderMenu.node}
+  <ContextMenu x={folderMenu.x} y={folderMenu.y} onclose={() => (folderMenu = null)} items={[
+    { label: `Broadcast to folder (${hostsUnder(f.id).length})`, action: () => broadcastFolder(f), disabled: !onbroadcast || hostsUnder(f.id).length === 0 },
+    { separator: true, label: "" },
+    { label: "Add host", action: () => startNew("ssh", f.id) },
+    { label: "Add folder", action: () => startNew("folder", f.id) },
+    { label: "Edit", action: () => startEdit(f) },
+    { label: "Delete", action: () => remove(f) },
+  ]} />
+{/if}
 {#if importing}
   <ImportPanel onclose={() => { importing = false; refresh(); refreshCreds(); }} />
 {/if}

@@ -30,24 +30,39 @@ pub fn parse(text: &str) -> Parsed {
         if !in_bookmarks {
             continue;
         }
-        let Some((key, value)) = line.split_once('=') else { continue };
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
         let (key, value) = (key.trim(), value.trim());
         match key {
             "SubRep" => {
-                folder = value.split('\\').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect();
+                folder = value
+                    .split('\\')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
             }
             "ImgNum" => {}
             _ => match parse_session(key, value, &folder) {
                 Ok(Some(h)) => out.hosts.push(h),
-                Ok(None) => out.warnings.push(format!("{key}: skipped (not an SSH session)")),
-                Err(e) => out.warnings.push(format!("line {}: {key}: {e}", lineno + 1)),
+                Ok(None) => out
+                    .warnings
+                    .push(format!("{key}: skipped (not an SSH session)")),
+                Err(e) => out
+                    .warnings
+                    .push(format!("line {}: {key}: {e}", lineno + 1)),
             },
         }
     }
     out
 }
 
-fn parse_session(name: &str, value: &str, folder: &[String]) -> Result<Option<ImportedHost>, String> {
+fn parse_session(
+    name: &str,
+    value: &str,
+    folder: &[String],
+) -> Result<Option<ImportedHost>, String> {
     // "#109#0%host%22%user%…#font…#…" → the part between the 2nd '#' and the 3rd.
     let mut parts = value.splitn(4, '#');
     let (Some(""), Some(_icon), Some(body)) = (parts.next(), parts.next(), parts.next()) else {
@@ -57,10 +72,26 @@ fn parse_session(name: &str, value: &str, folder: &[String]) -> Result<Option<Im
     if fields.first() != Some(&"0") {
         return Ok(None);
     }
-    let host = fields.get(1).map(|s| s.trim()).filter(|s| !s.is_empty()).ok_or("no host")?;
-    let port = fields.get(2).and_then(|p| p.trim().parse::<u16>().ok()).filter(|p| *p != 0);
-    let user = fields.get(3).map(|s| s.trim()).filter(|s| !s.is_empty()).map(str::to_string);
-    let identity_file = fields.iter().skip(4).map(|s| s.trim()).find(|s| looks_like_key_path(s)).map(str::to_string);
+    let host = fields
+        .get(1)
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or("no host")?;
+    let port = fields
+        .get(2)
+        .and_then(|p| p.trim().parse::<u16>().ok())
+        .filter(|p| *p != 0);
+    let user = fields
+        .get(3)
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let identity_file = fields
+        .iter()
+        .skip(4)
+        .map(|s| s.trim())
+        .find(|s| looks_like_key_path(s))
+        .map(str::to_string);
     Ok(Some(ImportedHost {
         name: clean_name(name, host, user.as_deref()),
         host: host.to_string(),
@@ -87,7 +118,11 @@ fn clean_name(name: &str, host: &str, user: Option<&str>) -> String {
             n = stripped.trim_end();
         }
     }
-    if n.is_empty() { host.to_string() } else { n.to_string() }
+    if n.is_empty() {
+        host.to_string()
+    } else {
+        n.to_string()
+    }
 }
 
 fn looks_like_key_path(s: &str) -> bool {
@@ -110,12 +145,27 @@ mod tests {
 
     #[test]
     fn cleans_auto_generated_names() {
-        assert_eq!(clean_name("10.20.0.20 (admin)", "10.20.0.20", Some("admin")), "10.20.0.20");
-        assert_eq!(clean_name("buildbox - 10.20.0.6 (travis)", "10.20.0.6", Some("travis")), "buildbox");
-        assert_eq!(clean_name("buildbox - 10.20.0.6", "10.20.0.6", None), "buildbox");
+        assert_eq!(
+            clean_name("10.20.0.20 (admin)", "10.20.0.20", Some("admin")),
+            "10.20.0.20"
+        );
+        assert_eq!(
+            clean_name("buildbox - 10.20.0.6 (alice)", "10.20.0.6", Some("alice")),
+            "buildbox"
+        );
+        assert_eq!(
+            clean_name("buildbox - 10.20.0.6", "10.20.0.6", None),
+            "buildbox"
+        );
         // Different user/host in the decoration is information: keep it.
-        assert_eq!(clean_name("db (root)", "10.0.0.1", Some("dbadmin")), "db (root)");
-        assert_eq!(clean_name("db - other.host", "10.0.0.1", None), "db - other.host");
+        assert_eq!(
+            clean_name("db (root)", "10.0.0.1", Some("dbadmin")),
+            "db (root)"
+        );
+        assert_eq!(
+            clean_name("db - other.host", "10.0.0.1", None),
+            "db - other.host"
+        );
         assert_eq!(clean_name("  (admin)", "h", Some("admin")), "h");
     }
 
@@ -126,7 +176,10 @@ mod tests {
         assert_eq!(names, vec!["web", "db", "bastion"]);
 
         let web = &p.hosts[0];
-        assert_eq!((web.host.as_str(), web.port, web.user.as_deref()), ("web.example.com", Some(22), Some("ops")));
+        assert_eq!(
+            (web.host.as_str(), web.port, web.user.as_deref()),
+            ("web.example.com", Some(22), Some("ops"))
+        );
         assert!(web.folder.is_empty());
         assert_eq!(web.identity_file, None);
 

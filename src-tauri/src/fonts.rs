@@ -22,7 +22,10 @@ pub fn mono_families() -> Vec<String> {
         // spacing=mono (100) plus dual-width (90): CJK-capable terminal fonts are "dual".
         let mut all = Vec::new();
         for pattern in [":spacing=mono", ":spacing=dual"] {
-            if let Ok(o) = std::process::Command::new("fc-list").args([pattern, "family"]).output() {
+            if let Ok(o) = std::process::Command::new("fc-list")
+                .args([pattern, "family"])
+                .output()
+            {
                 all.extend(parse_fc_list(&String::from_utf8_lossy(&o.stdout)));
             }
         }
@@ -43,6 +46,14 @@ mod tests {
     #[test]
     fn fc_list_lines_become_unique_families() {
         let out = "DejaVu Sans Mono\nDejaVu Sans Mono,DejaVu Sans Mono Bold\nJetBrains Mono,JetBrains Mono ExtraBold\n\nNoto Sans Mono\\-CJK\nadwaita mono\n";
-        assert_eq!(parse_fc_list(out), vec!["adwaita mono", "DejaVu Sans Mono", "JetBrains Mono", "Noto Sans Mono-CJK"]);
+        assert_eq!(
+            parse_fc_list(out),
+            vec![
+                "adwaita mono",
+                "DejaVu Sans Mono",
+                "JetBrains Mono",
+                "Noto Sans Mono-CJK"
+            ]
+        );
     }
 }

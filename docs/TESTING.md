@@ -1,4 +1,4 @@
-# Charon — tester guide (0.2.0 preview)
+# Charon — tester guide (0.3 preview)
 
 Charon is one app for the work you'd otherwise spread across PuTTY, MobaXterm and
 Notepad++: a connection manager, SSH/serial/local terminals, an SFTP pane that
@@ -20,14 +20,14 @@ Grab the build for your platform from the release page.
 - **Portable (recommended for testing):** unzip `charon-windows-portable.zip`
   anywhere and run `charon.exe`. Everything it saves stays in a `data\` folder
   next to the exe — nothing lands in AppData. Delete the folder to uninstall.
-- **Installer:** `Charon_0.2.0_x64-setup.exe`. Per-user install, no admin needed.
+- **Installer:** `Charon_<version>_x64-setup.exe`. Per-user install, no admin needed.
   Data lives in `%APPDATA%\charon`.
 - Needs the WebView2 runtime, which every updated Windows 10/11 already has.
 
 ### Linux
-- Debian/Ubuntu 22.04+: `sudo apt install ./charon_0.2.0_amd64.deb`
-- Fedora / RHEL 9 family: `sudo dnf install ./charon-0.2.0-1.x86_64.rpm`
-- Anything else: `chmod +x Charon_0.2.0_amd64.AppImage && ./Charon_0.2.0_amd64.AppImage`
+- Debian/Ubuntu 22.04+: `sudo apt install ./charon_<version>_amd64.deb`
+- Fedora / RHEL 9 family: `sudo dnf install ./charon-<version>-1.x86_64.rpm`
+- Anything else: `chmod +x Charon_<version>_amd64.AppImage && ./Charon_<version>_amd64.AppImage`
 - Portable: unpack `charon-linux-portable.tar.gz` and run `./charon` from that folder.
 - Data lives in `~/.config/charon` (installed) or `./data` (portable).
 
@@ -152,6 +152,18 @@ badge above the listing shows which backend is live: `sftp as admin`,
 `sftp as root (sudo)`, or `shell as root` (a fallback for hosts without
 `sftp-server`). When you `exit` back to your user, it switches back.
 
+**Edit as root, on demand.** You don't have to be in a root shell: the badge
+offers *browse as root (sudo)* at any time, right-click a file → *Edit as root*,
+a directory → *Open as root*. One sudo-sftp channel per session serves the pane
+and the editor and asks for the sudo password once (or uses the stored
+credential). A save that fails with *permission denied* offers **Retry as sudo**;
+documents opened that way carry a red **root** badge. Saves keep the file's owner
+and mode (setuid/setgid survive).
+
+**To test:** on a lab host, open `/etc/hosts` with *Edit as root*, add a comment,
+save, and check `ls -l /etc/hosts` shows the same owner and mode as before. Then
+open a root-only file normally, save, and take the *Retry as sudo* path.
+
 Transfers show progress at the bottom with cancel/retry. Uploading to a path that
 already has a transfer in flight asks first. *Preserve mode* copies the source
 file's permissions after upload (off by default).
@@ -175,7 +187,37 @@ pastes cleaned.
 
 ---
 
-## 7. MCP — letting an agent into your sessions
+## 7. Broadcast input and Split view
+
+**Broadcast (MultiExec).** Tick tabs with the checkbox in the tab strip (it shows
+on hover), or right-click a folder → *Broadcast to folder* to open every host in it
+and tick them. **Ctrl+Shift+B** then sends what you type or paste in the tab with
+the keyboard to every ticked tab, in any Charon window. While it's on, that tab has
+an amber border and a `BROADCAST → N sessions` chip; the receiving tabs have a
+dashed amber border. Rules worth checking:
+
+- A multi-line paste asks once (in the source tab), then goes to every target.
+- The sudo button answers each target that is at a password prompt with that
+  session's own saved password, and sends nothing to a target that isn't.
+- A tab whose session closes drops out of the broadcast.
+- The flag picker and Charon's hidden commands run only in the source tab.
+
+**Split.** The *Split* button shows the active tab and the ticked ones side by
+side, sized to the window (each pane keeps at least 24 rows; more panes than fit
+scroll by rows). Entering Split collapses every Files pane; the top bar's *Files*
+toggles them all, and each pane's own `files` button just that one. Leaving Split
+puts them back. **⧉** moves the Split panes to a window of their own; closing that
+window brings them back. One click on a pane gives it the keyboard and makes it the
+broadcast source.
+
+**To test:** tick three lab hosts, broadcast, type `echo hello` and press Enter:
+every host should run exactly that line once. Try it typing fast and typing slowly.
+Then `sudo -k; sudo true` and press the sudo button. **Never broadcast to
+production hosts while testing.**
+
+---
+
+## 8. MCP — letting an agent into your sessions
 
 This is the feature that needs the most careful testing.
 
@@ -195,7 +237,19 @@ Commands run hidden (you don't see them scroll past) and only on sessions where
 shell integration is active, because that's how Charon knows when they finish and
 what they returned. If you're typing in a session, the agent is refused for a few
 seconds rather than interleaved with your keystrokes. `data/mcp.log` records tool,
-session, tier decision, exit code and duration — never command text or output.
+session, tier decision, exit code, duration and what was asked for (the command
+line, or the paths) — never command output. A secret typed into a command ends up
+in the log, so don't.
+
+**Root.** An agent's command that starts with `sudo` is never typed into your
+terminal: Charon runs the rest as root on its own channel, giving the saved
+password to sudo directly (the command can't read it, and a password prompt the
+command prints is ignored). It needs *may run as root* ticked in the approval
+dialog (or `mcp_sudo` on a trusted node). `sudo -u …` and `su` are refused.
+
+`run_command` can take `sessions: [...]` to run the same command on several
+sessions: each session's own tier decides, and one approval dialog lists every
+target with what it will get.
 
 **To test:** set a lab host to `exec-approve`, ask your agent to run `uptime`
 there, and try Approve, Deny, and letting it time out. Then check the host's
@@ -204,7 +258,7 @@ hosts to `trusted` while testing.
 
 ---
 
-## 8. Profile
+## 9. Profile
 
 `data/profiles/default.toml` (portable) or the same path under the config dir. It
 covers font, size, renderer, scrollback, copy/paste rules, right-click mode,
@@ -213,20 +267,32 @@ reloads on save. Unknown keys are preserved so a newer build won't eat your edit
 
 ---
 
-## 9. Known limitations in this build
+## 10. Known limitations in this build
 
 - Serial and RDP/VNC: serial connections exist but have had little real-hardware
   testing; RDP/VNC aren't in yet (planned, in-tab).
 - Editor has no language servers yet — completion is word-based plus snippets.
 - Two installed (non-portable) copies at different privilege levels on Windows
-  break keyboard input in the non-elevated one (see §1).
+  break keyboard input in the non-elevated one (see §1). Run one elevation level
+  at a time; use *Local (admin)* for an elevated shell instead.
+- Linux renderer: Settings → Terminal → *Renderer* defaults to *Automatic*, which
+  is the DOM renderer on Linux because WebKitGTK has painted WebGL output only after
+  a key press on some systems. WebGL can be chosen there; if the screen stops
+  updating until you type, switch back.
+- Sudo auto-send (`[sudo] auto_send = true` in the profile) only fires during a
+  command you started (needs shell integration on), once per command; any other
+  password prompt shows the button. A remote can print a fake prompt, so this is
+  deliberate.
+- Portable mode keeps everything in `./data` on Windows and Linux, the webview's
+  cache included. On macOS the webview (WKWebView) keeps its cache under
+  `~/Library` regardless; Charon's own data stays in `./data`.
 - macOS builds are unsigned (see §1) and have had the least testing.
 - Headless Linux without a Secret Service (no desktop keyring): use portable mode.
 - `.ppk` DSA keys are refused (deprecated everywhere; convert to ed25519).
 
 ---
 
-## 10. Reporting
+## 11. Reporting
 
 Open an issue with:
 

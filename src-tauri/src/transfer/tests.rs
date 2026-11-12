@@ -13,8 +13,14 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone)]
 enum Node {
     Dir,
-    File { data: Vec<u8>, mode: u32, mtime: u64 },
-    Symlink { target_dir: bool },
+    File {
+        data: Vec<u8>,
+        mode: u32,
+        mtime: u64,
+    },
+    Symlink {
+        target_dir: bool,
+    },
 }
 
 /// In-memory remote filesystem. Paths are POSIX ("/a/b"); the map holds every
@@ -42,7 +48,11 @@ impl MockFs {
     }
 
     fn children(&self, dir: &str) -> Vec<(String, Node)> {
-        let prefix = if dir == "/" { "/".to_string() } else { format!("{dir}/") };
+        let prefix = if dir == "/" {
+            "/".to_string()
+        } else {
+            format!("{dir}/")
+        };
         let mut out = Vec::new();
         for (path, node) in &self.nodes {
             if let Some(rest) = path.strip_prefix(&prefix) {
@@ -60,7 +70,13 @@ impl MockFs {
         let (kind, target_kind, size, mode, mtime) = match node {
             Node::Dir => ("dir", None, 0, 0o755, 0),
             Node::File { data, mode, mtime } => ("file", None, data.len() as u64, *mode, *mtime),
-            Node::Symlink { target_dir } => ("symlink", Some(if *target_dir { "dir" } else { "file" }), 0, 0o777, 0),
+            Node::Symlink { target_dir } => (
+                "symlink",
+                Some(if *target_dir { "dir" } else { "file" }),
+                0,
+                0o777,
+                0,
+            ),
         };
         Entry {
             name,
@@ -86,12 +102,23 @@ impl Fs for MockFs {
         if !matches!(self.nodes.get(path), Some(Node::Dir)) && path != "/" {
             anyhow::bail!("not a directory: {path}");
         }
-        let entries = self.children(path).iter().map(|(p, n)| self.entry_for(p, n)).collect();
-        Ok(Listing { path: path.to_string(), parent: None, entries })
+        let entries = self
+            .children(path)
+            .iter()
+            .map(|(p, n)| self.entry_for(p, n))
+            .collect();
+        Ok(Listing {
+            path: path.to_string(),
+            parent: None,
+            entries,
+        })
     }
 
     async fn stat(&self, path: &str) -> anyhow::Result<Entry> {
-        let node = self.nodes.get(path).ok_or_else(|| anyhow::anyhow!("no such path: {path}"))?;
+        let node = self
+            .nodes
+            .get(path)
+            .ok_or_else(|| anyhow::anyhow!("no such path: {path}"))?;
         Ok(self.entry_for(path, node))
     }
 
@@ -152,7 +179,11 @@ impl Fs for MockFs {
 }
 
 fn file(data: &str) -> Node {
-    Node::File { data: data.as_bytes().to_vec(), mode: 0o644, mtime: 1_600_000_000 }
+    Node::File {
+        data: data.as_bytes().to_vec(),
+        mode: 0o644,
+        mtime: 1_600_000_000,
+    }
 }
 
 /// Collect every reported event into a shared Vec.
@@ -165,14 +196,27 @@ fn collector() -> (Reporter, Arc<Mutex<Vec<TreeEvent>>>) {
 
 fn plan_of(log: &[TreeEvent]) -> Vec<PlanFile> {
     log.iter()
-        .find_map(|e| if let TreeEvent::Plan { files, .. } = e { Some(files.clone()) } else { None })
+        .find_map(|e| {
+            if let TreeEvent::Plan { files, .. } = e {
+                Some(files.clone())
+            } else {
+                None
+            }
+        })
         .expect("a Plan event")
 }
 
 fn done_of(log: &[TreeEvent]) -> (u64, u64, Vec<String>, bool) {
     log.iter()
         .find_map(|e| {
-            if let TreeEvent::Done { files_done, files_total, failed, cancelled, .. } = e {
+            if let TreeEvent::Done {
+                files_done,
+                files_total,
+                failed,
+                cancelled,
+                ..
+            } = e
+            {
                 Some((*files_done, *files_total, failed.clone(), *cancelled))
             } else {
                 None
@@ -194,19 +238,39 @@ async fn recursive_download_builds_the_local_tree() {
     let tmp = tempfile::tempdir().unwrap();
     let (report, log) = collector();
 
-    download_tree(fs.clone(), "/proj", tmp.path(), &TreeOpts::default(), Arc::new(AtomicBool::new(false)), report, None)
-        .await
-        .unwrap();
+    download_tree(
+        fs.clone(),
+        "/proj",
+        tmp.path(),
+        &TreeOpts::default(),
+        Arc::new(AtomicBool::new(false)),
+        report,
+        None,
+    )
+    .await
+    .unwrap();
 
     let log = log.lock().unwrap();
     let mut rels: Vec<_> = plan_of(&log).iter().map(|f| f.rel.clone()).collect();
     rels.sort();
-    assert_eq!(rels, vec!["proj/a.txt", "proj/sub/b.txt", "proj/sub/deep/c.txt"]);
+    assert_eq!(
+        rels,
+        vec!["proj/a.txt", "proj/sub/b.txt", "proj/sub/deep/c.txt"]
+    );
 
     // Files exist locally with the right contents and the directory shape.
-    assert_eq!(std::fs::read_to_string(tmp.path().join("proj/a.txt")).unwrap(), "aaa");
-    assert_eq!(std::fs::read_to_string(tmp.path().join("proj/sub/b.txt")).unwrap(), "bbbb");
-    assert_eq!(std::fs::read_to_string(tmp.path().join("proj/sub/deep/c.txt")).unwrap(), "ccccc");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("proj/a.txt")).unwrap(),
+        "aaa"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("proj/sub/b.txt")).unwrap(),
+        "bbbb"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("proj/sub/deep/c.txt")).unwrap(),
+        "ccccc"
+    );
 
     let (files_done, files_total, failed, cancelled) = done_of(&log);
     assert_eq!(files_done, 3);
@@ -220,7 +284,10 @@ async fn cancel_mid_tree_stops_early() {
     let mut nodes = vec![("/big", Node::Dir)];
     let contents: Vec<String> = (0..10).map(|i| format!("data-{i}")).collect();
     for (i, c) in contents.iter().enumerate() {
-        nodes.push((Box::leak(format!("/big/f{i:02}.txt").into_boxed_str()), file(c)));
+        nodes.push((
+            Box::leak(format!("/big/f{i:02}.txt").into_boxed_str()),
+            file(c),
+        ));
     }
     let mut fs = MockFs::new(nodes);
     // Cancel once the 3rd download starts; parallel=1 makes it deterministic.
@@ -230,14 +297,30 @@ async fn cancel_mid_tree_stops_early() {
 
     let tmp = tempfile::tempdir().unwrap();
     let (report, log) = collector();
-    let opts = TreeOpts { parallel: 1, ..TreeOpts::default() };
+    let opts = TreeOpts {
+        parallel: 1,
+        ..TreeOpts::default()
+    };
 
-    download_tree(fs.clone(), "/big", tmp.path(), &opts, cancel.clone(), report, None).await.unwrap();
+    download_tree(
+        fs.clone(),
+        "/big",
+        tmp.path(),
+        &opts,
+        cancel.clone(),
+        report,
+        None,
+    )
+    .await
+    .unwrap();
 
     let log = log.lock().unwrap();
     let (files_done, _total, _failed, cancelled) = done_of(&log);
     assert!(cancelled, "the tree should report cancellation");
-    assert!(files_done < 10, "not every file should have transferred, got {files_done}");
+    assert!(
+        files_done < 10,
+        "not every file should have transferred, got {files_done}"
+    );
     // Some files did transfer before the cancel; not all did.
     assert!(fs.downloaded.lock().unwrap().len() < 10);
 }
@@ -251,13 +334,27 @@ async fn conflict_skip_leaves_existing_untouched() {
     std::fs::write(tmp.path().join("proj/a.txt"), "OLD").unwrap();
 
     let (report, log) = collector();
-    let opts = TreeOpts { conflict: Conflict::Skip, ..TreeOpts::default() };
-    download_tree(fs.clone(), "/proj", tmp.path(), &opts, Arc::new(AtomicBool::new(false)), report, None)
-        .await
-        .unwrap();
+    let opts = TreeOpts {
+        conflict: Conflict::Skip,
+        ..TreeOpts::default()
+    };
+    download_tree(
+        fs.clone(),
+        "/proj",
+        tmp.path(),
+        &opts,
+        Arc::new(AtomicBool::new(false)),
+        report,
+        None,
+    )
+    .await
+    .unwrap();
 
     // Nothing overwritten; a Warn and an empty Done were reported.
-    assert_eq!(std::fs::read_to_string(tmp.path().join("proj/a.txt")).unwrap(), "OLD");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("proj/a.txt")).unwrap(),
+        "OLD"
+    );
     let log = log.lock().unwrap();
     assert!(log.iter().any(|e| matches!(e, TreeEvent::Warn { .. })));
     let (files_done, _total, _failed, _cancelled) = done_of(&log);
@@ -272,14 +369,31 @@ async fn conflict_rename_writes_beside_existing() {
     std::fs::write(tmp.path().join("proj/a.txt"), "OLD").unwrap();
 
     let (report, log) = collector();
-    let opts = TreeOpts { conflict: Conflict::Rename, ..TreeOpts::default() };
-    download_tree(fs.clone(), "/proj", tmp.path(), &opts, Arc::new(AtomicBool::new(false)), report, None)
-        .await
-        .unwrap();
+    let opts = TreeOpts {
+        conflict: Conflict::Rename,
+        ..TreeOpts::default()
+    };
+    download_tree(
+        fs.clone(),
+        "/proj",
+        tmp.path(),
+        &opts,
+        Arc::new(AtomicBool::new(false)),
+        report,
+        None,
+    )
+    .await
+    .unwrap();
 
     // Original untouched; the new tree landed under "proj (2)".
-    assert_eq!(std::fs::read_to_string(tmp.path().join("proj/a.txt")).unwrap(), "OLD");
-    assert_eq!(std::fs::read_to_string(tmp.path().join("proj (2)/a.txt")).unwrap(), "new");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("proj/a.txt")).unwrap(),
+        "OLD"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("proj (2)/a.txt")).unwrap(),
+        "new"
+    );
     let log = log.lock().unwrap();
     assert_eq!(plan_of(&log)[0].rel, "proj (2)/a.txt");
 }
@@ -293,15 +407,28 @@ async fn symlinks_skipped_when_not_following() {
     ]);
     let tmp = tempfile::tempdir().unwrap();
     let (report, log) = collector();
-    let opts = TreeOpts { follow_symlinks: false, ..TreeOpts::default() };
-    download_tree(fs.clone(), "/proj", tmp.path(), &opts, Arc::new(AtomicBool::new(false)), report, None)
-        .await
-        .unwrap();
+    let opts = TreeOpts {
+        follow_symlinks: false,
+        ..TreeOpts::default()
+    };
+    download_tree(
+        fs.clone(),
+        "/proj",
+        tmp.path(),
+        &opts,
+        Arc::new(AtomicBool::new(false)),
+        report,
+        None,
+    )
+    .await
+    .unwrap();
 
     let log = log.lock().unwrap();
     let rels: Vec<_> = plan_of(&log).iter().map(|f| f.rel.clone()).collect();
     assert_eq!(rels, vec!["proj/a.txt"]); // the symlink is not in the plan
-    assert!(log.iter().any(|e| matches!(e, TreeEvent::Warn { message } if message.contains("symlink skipped"))));
+    assert!(log
+        .iter()
+        .any(|e| matches!(e, TreeEvent::Warn { message } if message.contains("symlink skipped"))));
 }
 
 // ---------------------------------------------------------------- copy / move / delete (LocalFs)
@@ -333,17 +460,52 @@ async fn copy_tree_copies_a_folder_and_keeps_both_in_place() {
     let src = fs.join(&fs.join(&base, "src"), "proj");
     let dest = fs.join(&base, "dest");
     let (report, log) = collector();
-    copy_tree(fs.clone(), &src, &dest, &TreeOpts::default(), Arc::new(AtomicBool::new(false)), report, None).await.unwrap();
-    assert_eq!(std::fs::read_to_string(dir.path().join("dest/proj/a.txt")).unwrap(), "alpha");
-    assert_eq!(std::fs::read_to_string(dir.path().join("dest/proj/deep/b.txt")).unwrap(), "beta");
-    assert!(dir.path().join("src/proj/a.txt").exists(), "source untouched");
+    copy_tree(
+        fs.clone(),
+        &src,
+        &dest,
+        &TreeOpts::default(),
+        Arc::new(AtomicBool::new(false)),
+        report,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("dest/proj/a.txt")).unwrap(),
+        "alpha"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("dest/proj/deep/b.txt")).unwrap(),
+        "beta"
+    );
+    assert!(
+        dir.path().join("src/proj/a.txt").exists(),
+        "source untouched"
+    );
     assert_eq!(done_of(&log.lock().unwrap()).0, 2);
 
     // Same directory: a duplicate beside it, whatever the policy says.
     let (report, _) = collector();
-    let opts = TreeOpts { conflict: Conflict::Overwrite, ..TreeOpts::default() };
-    copy_tree(fs.clone(), &src, &fs.join(&base, "src"), &opts, Arc::new(AtomicBool::new(false)), report, None).await.unwrap();
-    assert_eq!(std::fs::read_to_string(dir.path().join("src/proj (2)/deep/b.txt")).unwrap(), "beta");
+    let opts = TreeOpts {
+        conflict: Conflict::Overwrite,
+        ..TreeOpts::default()
+    };
+    copy_tree(
+        fs.clone(),
+        &src,
+        &fs.join(&base, "src"),
+        &opts,
+        Arc::new(AtomicBool::new(false)),
+        report,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("src/proj (2)/deep/b.txt")).unwrap(),
+        "beta"
+    );
 }
 
 #[tokio::test]
@@ -351,7 +513,16 @@ async fn copy_tree_refuses_a_folder_into_itself() {
     let (_dir, fs, base) = local_tree();
     let src = fs.join(&fs.join(&base, "src"), "proj");
     let (report, _) = collector();
-    let r = copy_tree(fs.clone(), &src, &fs.join(&src, "deep"), &TreeOpts::default(), Arc::new(AtomicBool::new(false)), report, None).await;
+    let r = copy_tree(
+        fs.clone(),
+        &src,
+        &fs.join(&src, "deep"),
+        &TreeOpts::default(),
+        Arc::new(AtomicBool::new(false)),
+        report,
+        None,
+    )
+    .await;
     assert!(r.is_err());
 }
 
@@ -363,25 +534,66 @@ async fn move_item_renames_and_honours_conflicts() {
     std::fs::write(dir.path().join("dest/a.txt"), "old").unwrap();
 
     // skip leaves both alone
-    assert_eq!(move_item(fs.as_ref(), &a, &dest, Conflict::Skip).await.unwrap(), None);
+    assert_eq!(
+        move_item(fs.as_ref(), &a, &dest, Conflict::Skip)
+            .await
+            .unwrap(),
+        None
+    );
     assert!(dir.path().join("src/proj/a.txt").exists());
     // keep both
-    let to = move_item(fs.as_ref(), &a, &dest, Conflict::Rename).await.unwrap().unwrap();
+    let to = move_item(fs.as_ref(), &a, &dest, Conflict::Rename)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(to.ends_with("a (2).txt"));
     assert!(!dir.path().join("src/proj/a.txt").exists());
     // overwrite replaces the target
-    let to2 = move_item(fs.as_ref(), &to, &fs.join(&base, "src"), Conflict::Overwrite).await.unwrap().unwrap();
+    let to2 = move_item(
+        fs.as_ref(),
+        &to,
+        &fs.join(&base, "src"),
+        Conflict::Overwrite,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     std::fs::write(dir.path().join("src/a.txt"), "new").unwrap();
-    let back = move_item(fs.as_ref(), &to2, &dest, Conflict::Overwrite).await.unwrap().unwrap();
+    let back = move_item(fs.as_ref(), &to2, &dest, Conflict::Overwrite)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(back.ends_with("a (2).txt"));
 
     // a folder never moves into itself; moving to where it already is is a no-op
     let proj = fs.join(&fs.join(&base, "src"), "proj");
-    assert!(move_item(fs.as_ref(), &proj, &fs.join(&proj, "deep"), Conflict::Overwrite).await.is_err());
-    assert_eq!(move_item(fs.as_ref(), &proj, &fs.join(&base, "src"), Conflict::Overwrite).await.unwrap(), Some(proj.clone()));
+    assert!(move_item(
+        fs.as_ref(),
+        &proj,
+        &fs.join(&proj, "deep"),
+        Conflict::Overwrite
+    )
+    .await
+    .is_err());
+    assert_eq!(
+        move_item(
+            fs.as_ref(),
+            &proj,
+            &fs.join(&base, "src"),
+            Conflict::Overwrite
+        )
+        .await
+        .unwrap(),
+        Some(proj.clone())
+    );
     // a whole folder moves
-    move_item(fs.as_ref(), &proj, &dest, Conflict::Overwrite).await.unwrap();
-    assert_eq!(std::fs::read_to_string(dir.path().join("dest/proj/deep/b.txt")).unwrap(), "beta");
+    move_item(fs.as_ref(), &proj, &dest, Conflict::Overwrite)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("dest/proj/deep/b.txt")).unwrap(),
+        "beta"
+    );
 }
 
 #[tokio::test]
@@ -399,26 +611,115 @@ async fn default_remove_tree_walks_children_first() {
     struct Prim(crate::sftp::LocalFs);
     #[async_trait]
     impl Fs for Prim {
-        async fn home(&self) -> anyhow::Result<String> { self.0.home().await }
-        async fn list(&self, p: &str) -> anyhow::Result<Listing> { self.0.list(p).await }
-        async fn stat(&self, p: &str) -> anyhow::Result<Entry> { self.0.stat(p).await }
-        async fn mkdir(&self, p: &str) -> anyhow::Result<()> { self.0.mkdir(p).await }
-        async fn rename(&self, a: &str, b: &str) -> anyhow::Result<()> { self.0.rename(a, b).await }
-        async fn delete(&self, p: &str, d: bool) -> anyhow::Result<()> { self.0.delete(p, d).await }
-        async fn chmod(&self, p: &str, m: u32) -> anyhow::Result<()> { self.0.chmod(p, m).await }
-        async fn read(&self, p: &str, l: u64) -> anyhow::Result<Vec<u8>> { self.0.read(p, l).await }
-        async fn write(&self, p: &str, d: &[u8]) -> anyhow::Result<()> { self.0.write(p, d).await }
-        async fn download(&self, p: &str, l: &Path, t: &Transfer) -> anyhow::Result<()> { self.0.download(p, l, t).await }
-        async fn upload(&self, l: &Path, p: &str, t: &Transfer) -> anyhow::Result<()> { self.0.upload(l, p, t).await }
-        fn join(&self, d: &str, n: &str) -> String { self.0.join(d, n) }
+        async fn home(&self) -> anyhow::Result<String> {
+            self.0.home().await
+        }
+        async fn list(&self, p: &str) -> anyhow::Result<Listing> {
+            self.0.list(p).await
+        }
+        async fn stat(&self, p: &str) -> anyhow::Result<Entry> {
+            self.0.stat(p).await
+        }
+        async fn mkdir(&self, p: &str) -> anyhow::Result<()> {
+            self.0.mkdir(p).await
+        }
+        async fn rename(&self, a: &str, b: &str) -> anyhow::Result<()> {
+            self.0.rename(a, b).await
+        }
+        async fn delete(&self, p: &str, d: bool) -> anyhow::Result<()> {
+            self.0.delete(p, d).await
+        }
+        async fn chmod(&self, p: &str, m: u32) -> anyhow::Result<()> {
+            self.0.chmod(p, m).await
+        }
+        async fn read(&self, p: &str, l: u64) -> anyhow::Result<Vec<u8>> {
+            self.0.read(p, l).await
+        }
+        async fn write(&self, p: &str, d: &[u8]) -> anyhow::Result<()> {
+            self.0.write(p, d).await
+        }
+        async fn download(&self, p: &str, l: &Path, t: &Transfer) -> anyhow::Result<()> {
+            self.0.download(p, l, t).await
+        }
+        async fn upload(&self, l: &Path, p: &str, t: &Transfer) -> anyhow::Result<()> {
+            self.0.upload(l, p, t).await
+        }
+        fn join(&self, d: &str, n: &str) -> String {
+            self.0.join(d, n)
+        }
     }
     let (dir, _, base) = local_tree();
     let fs = Prim(crate::sftp::LocalFs);
     // and the default copy_file (through a temp file)
     let t = Transfer::new("t".into(), None, Arc::new(AtomicBool::new(false)));
     let a = fs.join(&fs.join(&fs.join(&base, "src"), "proj"), "a.txt");
-    fs.copy_file(&a, &fs.join(&fs.join(&base, "dest"), "a.txt"), &t).await.unwrap();
-    assert_eq!(std::fs::read_to_string(dir.path().join("dest/a.txt")).unwrap(), "alpha");
+    fs.copy_file(&a, &fs.join(&fs.join(&base, "dest"), "a.txt"), &t)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("dest/a.txt")).unwrap(),
+        "alpha"
+    );
     fs.remove_tree(&fs.join(&base, "src")).await.unwrap();
     assert!(!dir.path().join("src").exists());
+}
+
+#[tokio::test]
+async fn rename_gives_up_when_every_name_exists() {
+    // A server that says every path exists must not keep "name (n)" looping.
+    struct AllExist(crate::sftp::LocalFs);
+    #[async_trait]
+    impl Fs for AllExist {
+        async fn home(&self) -> anyhow::Result<String> {
+            self.0.home().await
+        }
+        async fn list(&self, p: &str) -> anyhow::Result<Listing> {
+            self.0.list(p).await
+        }
+        async fn stat(&self, p: &str) -> anyhow::Result<Entry> {
+            Ok(Entry {
+                name: p.into(),
+                path: p.into(),
+                kind: "file",
+                target_kind: None,
+                size: 0,
+                mtime: 0,
+                mode: 0o644,
+                user: None,
+                group: None,
+            })
+        }
+        async fn mkdir(&self, p: &str) -> anyhow::Result<()> {
+            self.0.mkdir(p).await
+        }
+        async fn rename(&self, a: &str, b: &str) -> anyhow::Result<()> {
+            self.0.rename(a, b).await
+        }
+        async fn delete(&self, p: &str, d: bool) -> anyhow::Result<()> {
+            self.0.delete(p, d).await
+        }
+        async fn chmod(&self, p: &str, m: u32) -> anyhow::Result<()> {
+            self.0.chmod(p, m).await
+        }
+        async fn read(&self, p: &str, l: u64) -> anyhow::Result<Vec<u8>> {
+            self.0.read(p, l).await
+        }
+        async fn write(&self, p: &str, d: &[u8]) -> anyhow::Result<()> {
+            self.0.write(p, d).await
+        }
+        async fn download(&self, p: &str, l: &Path, t: &Transfer) -> anyhow::Result<()> {
+            self.0.download(p, l, t).await
+        }
+        async fn upload(&self, l: &Path, p: &str, t: &Transfer) -> anyhow::Result<()> {
+            self.0.upload(l, p, t).await
+        }
+        fn join(&self, d: &str, n: &str) -> String {
+            format!("{d}/{n}")
+        }
+    }
+    let fs = AllExist(crate::sftp::LocalFs);
+    assert_eq!(
+        resolve_remote(&fs, "/d", "a.txt", Conflict::Rename).await,
+        None
+    );
 }

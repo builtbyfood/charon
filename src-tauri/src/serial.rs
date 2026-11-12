@@ -28,7 +28,11 @@ pub struct SerialSettings {
 impl SerialSettings {
     /// Resolve defaults (9600 8N1) and validate.
     pub fn resolve(&self) -> Result<(String, u32, DataBits, Parity, StopBits)> {
-        let port = self.port.clone().filter(|p| !p.trim().is_empty()).ok_or_else(|| anyhow!("serial port required"))?;
+        let port = self
+            .port
+            .clone()
+            .filter(|p| !p.trim().is_empty())
+            .ok_or_else(|| anyhow!("serial port required"))?;
         let baud = self.baud.unwrap_or(9600);
         let data_bits = match self.data_bits.unwrap_or(8) {
             5 => DataBits::Five,
@@ -37,7 +41,13 @@ impl SerialSettings {
             8 => DataBits::Eight,
             n => return Err(anyhow!("data bits must be 5-8, got {n}")),
         };
-        let parity = match self.parity.as_deref().unwrap_or("none").to_ascii_lowercase().as_str() {
+        let parity = match self
+            .parity
+            .as_deref()
+            .unwrap_or("none")
+            .to_ascii_lowercase()
+            .as_str()
+        {
             "none" | "n" => Parity::None,
             "odd" | "o" => Parity::Odd,
             "even" | "e" => Parity::Even,
@@ -53,7 +63,14 @@ impl SerialSettings {
 
     /// "COM3 9600 8N1" for tab titles.
     pub fn label(&self) -> String {
-        let parity = self.parity.as_deref().unwrap_or("none").chars().next().unwrap_or('n').to_ascii_uppercase();
+        let parity = self
+            .parity
+            .as_deref()
+            .unwrap_or("none")
+            .chars()
+            .next()
+            .unwrap_or('n')
+            .to_ascii_uppercase();
         format!(
             "{} {} {}{}{}",
             self.port.as_deref().unwrap_or("?"),
@@ -80,24 +97,42 @@ pub fn list_ports() -> Result<Vec<PortInfo>> {
             let description = match p.port_type {
                 serialport::SerialPortType::UsbPort(u) => {
                     let mut parts = Vec::new();
-                    if let Some(m) = u.manufacturer { parts.push(m); }
-                    if let Some(pr) = u.product { parts.push(pr); }
-                    if parts.is_empty() { format!("USB {:04x}:{:04x}", u.vid, u.pid) } else { parts.join(" ") }
+                    if let Some(m) = u.manufacturer {
+                        parts.push(m);
+                    }
+                    if let Some(pr) = u.product {
+                        parts.push(pr);
+                    }
+                    if parts.is_empty() {
+                        format!("USB {:04x}:{:04x}", u.vid, u.pid)
+                    } else {
+                        parts.join(" ")
+                    }
                 }
                 serialport::SerialPortType::PciPort => "PCI".into(),
                 serialport::SerialPortType::BluetoothPort => "Bluetooth".into(),
                 serialport::SerialPortType::Unknown => String::new(),
             };
-            PortInfo { name: p.port_name, description }
+            PortInfo {
+                name: p.port_name,
+                description,
+            }
         })
         .collect();
-    ports.sort_by(|a, b| natural_key(&a.name).cmp(&natural_key(&b.name)));
+    ports.sort_by_key(|a| natural_key(&a.name));
     Ok(ports)
 }
 
 /// Sort COM3 before COM10.
 fn natural_key(s: &str) -> (String, u64) {
-    let digits: String = s.chars().rev().take_while(|c| c.is_ascii_digit()).collect::<Vec<_>>().into_iter().rev().collect();
+    let digits: String = s
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     let prefix = &s[..s.len() - digits.len()];
     (prefix.to_string(), digits.parse().unwrap_or(0))
 }
@@ -145,7 +180,10 @@ impl SerialSession {
                 })
                 .context("spawn serial reader thread")?;
         }
-        Ok(Arc::new(Self { writer: Mutex::new(writer), stop }))
+        Ok(Arc::new(Self {
+            writer: Mutex::new(writer),
+            stop,
+        }))
     }
 }
 
@@ -175,19 +213,35 @@ mod tests {
 
     #[test]
     fn defaults_are_9600_8n1() {
-        let s = SerialSettings { port: Some("COM3".into()), ..Default::default() };
+        let s = SerialSettings {
+            port: Some("COM3".into()),
+            ..Default::default()
+        };
         let (port, baud, d, p, st) = s.resolve().unwrap();
         assert_eq!((port.as_str(), baud), ("COM3", 9600));
-        assert!(matches!((d, p, st), (DataBits::Eight, Parity::None, StopBits::One)));
+        assert!(matches!(
+            (d, p, st),
+            (DataBits::Eight, Parity::None, StopBits::One)
+        ));
         assert_eq!(s.label(), "COM3 9600 8N1");
     }
 
     #[test]
     fn validates_line_settings() {
         assert!(SerialSettings::default().resolve().is_err());
-        let bad = SerialSettings { port: Some("/dev/ttyUSB0".into()), data_bits: Some(9), ..Default::default() };
+        let bad = SerialSettings {
+            port: Some("/dev/ttyUSB0".into()),
+            data_bits: Some(9),
+            ..Default::default()
+        };
         assert!(bad.resolve().unwrap_err().to_string().contains("data bits"));
-        let odd = SerialSettings { port: Some("x".into()), parity: Some("Even".into()), stop_bits: Some(2), baud: Some(115200), ..Default::default() };
+        let odd = SerialSettings {
+            port: Some("x".into()),
+            parity: Some("Even".into()),
+            stop_bits: Some(2),
+            baud: Some(115200),
+            ..Default::default()
+        };
         let (_, baud, _, p, st) = odd.resolve().unwrap();
         assert_eq!(baud, 115200);
         assert!(matches!((p, st), (Parity::Even, StopBits::Two)));
@@ -198,7 +252,10 @@ mod tests {
     fn ports_sort_naturally() {
         let mut names = vec!["COM10", "COM3", "COM1", "/dev/ttyUSB1", "/dev/ttyUSB0"];
         names.sort_by_key(|n| natural_key(n));
-        assert_eq!(names, vec!["/dev/ttyUSB0", "/dev/ttyUSB1", "COM1", "COM3", "COM10"]);
+        assert_eq!(
+            names,
+            vec!["/dev/ttyUSB0", "/dev/ttyUSB1", "COM1", "COM3", "COM10"]
+        );
     }
 
     #[test]

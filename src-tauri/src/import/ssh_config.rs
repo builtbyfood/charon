@@ -32,8 +32,8 @@ pub fn parse(text: &str) -> Parsed {
             continue;
         }
         // "Key value", "Key=value" and "Key = value" are all valid.
-        let (key, value) = match line.split_once(|c: char| c == ' ' || c == '\t' || c == '=') {
-            Some((k, v)) => (k.trim(), v.trim_start_matches(|c: char| c == ' ' || c == '\t' || c == '=').trim()),
+        let (key, value) = match line.split_once([' ', '\t', '=']) {
+            Some((k, v)) => (k.trim(), v.trim_start_matches([' ', '\t', '=']).trim()),
             None => (line, ""),
         };
         let value = value.trim_matches('"');
@@ -45,12 +45,18 @@ pub fn parse(text: &str) -> Parsed {
                 for alias in value.split_whitespace() {
                     if alias.contains(['*', '?']) || alias.starts_with('!') {
                         if !warned_wildcard {
-                            out.warnings.push(format!("line {}: wildcard Host patterns skipped", lineno + 1));
+                            out.warnings.push(format!(
+                                "line {}: wildcard Host patterns skipped",
+                                lineno + 1
+                            ));
                             warned_wildcard = true;
                         }
                         continue;
                     }
-                    current.push(ImportedHost { name: alias.to_string(), ..Default::default() });
+                    current.push(ImportedHost {
+                        name: alias.to_string(),
+                        ..Default::default()
+                    });
                 }
                 if current.is_empty() {
                     skipping = true;
@@ -59,22 +65,33 @@ pub fn parse(text: &str) -> Parsed {
             "match" => {
                 flush(&mut current, &mut out);
                 skipping = true;
-                out.warnings.push(format!("line {}: Match block skipped", lineno + 1));
+                out.warnings
+                    .push(format!("line {}: Match block skipped", lineno + 1));
             }
-            "include" => out.warnings.push(format!("line {}: Include {value} not followed", lineno + 1)),
+            "include" => out
+                .warnings
+                .push(format!("line {}: Include {value} not followed", lineno + 1)),
             _ if skipping || current.is_empty() => {}
             "hostname" => current.iter_mut().for_each(|h| h.host = value.to_string()),
-            "user" => current.iter_mut().for_each(|h| h.user = Some(value.to_string())),
+            "user" => current
+                .iter_mut()
+                .for_each(|h| h.user = Some(value.to_string())),
             "port" => match value.parse::<u16>() {
                 Ok(p) => current.iter_mut().for_each(|h| h.port = Some(p)),
-                Err(_) => out.warnings.push(format!("line {}: bad port {value:?}", lineno + 1)),
+                Err(_) => out
+                    .warnings
+                    .push(format!("line {}: bad port {value:?}", lineno + 1)),
             },
             "identityfile" => {
                 // First IdentityFile wins, like ssh's own precedence.
                 let p = expand_tilde(value);
-                current.iter_mut().for_each(|h| { h.identity_file.get_or_insert_with(|| p.clone()); });
+                current.iter_mut().for_each(|h| {
+                    h.identity_file.get_or_insert_with(|| p.clone());
+                });
             }
-            "proxyjump" => current.iter_mut().for_each(|h| h.jump_host = Some(value.to_string())),
+            "proxyjump" => current
+                .iter_mut()
+                .for_each(|h| h.jump_host = Some(value.to_string())),
             _ => {}
         }
     }
@@ -98,8 +115,15 @@ mod tests {
         assert_eq!(web.host, "10.0.0.5");
         assert_eq!(web.user.as_deref(), Some("ops"));
         assert_eq!(web.port, Some(2222));
-        assert!(web.identity_file.as_deref().unwrap().ends_with("id_ed25519"));
-        assert!(!web.identity_file.as_deref().unwrap().starts_with('~'), "tilde expanded");
+        assert!(web
+            .identity_file
+            .as_deref()
+            .unwrap()
+            .ends_with("id_ed25519"));
+        assert!(
+            !web.identity_file.as_deref().unwrap().starts_with('~'),
+            "tilde expanded"
+        );
         assert_eq!(web.jump_host.as_deref(), Some("ops@bastion.example.com"));
         // Alias on the same Host line shares the block.
         assert_eq!(p.hosts[1].host, "10.0.0.5");

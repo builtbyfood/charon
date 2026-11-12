@@ -1,0 +1,13 @@
+# cargo audit: advisories that do not apply to Charon, with the reason.
+# Everything else stays visible until fixed (see docs/REVIEW-0.3.md, S1).
+[advisories]
+ignore = [
+  # zip 2.x: all four are in ZipArchive::extract / ZipStreamReader::extract
+  # (SUID bits, symlink targets, permissions through symlinks, symlink size
+  # abort). Charon never extracts to disk: docs.rs reads the tldr archive's
+  # .md entries in memory (each capped at 256 KB) and writes one JSON file.
+  "RUSTSEC-2026-0367",
+  "RUSTSEC-2026-0368",
+  "RUSTSEC-2026-0369",
+  "RUSTSEC-2026-0429",
+]

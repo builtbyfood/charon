@@ -55,3 +55,18 @@ export function sudoUserOf(line: string): string | null {
 export function sudoAutoEligible(line: string, loginUser?: string): boolean {
   return !!loginUser && sudoUserOf(line) === loginUser;
 }
+
+/**
+ * May the saved password go to a sudo prompt without a click? A remote can print
+ * `[sudo] password for <you>:` whenever it likes, so the text alone is not enough:
+ * - it must be the login user's own prompt (`eligible`) and auto-send be on;
+ * - shell integration must be on and a command be running (OSC 133 C seen, no D);
+ * - that command must be one the user started: an Enter typed (or broadcast) in
+ *   this tab since the last prompt `armed` it, and a send spends it, so there is
+ *   at most one automatic send per command. A new prompt disarms it; nothing the
+ *   remote prints can arm it.
+ * Anything else still shows the button (one click sends).
+ */
+export function sudoAutoAllowed(s: { pref: boolean; hasPassword: boolean; eligible: boolean; integration: boolean; commandOpen: boolean; armed: boolean }): boolean {
+  return s.pref && s.hasPassword && s.eligible && s.integration && s.commandOpen && s.armed;
+}

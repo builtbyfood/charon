@@ -1,7 +1,7 @@
 //! Local shell in a PTY via portable-pty (ConPTY on Windows, openpty elsewhere).
 //! Blocking reads/waits run on plain threads; the `Session` methods are cheap.
 //! Hidden commands (MCP run_command) work as on SSH: the emitter thread feeds
-//! output through `hidden::Capture` while one runs (see `exec_hidden_sudo`).
+//! output through `hidden::Capture` while one runs (see `exec_hidden`).
 
 use crate::session::{Session, SessionManager};
 use anyhow::{anyhow, Context, Result};
@@ -37,9 +37,12 @@ type Reply = oneshot::Sender<Result<(Vec<u8>, i32)>>;
 /// commands to start (queued behind the output already read, as on SSH).
 enum Ev {
     Data(Vec<u8>),
-    /// Type `line` and capture its output; `sudo` = (password, login user) to
-    /// auto-answer that user's sudo prompt with (MCP, tier-gated).
-    Capture { line: Vec<u8>, sudo: Option<(String, String)>, reply: Reply },
+    /// Type `line` and capture its output.
+    Capture {
+        line: Vec<u8>,
+        nonce: String,
+        reply: Reply,
+    },
     Eof,
 }
 
@@ -74,7 +77,8 @@ pub struct LocalSession {
 /// Windows: PowerShell 7 → Windows PowerShell → cmd. Unix: `$SHELL` → bash → sh.
 pub fn default_shell() -> String {
     #[cfg(windows)]
-    let candidates: Vec<String> = vec!["pwsh.exe".into(), "powershell.exe".into(), "cmd.exe".into()];
+    let candidates: Vec<String> =
+        vec!["pwsh.exe".into(), "powershell.exe".into(), "cmd.exe".into()];
     #[cfg(not(windows))]
     let candidates: Vec<String> = {
         let mut v = Vec::new();
@@ -102,7 +106,9 @@ fn find_on_path(prog: &str) -> Option<PathBuf> {
         return p.is_file().then(|| p.to_path_buf());
     }
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).map(|dir| dir.join(prog)).find(|c| c.is_file())
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(prog))
+        .find(|c| c.is_file())
 }
 
 // ---------------------------------------------------------------- elevation ("Local (admin)")
@@ -129,7 +135,9 @@ pub fn elevation_for(shell: &str) -> Elevation {
     #[cfg(windows)]
     {
         let Some(sudo) = find_on_path("sudo.exe") else {
-            return Elevation::NewWindow { why: "Windows sudo (sudo.exe, Windows 11 24H2+) is not available".into() };
+            return Elevation::NewWindow {
+                why: "Windows sudo (sudo.exe, Windows 11 24H2+) is not available".into(),
+            };
         };
         match windows_sudo_mode() {
             Some(SUDO_INLINE) => Elevation::Inline {
@@ -147,7 +155,10 @@ pub fn elevation_for(shell: &str) -> Elevation {
     #[cfg(not(windows))]
     {
         let _ = shell;
-        Elevation::Inline { program: "sudo".into(), args: vec!["-i".into()] }
+        Elevation::Inline {
+            program: "sudo".into(),
+            args: vec!["-i".into()],
+        }
     }
 }
 
@@ -156,14 +167,19 @@ pub fn elevation_for(shell: &str) -> Elevation {
 #[cfg(windows)]
 fn windows_sudo_mode() -> Option<u32> {
     let read = |key: &str| -> Option<u32> {
-        let out = hidden_command("reg").args(["query", key, "/v", "Enabled"]).output().ok()?;
+        let out = hidden_command("reg")
+            .args(["query", key, "/v", "Enabled"])
+            .output()
+            .ok()?;
         parse_reg_dword(&String::from_utf8_lossy(&out.stdout))
     };
     let setting = read(r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Sudo")?;
-    Some(match read(r"HKLM\SOFTWARE\Policies\Microsoft\Windows\Sudo") {
-        Some(policy) => setting.min(policy),
-        None => setting,
-    })
+    Some(
+        match read(r"HKLM\SOFTWARE\Policies\Microsoft\Windows\Sudo") {
+            Some(policy) => setting.min(policy),
+            None => setting,
+        },
+    )
 }
 
 /// `reg query` prints `    Enabled    REG_DWORD    0x3`.
@@ -186,7 +202,10 @@ fn hidden_command(prog: &str) -> std::process::Command {
 /// Fallback: start `shell` elevated in its own console via UAC (ShellExecute "runas").
 #[cfg(windows)]
 pub fn open_elevated_window(shell: &str) -> Result<()> {
-    let ps = format!("Start-Process -FilePath '{}' -Verb RunAs", shell.replace('\'', "''"));
+    let ps = format!(
+        "Start-Process -FilePath '{}' -Verb RunAs",
+        shell.replace('\'', "''")
+    );
     hidden_command("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
         .spawn()
@@ -217,17 +236,34 @@ impl Sink for AppSink {
 
 impl LocalSession {
     pub fn spawn(app: AppHandle, id: String, p: LocalParams) -> Result<Arc<Self>> {
-        Self::spawn_with(AppSink { app, id: id.clone() }, &id, p)
+        Self::spawn_with(
+            AppSink {
+                app,
+                id: id.clone(),
+            },
+            &id,
+            p,
+        )
     }
 
     pub fn spawn_with(sink: impl Sink, id: &str, p: LocalParams) -> Result<Arc<Self>> {
-        let requested = p.shell.filter(|s| !s.trim().is_empty()).unwrap_or_else(default_shell);
+        let requested = p
+            .shell
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(default_shell);
         // Resolve to an absolute path (a bare program name from a node config or a
         // bare $SHELL should still launch); `program` is what we run and report.
-        let program = find_on_path(&requested).map(|p| p.to_string_lossy().into_owned()).unwrap_or(requested);
+        let program = find_on_path(&requested)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or(requested);
         let pty = native_pty_system();
         let pair = pty
-            .openpty(PtySize { rows: p.rows, cols: p.cols, pixel_width: 0, pixel_height: 0 })
+            .openpty(PtySize {
+                rows: p.rows,
+                cols: p.cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
             .map_err(|e| anyhow!("open pty: {e}"))?;
 
         let mut cmd = CommandBuilder::new(&program);
@@ -247,8 +283,14 @@ impl LocalSession {
             .map_err(|e| anyhow!("start {program}: {e}"))?;
         drop(pair.slave);
 
-        let mut reader = pair.master.try_clone_reader().map_err(|e| anyhow!("pty reader: {e}"))?;
-        let writer = pair.master.take_writer().map_err(|e| anyhow!("pty writer: {e}"))?;
+        let mut reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|e| anyhow!("pty reader: {e}"))?;
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(|e| anyhow!("pty writer: {e}"))?;
         let killer = child.clone_killer();
 
         // Reader thread pumps PTY output until EOF; waiter thread reaps the child.
@@ -282,7 +324,9 @@ impl LocalSession {
                     loop {
                         match reader.read(&mut buf) {
                             Ok(0) => break, // EOF
-                            Ok(n) => { let _ = dtx.send(Ev::Data(buf[..n].to_vec())); }
+                            Ok(n) => {
+                                let _ = dtx.send(Ev::Data(buf[..n].to_vec()));
+                            }
                             // Retry a signal-interrupted read; drain buffered output first.
                             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                             // On a Unix PTY the master read returns EIO once the child has
@@ -292,7 +336,7 @@ impl LocalSession {
                         }
                     }
                     let _ = dtx.send(Ev::Eof); // let the emitter flush its remainder and exit
-                    // Give the waiter a moment to report the real exit code first.
+                                               // Give the waiter a moment to report the real exit code first.
                     std::thread::sleep(std::time::Duration::from_millis(200));
                     if !closed.swap(true, Ordering::SeqCst) {
                         sink.closed("closed");
@@ -330,6 +374,9 @@ impl LocalSession {
     }
 }
 
+/// A hidden command waiting to be typed: line, nonce, reply, since.
+type QueuedCapture = (Vec<u8>, String, Reply, std::time::Instant);
+
 fn write_pty(writer: &Mutex<Box<dyn Write + Send>>, data: &[u8]) -> std::io::Result<()> {
     let mut w = writer.lock().unwrap();
     w.write_all(data)?;
@@ -357,7 +404,7 @@ fn emit_loop(
     // A hidden command waiting to be typed: the shell still expects the terminal's
     // answer to a cursor query (PSReadLine, right after the prompt), and would read
     // the command as that answer. Typed once answered, or after REPORT_WAIT anyway.
-    let mut queued: Option<(Vec<u8>, Option<(String, String)>, Reply, std::time::Instant)> = None;
+    let mut queued: Option<QueuedCapture> = None;
     const REPORT_WAIT: Duration = Duration::from_secs(1);
     // End a capture: answer the caller, then type what the user typed meanwhile.
     let finish = |capture: &mut Option<(crate::hidden::Capture, Reply)>, r: Result<(), String>| {
@@ -396,11 +443,6 @@ fn emit_loop(
                             typing.lock().unwrap().prompt.answered(n);
                             let _ = write_pty(&writer, &r);
                         }
-                        // The login user's own sudo prompt, when MCP allowed it. Never logged.
-                        if let Some(pw) = cap.take_password_send() {
-                            tracing::info!(session = %id, "sudo: prompt detected, sent=true");
-                            let _ = write_pty(&writer, &pw);
-                        }
                         if cap.done() {
                             finish(&mut capture, Ok(()));
                         }
@@ -408,11 +450,11 @@ fn emit_loop(
                     None => co.push(&chunk),
                 }
             }
-            Ok(Ev::Capture { line, sudo, reply }) => {
+            Ok(Ev::Capture { line, nonce, reply }) => {
                 if capture.is_some() || queued.is_some() {
                     let _ = reply.send(Err(anyhow!("another hidden command is still running")));
                 } else {
-                    queued = Some((line, sudo, reply, std::time::Instant::now()));
+                    queued = Some((line, nonce, reply, std::time::Instant::now()));
                 }
             }
             Ok(Ev::Eof) | Err(RecvTimeoutError::Disconnected) => {
@@ -434,10 +476,10 @@ fn emit_loop(
         }
         // Type the queued hidden command once the shell isn't waiting on the terminal.
         if capture.is_none() {
-            if let Some((line, sudo, reply, since)) = queued.take() {
+            if let Some((line, nonce, reply, since)) = queued.take() {
                 let mut t = typing.lock().unwrap();
                 if t.prompt.awaiting_report() && since.elapsed() < REPORT_WAIT {
-                    queued = Some((line, sudo, reply, since));
+                    queued = Some((line, nonce, reply, since));
                     continue;
                 }
                 co.flush_close(); // don't let buffered output land inside the capture window
@@ -448,11 +490,7 @@ fn emit_loop(
                     let _ = reply.send(Err(anyhow!("write to the shell: {e}")));
                 } else {
                     t.capturing = true;
-                    let mut cap = crate::hidden::Capture::new();
-                    if let Some((pw, user)) = sudo {
-                        cap.set_sudo_password(pw, user);
-                    }
-                    capture = Some((cap, reply));
+                    capture = Some((crate::hidden::Capture::new(&nonce), reply));
                 }
             }
         }
@@ -461,9 +499,21 @@ fn emit_loop(
 
 /// This machine's name, for MCP `list_sessions` (`host` of a local session).
 pub fn hostname() -> String {
-    let from_env = std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).ok();
-    let from_file = || ["/proc/sys/kernel/hostname", "/etc/hostname"].iter().find_map(|f| std::fs::read_to_string(f).ok());
-    let from_uname = || std::process::Command::new("uname").arg("-n").output().ok().map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    let from_env = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok();
+    let from_file = || {
+        ["/proc/sys/kernel/hostname", "/etc/hostname"]
+            .iter()
+            .find_map(|f| std::fs::read_to_string(f).ok())
+    };
+    let from_uname = || {
+        std::process::Command::new("uname")
+            .arg("-n")
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    };
     from_env
         .or_else(from_file)
         .or_else(from_uname)
@@ -477,8 +527,47 @@ fn basename(p: &str) -> String {
 }
 
 /// The OS account this app runs as (the user a local `sudo` prompt names).
-fn os_user() -> String {
-    std::env::var("USERNAME").or_else(|_| std::env::var("USER")).unwrap_or_default()
+/// `sudo` without a terminal (see `hidden::root_exec`): probe for NOPASSWD, then
+/// run with the password on sudo's stdin only, stdin closed after it.
+#[cfg(unix)]
+async fn run_root(script: &str, password: Option<&str>) -> Result<(Vec<u8>, i32)> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+    let sh = |line: String| {
+        let mut c = tokio::process::Command::new("sh");
+        c.arg("-c")
+            .arg(line)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        c
+    };
+    let probe = sh(crate::hidden::ROOT_PROBE.to_string())
+        .stdin(Stdio::null())
+        .output()
+        .await?;
+    let needs_password = !probe.status.success();
+    if needs_password && password.is_none() {
+        return Err(anyhow!(
+            "sudo wants a password and none is stored for this shell (Settings: local credential)"
+        ));
+    }
+    let mut child = sh(crate::hidden::root_exec(script, needs_password)).spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("no stdin for sudo"))?;
+    if let (true, Some(pw)) = (needs_password, password) {
+        let mut line = zeroize::Zeroizing::new(pw.as_bytes().to_vec());
+        line.push(b'\n');
+        stdin.write_all(&line).await?;
+    }
+    drop(stdin); // EOF: sudo never waits for a second try
+    let out = child.wait_with_output().await?;
+    let mut text = out.stdout;
+    text.extend_from_slice(&out.stderr);
+    Ok((text, out.status.code().unwrap_or(-1)))
 }
 
 #[async_trait]
@@ -500,7 +589,12 @@ impl Session for LocalSession {
         self.master
             .lock()
             .unwrap()
-            .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
             .map_err(|e| anyhow!("resize pty: {e}"))
     }
 
@@ -513,18 +607,15 @@ impl Session for LocalSession {
         Ok(Arc::new(crate::sftp::LocalFs))
     }
 
-    async fn exec_hidden(&self, cmd: &str) -> Result<(Vec<u8>, i32)> {
-        self.exec_hidden_sudo(cmd, false).await
-    }
-
     /// Type `cmd` into the shell wrapped in sentinels and capture its output, out
-    /// of the user's sight (as SSH does). bash/zsh and PowerShell; `allow_sudo`
-    /// (MCP, tier-gated) lets it answer the OS user's own sudo prompt with the
-    /// stored password on Unix.
-    async fn exec_hidden_sudo(&self, cmd: &str, allow_sudo: bool) -> Result<(Vec<u8>, i32)> {
+    /// of the user's sight (as SSH does). bash/zsh and PowerShell.
+    async fn exec_hidden(&self, cmd: &str) -> Result<(Vec<u8>, i32)> {
         let shell = self.shell.lock().unwrap().clone();
         let dialect = crate::hidden::Dialect::of(&shell).ok_or_else(|| {
-            anyhow!("hidden commands need bash, zsh or PowerShell; this tab is running {}", basename(&shell))
+            anyhow!(
+                "hidden commands need bash, zsh or PowerShell; this tab is running {}",
+                basename(&shell)
+            )
         })?;
         // UAC shows on the secure desktop: nothing can answer it for the agent, and
         // the command would hang until the timeout.
@@ -534,20 +625,31 @@ impl Session for LocalSession {
                 "refused: {what} would open a UAC prompt that cannot be answered from here; run it yourself in a Local (admin) tab"
             ));
         }
-        #[cfg(unix)]
-        let sudo = if allow_sudo { self.sudo_password.clone().map(|pw| (pw, os_user())) } else { None };
-        #[cfg(not(unix))]
-        let sudo = {
-            let _ = (allow_sudo, os_user);
-            None
-        };
         let (reply, rx) = oneshot::channel();
+        let nonce = crate::hidden::nonce();
         self.events
             .lock()
             .unwrap()
-            .send(Ev::Capture { line: dialect.wrap(cmd).into_bytes(), sudo, reply })
+            .send(Ev::Capture {
+                line: dialect.wrap(cmd, &nonce).into_bytes(),
+                nonce,
+                reply,
+            })
             .map_err(|_| anyhow!("session closed"))?;
         rx.await.map_err(|_| anyhow!("session closed"))?
+    }
+
+    /// Unix: `sudo` as a child process, not in the PTY (see `Session::exec_root`).
+    async fn exec_root(&self, script: &str, password: Option<&str>) -> Result<(Vec<u8>, i32)> {
+        #[cfg(unix)]
+        {
+            run_root(script, password).await
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (script, password);
+            Err(anyhow!("sudo isn't available here: Windows elevates through UAC; run it yourself in a Local (admin) tab"))
+        }
     }
 
     fn shell_changed(&self, shell: Option<&str>) {
@@ -585,18 +687,36 @@ mod tests {
 
     struct ChanSink(Mutex<std::sync::mpsc::Sender<Result<Vec<u8>, String>>>);
     impl Sink for ChanSink {
-        fn data(&self, b: &[u8]) { let _ = self.0.lock().unwrap().send(Ok(b.to_vec())); }
-        fn closed(&self, r: &str) { let _ = self.0.lock().unwrap().send(Err(r.to_string())); }
+        fn data(&self, b: &[u8]) {
+            let _ = self.0.lock().unwrap().send(Ok(b.to_vec()));
+        }
+        fn closed(&self, r: &str) {
+            let _ = self.0.lock().unwrap().send(Err(r.to_string()));
+        }
     }
 
     #[test]
     fn spawns_a_real_pty_and_reports_exit() {
         let (tx, rx) = std::sync::mpsc::channel();
         #[cfg(windows)]
-        let (shell, args) = ("cmd.exe", vec!["/c".to_string(), "echo charon-pty-ok".to_string()]);
+        let (shell, args) = (
+            "cmd.exe",
+            vec!["/c".to_string(), "echo charon-pty-ok".to_string()],
+        );
         #[cfg(not(windows))]
-        let (shell, args) = ("/bin/sh", vec!["-c".to_string(), "echo charon-pty-ok".to_string()]);
-        let p = LocalParams { shell: Some(shell.into()), args, cwd: None, cols: 80, rows: 24, sudo_password: None, shell_name: None };
+        let (shell, args) = (
+            "/bin/sh",
+            vec!["-c".to_string(), "echo charon-pty-ok".to_string()],
+        );
+        let p = LocalParams {
+            shell: Some(shell.into()),
+            args,
+            cwd: None,
+            cols: 80,
+            rows: 24,
+            sudo_password: None,
+            shell_name: None,
+        };
         let sess = LocalSession::spawn_with(ChanSink(Mutex::new(tx)), "test-session", p).unwrap();
         // The resolver turns the shell into an absolute path (even a bare name),
         // so the session reports that resolved path.
@@ -633,8 +753,12 @@ mod tests {
     /// Collects everything the terminal would be shown, and why the shell ended.
     struct Screen(Arc<Mutex<Vec<u8>>>, Arc<Mutex<Option<String>>>);
     impl Sink for Screen {
-        fn data(&self, b: &[u8]) { self.0.lock().unwrap().extend_from_slice(b); }
-        fn closed(&self, r: &str) { *self.1.lock().unwrap() = Some(r.to_string()); }
+        fn data(&self, b: &[u8]) {
+            self.0.lock().unwrap().extend_from_slice(b);
+        }
+        fn closed(&self, r: &str) {
+            *self.1.lock().unwrap() = Some(r.to_string());
+        }
     }
 
     /// The end of the screen and the close reason, for a failure message.
@@ -667,7 +791,12 @@ mod tests {
         std::thread::spawn(move || {
             let mut answered = 0;
             while let Some(s) = sess.upgrade() {
-                let asked = screen.lock().unwrap().windows(4).filter(|w| *w == b"\x1b[6n").count();
+                let asked = screen
+                    .lock()
+                    .unwrap()
+                    .windows(4)
+                    .filter(|w| *w == b"\x1b[6n")
+                    .count();
                 for _ in answered..asked {
                     let _ = futures::executor::block_on(s.write(b"\x1b[1;1R"));
                 }
@@ -679,14 +808,26 @@ mod tests {
     }
 
     /// Start `program args` in a real PTY and wait for the hook's first prompt (133;B).
-    fn hooked_shell(program: &Path, args: Vec<String>) -> (Arc<LocalSession>, Arc<Mutex<Vec<u8>>>, Arc<Mutex<Option<String>>>) {
+    type ScreenBytes = Arc<Mutex<Vec<u8>>>;
+    type ClosedWhy = Arc<Mutex<Option<String>>>;
+    fn hooked_shell(
+        program: &Path,
+        args: Vec<String>,
+    ) -> (Arc<LocalSession>, ScreenBytes, ClosedWhy) {
         let screen = Arc::new(Mutex::new(Vec::new()));
         let closed = Arc::new(Mutex::new(None));
         let p = LocalParams {
-            shell: Some(program.to_string_lossy().into_owned()), args, cwd: None, cols: 120, rows: 30,
-            sudo_password: None, shell_name: None,
+            shell: Some(program.to_string_lossy().into_owned()),
+            args,
+            cwd: None,
+            cols: 120,
+            rows: 30,
+            sudo_password: None,
+            shell_name: None,
         };
-        let sess = LocalSession::spawn_with(Screen(screen.clone(), closed.clone()), "hidden-test", p).unwrap();
+        let sess =
+            LocalSession::spawn_with(Screen(screen.clone(), closed.clone()), "hidden-test", p)
+                .unwrap();
         answer_cursor_queries(&sess, &screen);
         let ok = wait_for(&screen, b"\x1b]133;B", 0, 60);
         assert!(ok, "no hooked prompt\n{}", dump(&screen, &closed));
@@ -694,17 +835,35 @@ mod tests {
     }
 
     /// Run a hidden command; check nothing of it (typed line, output, sentinels) reached the screen.
-    async fn hidden(sess: &LocalSession, screen: &Mutex<Vec<u8>>, closed: &Mutex<Option<String>>, cmd: &str, marker: &str) -> (String, i32) {
+    async fn hidden(
+        sess: &LocalSession,
+        screen: &Mutex<Vec<u8>>,
+        closed: &Mutex<Option<String>>,
+        cmd: &str,
+        marker: &str,
+    ) -> (String, i32) {
         let before = screen.lock().unwrap().len();
-        let (out, code) = match tokio::time::timeout(std::time::Duration::from_secs(60), sess.exec_hidden(cmd)).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => panic!("hidden command {cmd:?} failed: {e:#}\n{}", dump(screen, closed)),
-            Err(_) => panic!("hidden command {cmd:?} timed out\n{}", dump(screen, closed)),
-        };
+        let (out, code) =
+            match tokio::time::timeout(std::time::Duration::from_secs(60), sess.exec_hidden(cmd))
+                .await
+            {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => panic!(
+                    "hidden command {cmd:?} failed: {e:#}\n{}",
+                    dump(screen, closed)
+                ),
+                Err(_) => panic!("hidden command {cmd:?} timed out\n{}", dump(screen, closed)),
+            };
         std::thread::sleep(std::time::Duration::from_millis(400)); // anything that leaks would be here by now
         let shown = String::from_utf8_lossy(&screen.lock().unwrap()[before..]).into_owned();
-        assert!(!shown.contains(marker) && !shown.contains("7771"), "leaked to the screen: {shown:?}");
-        (crate::hidden::strip_escapes(&String::from_utf8_lossy(&out)), code)
+        assert!(
+            !shown.contains(marker) && !shown.contains("7771"),
+            "leaked to the screen: {shown:?}"
+        );
+        (
+            crate::hidden::strip_escapes(&String::from_utf8_lossy(&out)),
+            code,
+        )
     }
 
     #[cfg(unix)]
@@ -715,10 +874,22 @@ mod tests {
         let rc = dir.path().join("rc");
         let hook = include_str!("../../shell-integration/bash.sh");
         std::fs::write(&rc, format!("HISTFILE=/dev/null\nPS1='$ '\n{hook}\n")).unwrap();
-        let args = vec!["--noprofile".into(), "--rcfile".into(), rc.to_string_lossy().into_owned(), "-i".into()];
+        let args = vec![
+            "--noprofile".into(),
+            "--rcfile".into(),
+            rc.to_string_lossy().into_owned(),
+            "-i".into(),
+        ];
         let (sess, screen, closed) = hooked_shell(&bash, args);
 
-        let (out, code) = hidden(&sess, &screen, &closed, "echo charon-hidden; (exit 3)", "charon-hidden").await;
+        let (out, code) = hidden(
+            &sess,
+            &screen,
+            &closed,
+            "echo charon-hidden; (exit 3)",
+            "charon-hidden",
+        )
+        .await;
         assert_eq!((out.trim(), code), ("charon-hidden", 3));
         // The shell is back at its prompt: the next one works too.
         let (out, code) = hidden(&sess, &screen, &closed, "echo again-$((40+2))", "again-").await;
@@ -728,7 +899,10 @@ mod tests {
 
     #[tokio::test]
     async fn hidden_command_over_a_real_pty_pwsh() {
-        let Some(pwsh) = ["pwsh", "pwsh.exe", "powershell.exe"].iter().find_map(|p| find_on_path(p)) else {
+        let Some(pwsh) = ["pwsh", "pwsh.exe", "powershell.exe"]
+            .iter()
+            .find_map(|p| find_on_path(p))
+        else {
             #[cfg(windows)]
             panic!("no PowerShell on Windows");
             #[cfg(not(windows))]
@@ -741,8 +915,17 @@ mod tests {
         let hook = dir.path().join("hook.ps1");
         std::fs::write(&hook, include_str!("../../shell-integration/pwsh.ps1")).unwrap();
         // CHARON_HOOKED is exported: run from inside a Charon tab, it would skip the hook.
-        let setup = format!("Remove-Item Env:CHARON_HOOKED -ErrorAction Ignore; . '{}'", hook.to_string_lossy().replace('\'', "''"));
-        let args = vec!["-NoLogo".into(), "-NoProfile".into(), "-NoExit".into(), "-Command".into(), setup];
+        let setup = format!(
+            "Remove-Item Env:CHARON_HOOKED -ErrorAction Ignore; . '{}'",
+            hook.to_string_lossy().replace('\'', "''")
+        );
+        let args = vec![
+            "-NoLogo".into(),
+            "-NoProfile".into(),
+            "-NoExit".into(),
+            "-Command".into(),
+            setup,
+        ];
         let (sess, screen, closed) = hooked_shell(&pwsh, args);
 
         // A native command's exit code comes through $LASTEXITCODE.
@@ -755,10 +938,37 @@ mod tests {
         // Success; a cmdlet error ($? false, no native code); a terminating error.
         let (out, code) = hidden(&sess, &screen, &closed, "Write-Output fine", "fine").await;
         assert_eq!((out.trim(), code), ("fine", 0));
-        assert_eq!(hidden(&sess, &screen, &closed, "Get-Item ./charon-missing-xyz", "charon-missing").await.1, 1);
-        assert_eq!(hidden(&sess, &screen, &closed, "throw 'charon-boom'", "charon-boom").await.1, 1);
+        assert_eq!(
+            hidden(
+                &sess,
+                &screen,
+                &closed,
+                "Get-Item ./charon-missing-xyz",
+                "charon-missing"
+            )
+            .await
+            .1,
+            1
+        );
+        assert_eq!(
+            hidden(
+                &sess,
+                &screen,
+                &closed,
+                "throw 'charon-boom'",
+                "charon-boom"
+            )
+            .await
+            .1,
+            1
+        );
         // An earlier native failure doesn't leak into the next command's code.
-        assert_eq!(hidden(&sess, &screen, &closed, "Write-Output after", "after").await.1, 0);
+        assert_eq!(
+            hidden(&sess, &screen, &closed, "Write-Output after", "after")
+                .await
+                .1,
+            0
+        );
         sess.close().await.unwrap();
     }
 
@@ -767,7 +977,12 @@ mod tests {
     fn reg_query_output_parses() {
         let out = "\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Sudo\r\n    Enabled    REG_DWORD    0x3\r\n\r\n";
         assert_eq!(parse_reg_dword(out), Some(3));
-        assert_eq!(parse_reg_dword("ERROR: The system was unable to find the specified registry key or value."), None);
+        assert_eq!(
+            parse_reg_dword(
+                "ERROR: The system was unable to find the specified registry key or value."
+            ),
+            None
+        );
         assert_eq!(parse_reg_dword("    Enabled    REG_DWORD    0x0"), Some(0));
     }
 

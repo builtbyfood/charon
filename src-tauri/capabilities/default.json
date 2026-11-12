@@ -8,6 +8,7 @@
     "core:event:default",
     "core:window:allow-set-title",
     "core:window:allow-set-focus",
+    "core:window:allow-destroy",
     "shell:allow-open",
     "dialog:default",
     "clipboard-manager:allow-read-text",

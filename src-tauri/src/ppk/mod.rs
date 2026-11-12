@@ -18,7 +18,8 @@ use std::collections::HashMap;
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
 pub fn is_ppk(text: &str) -> bool {
-    text.trim_start_matches('\u{feff}').starts_with("PuTTY-User-Key-File-")
+    text.trim_start_matches('\u{feff}')
+        .starts_with("PuTTY-User-Key-File-")
 }
 
 /// Parsed, decrypted and MAC-verified key material.
@@ -42,7 +43,9 @@ fn parse_header(text: &str) -> Result<Header> {
     let text = text.trim_start_matches('\u{feff}');
     let mut lines = text.lines().map(str::trim_end);
     let first = lines.next().ok_or_else(|| anyhow!("empty file"))?;
-    let (tag, algorithm) = first.split_once(':').ok_or_else(|| anyhow!("not a PuTTY key file"))?;
+    let (tag, algorithm) = first
+        .split_once(':')
+        .ok_or_else(|| anyhow!("not a PuTTY key file"))?;
     let version: u8 = tag
         .strip_prefix("PuTTY-User-Key-File-")
         .and_then(|v| v.parse().ok())
@@ -56,7 +59,9 @@ fn parse_header(text: &str) -> Result<Header> {
     let mut public_blob = Vec::new();
     let mut private_blob = Vec::new();
     while let Some(line) = lines.next() {
-        let Some((k, v)) = line.split_once(':') else { continue };
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
         let (k, v) = (k.trim(), v.trim());
         match k {
             "Public-Lines" | "Private-Lines" => {
@@ -66,7 +71,11 @@ fn parse_header(text: &str) -> Result<Header> {
                     b64.push_str(lines.next().ok_or_else(|| anyhow!("truncated {k}"))?.trim());
                 }
                 let blob = B64.decode(&b64).with_context(|| format!("decode {k}"))?;
-                if k == "Public-Lines" { public_blob = blob } else { private_blob = blob }
+                if k == "Public-Lines" {
+                    public_blob = blob
+                } else {
+                    private_blob = blob
+                }
             }
             _ => {
                 fields.insert(k.to_string(), v.to_string());
@@ -76,27 +85,47 @@ fn parse_header(text: &str) -> Result<Header> {
     if public_blob.is_empty() || private_blob.is_empty() {
         bail!("PPK is missing its key blobs");
     }
-    Ok(Header { version, algorithm, fields, public_blob, private_blob })
+    Ok(Header {
+        version,
+        algorithm,
+        fields,
+        public_blob,
+        private_blob,
+    })
 }
 
 /// Decrypt + verify. `passphrase` is ignored for unencrypted files.
 pub fn parse(text: &str, passphrase: Option<&str>) -> Result<PpkKey> {
     let h = parse_header(text)?;
-    let encryption = h.fields.get("Encryption").map(String::as_str).unwrap_or("none");
+    let encryption = h
+        .fields
+        .get("Encryption")
+        .map(String::as_str)
+        .unwrap_or("none");
     let comment = h.fields.get("Comment").cloned().unwrap_or_default();
-    let mac_hex = h.fields.get("Private-MAC").ok_or_else(|| anyhow!("PPK has no Private-MAC"))?;
-    let mac_expected = data_encoding::HEXLOWER_PERMISSIVE.decode(mac_hex.as_bytes()).context("bad Private-MAC")?;
+    let mac_hex = h
+        .fields
+        .get("Private-MAC")
+        .ok_or_else(|| anyhow!("PPK has no Private-MAC"))?;
+    let mac_expected = data_encoding::HEXLOWER_PERMISSIVE
+        .decode(mac_hex.as_bytes())
+        .context("bad Private-MAC")?;
 
     let encrypted = match encryption {
         "none" => false,
         "aes256-cbc" => true,
         other => bail!("PPK encryption {other:?} is not supported"),
     };
-    if encrypted && passphrase.map_or(true, str::is_empty) {
+    if encrypted && passphrase.is_none_or(str::is_empty) {
         bail!("this .ppk is passphrase-protected; add the passphrase to the credential");
     }
     // An unencrypted file's MAC is keyed with the empty passphrase, whatever was supplied.
-    let pass = if encrypted { passphrase.unwrap_or("") } else { "" }.as_bytes();
+    let pass = if encrypted {
+        passphrase.unwrap_or("")
+    } else {
+        ""
+    }
+    .as_bytes();
 
     // Cipher key / IV / MAC key derivation differs per version.
     let (cipher_key, iv, mac_key): (Vec<u8>, [u8; 16], Vec<u8>) = if h.version == 2 {
@@ -143,7 +172,13 @@ pub fn parse(text: &str, passphrase: Option<&str>) -> Result<PpkKey> {
 
     // MAC over: string(alg) string(encryption) string(comment) string(pub) string(priv).
     let mut data = Vec::new();
-    for part in [h.algorithm.as_bytes(), encryption.as_bytes(), comment.as_bytes(), &h.public_blob, &private_blob] {
+    for part in [
+        h.algorithm.as_bytes(),
+        encryption.as_bytes(),
+        comment.as_bytes(),
+        &h.public_blob,
+        &private_blob,
+    ] {
         put_string(&mut data, part);
     }
     let ok = if h.version == 2 {
@@ -156,15 +191,28 @@ pub fn parse(text: &str, passphrase: Option<&str>) -> Result<PpkKey> {
         m.verify_slice(&mac_expected).is_ok()
     };
     if !ok {
-        bail!(if encrypted { "wrong passphrase for .ppk (MAC mismatch)" } else { ".ppk is corrupt (MAC mismatch)" });
+        bail!(if encrypted {
+            "wrong passphrase for .ppk (MAC mismatch)"
+        } else {
+            ".ppk is corrupt (MAC mismatch)"
+        });
     }
 
-    Ok(PpkKey { algorithm: h.algorithm, comment, public_blob: h.public_blob, private_blob })
+    Ok(PpkKey {
+        algorithm: h.algorithm,
+        comment,
+        public_blob: h.public_blob,
+        private_blob,
+    })
 }
 
 fn argon2_v3(fields: &HashMap<String, String>, pass: &[u8]) -> Result<[u8; 80]> {
     use argon2::{Algorithm, Argon2, Params, Version};
-    let get = |k: &str| fields.get(k).ok_or_else(|| anyhow!("PPK v3 is missing {k}"));
+    let get = |k: &str| {
+        fields
+            .get(k)
+            .ok_or_else(|| anyhow!("PPK v3 is missing {k}"))
+    };
     let algorithm = match get("Key-Derivation")?.as_str() {
         "Argon2id" => Algorithm::Argon2id,
         "Argon2i" => Algorithm::Argon2i,
@@ -173,8 +221,12 @@ fn argon2_v3(fields: &HashMap<String, String>, pass: &[u8]) -> Result<[u8; 80]> 
     };
     let m: u32 = get("Argon2-Memory")?.parse().context("Argon2-Memory")?;
     let t: u32 = get("Argon2-Passes")?.parse().context("Argon2-Passes")?;
-    let p: u32 = get("Argon2-Parallelism")?.parse().context("Argon2-Parallelism")?;
-    let salt = data_encoding::HEXLOWER_PERMISSIVE.decode(get("Argon2-Salt")?.as_bytes()).context("Argon2-Salt")?;
+    let p: u32 = get("Argon2-Parallelism")?
+        .parse()
+        .context("Argon2-Parallelism")?;
+    let salt = data_encoding::HEXLOWER_PERMISSIVE
+        .decode(get("Argon2-Salt")?.as_bytes())
+        .context("Argon2-Salt")?;
     let params = Params::new(m, t, p, Some(80)).map_err(|e| anyhow!("argon2 params: {e}"))?;
     let mut out = [0u8; 80];
     Argon2::new(algorithm, Version::V0x13, params)
@@ -204,9 +256,15 @@ impl<'a> Reader<'a> {
         Self { buf, pos: 0 }
     }
     fn string(&mut self) -> Result<&'a [u8]> {
-        let len_bytes = self.buf.get(self.pos..self.pos + 4).ok_or_else(|| anyhow!("truncated key blob"))?;
+        let len_bytes = self
+            .buf
+            .get(self.pos..self.pos + 4)
+            .ok_or_else(|| anyhow!("truncated key blob"))?;
         let len = u32::from_be_bytes(len_bytes.try_into().unwrap()) as usize;
-        let s = self.buf.get(self.pos + 4..self.pos + 4 + len).ok_or_else(|| anyhow!("truncated key blob"))?;
+        let s = self
+            .buf
+            .get(self.pos + 4..self.pos + 4 + len)
+            .ok_or_else(|| anyhow!("truncated key blob"))?;
         self.pos += 4 + len;
         Ok(s)
     }
@@ -254,7 +312,9 @@ pub fn to_openssh_pem(key: &PpkKey) -> Result<String> {
             put_string(&mut sec, point);
             put_string(&mut sec, d);
         }
-        "ssh-dss" => bail!("DSA keys are not supported by Charon's SSH client; generate an Ed25519 or RSA key"),
+        "ssh-dss" => bail!(
+            "DSA keys are not supported by Charon's SSH client; generate an Ed25519 or RSA key"
+        ),
         other => bail!("unsupported key type {other:?}"),
     }
 
@@ -291,48 +351,76 @@ pub fn to_openssh_pem(key: &PpkKey) -> Result<String> {
 }
 
 /// One-shot: PPK text (+ passphrase) → russh key pair.
-pub fn load(text: &str, passphrase: Option<&str>) -> Result<russh_keys::key::KeyPair> {
+pub fn load(text: &str, passphrase: Option<&str>) -> Result<russh::keys::PrivateKey> {
     let key = parse(text, passphrase)?;
     let pem = to_openssh_pem(&key)?;
-    russh_keys::decode_secret_key(&pem, None).context("converted .ppk was rejected")
+    russh::keys::decode_secret_key(&pem, None).context("converted .ppk was rejected")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use russh_keys::PublicKeyBase64;
+    use russh::keys::PublicKeyBase64;
 
     const PASS: &str = "testkey";
 
     fn fx(name: &str) -> String {
-        std::fs::read_to_string(format!("{}/src/ppk/fixtures/{name}.ppk", env!("CARGO_MANIFEST_DIR"))).unwrap()
+        std::fs::read_to_string(format!(
+            "{}/src/ppk/fixtures/{name}.ppk",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
     }
 
     /// Loads, and checks the derived public key equals the file's Public-Lines blob.
-    fn load_and_check(name: &str, pass: Option<&str>) -> russh_keys::key::KeyPair {
+    fn load_and_check(name: &str, pass: Option<&str>) -> russh::keys::PrivateKey {
         let text = fx(name);
         let parsed = parse(&text, pass).unwrap();
         let kp = load(&text, pass).unwrap();
-        assert_eq!(kp.clone_public_key().unwrap().public_key_bytes(), parsed.public_blob, "{name}: public key mismatch");
+        assert_eq!(
+            kp.public_key().public_key_bytes(),
+            parsed.public_blob,
+            "{name}: public key mismatch"
+        );
         kp
     }
 
     #[test]
     fn v2_unencrypted_rsa() {
         let kp = load_and_check("ssh-rsa-v2-plain", None);
-        assert_eq!(kp.name(), "rsa-sha2-512"); // russh signs RSA with SHA-512 by default
-        // Passphrase is ignored for a plain file.
+        assert_eq!(kp.algorithm().as_str(), "ssh-rsa"); // the hash (rsa-sha2-512/256) is picked when signing
+                                                        // Passphrase is ignored for a plain file.
         load_and_check("ssh-rsa-v2-plain", Some("whatever"));
     }
 
     #[test]
     fn v2_encrypted_keys_of_every_supported_type() {
-        assert_eq!(load_and_check("ssh-rsa-v2-enc", Some(PASS)).name(), "rsa-sha2-512");
-        assert_eq!(load_and_check("ecdsa-nistp256-v2-enc", Some(PASS)).name(), "ecdsa-sha2-nistp256");
-        assert_eq!(load_and_check("ecdsa-nistp384-v2-enc", Some(PASS)).name(), "ecdsa-sha2-nistp384");
-        assert_eq!(load_and_check("ecdsa-nistp521-v2-enc", Some(PASS)).name(), "ecdsa-sha2-nistp521");
+        assert_eq!(
+            load_and_check("ssh-rsa-v2-enc", Some(PASS))
+                .algorithm()
+                .as_str(),
+            "ssh-rsa"
+        );
+        assert_eq!(
+            load_and_check("ecdsa-nistp256-v2-enc", Some(PASS))
+                .algorithm()
+                .as_str(),
+            "ecdsa-sha2-nistp256"
+        );
+        assert_eq!(
+            load_and_check("ecdsa-nistp384-v2-enc", Some(PASS))
+                .algorithm()
+                .as_str(),
+            "ecdsa-sha2-nistp384"
+        );
+        assert_eq!(
+            load_and_check("ecdsa-nistp521-v2-enc", Some(PASS))
+                .algorithm()
+                .as_str(),
+            "ecdsa-sha2-nistp521"
+        );
         let ed = load_and_check("ssh-ed25519-v2-enc", Some(PASS));
-        assert_eq!(ed.name(), "ssh-ed25519");
+        assert_eq!(ed.algorithm().as_str(), "ssh-ed25519");
         // Known seed from the upstream fixture: 00 d8 f7 75 …
         let parsed = parse(&fx("ssh-ed25519-v2-enc"), Some(PASS)).unwrap();
         assert_eq!(&parsed.private_blob[4..8], &[0x00, 0xd8, 0xf7, 0x75]);
@@ -343,16 +431,26 @@ mod tests {
     fn v3_argon2id() {
         let plain = load_and_check("ssh-rsa-v3-plain", None);
         let enc = load_and_check("ssh-rsa-v3-enc", Some(PASS));
-        assert_eq!(plain.clone_public_key().unwrap(), enc.clone_public_key().unwrap(), "same key in both files");
+        assert_eq!(
+            plain.public_key(),
+            enc.public_key(),
+            "same key in both files"
+        );
     }
 
     #[test]
     fn wrong_passphrase_and_missing_passphrase_are_distinct_errors() {
-        let e = load(&fx("ssh-rsa-v3-enc"), Some("nope")).unwrap_err().to_string();
+        let e = load(&fx("ssh-rsa-v3-enc"), Some("nope"))
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("wrong passphrase"), "{e}");
-        let e = load(&fx("ssh-ed25519-v2-enc"), Some("nope")).unwrap_err().to_string();
+        let e = load(&fx("ssh-ed25519-v2-enc"), Some("nope"))
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("wrong passphrase"), "{e}");
-        let e = load(&fx("ssh-ed25519-v2-enc"), None).unwrap_err().to_string();
+        let e = load(&fx("ssh-ed25519-v2-enc"), None)
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("passphrase-protected"), "{e}");
     }
 
@@ -360,8 +458,13 @@ mod tests {
     fn tampering_is_caught_and_dsa_is_refused() {
         let mut text = fx("ssh-rsa-v2-plain");
         text = text.replace("Comment: a@b", "Comment: a@c");
-        assert!(load(&text, None).unwrap_err().to_string().contains("corrupt"));
-        let e = load(&fx("ssh-dss-v2-enc"), Some(PASS)).unwrap_err().to_string();
+        assert!(load(&text, None)
+            .unwrap_err()
+            .to_string()
+            .contains("corrupt"));
+        let e = load(&fx("ssh-dss-v2-enc"), Some(PASS))
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("DSA"), "{e}");
         assert!(is_ppk(&fx("ssh-rsa-v2-plain")));
         assert!(!is_ppk("-----BEGIN OPENSSH PRIVATE KEY-----"));

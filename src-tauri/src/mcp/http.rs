@@ -15,7 +15,16 @@ use tokio::net::{TcpListener, TcpStream};
 pub async fn handle_message(app: &tauri::AppHandle, mcp: &McpShared, body: &str) -> Option<String> {
     let req: rpc::Request = match serde_json::from_str(body) {
         Ok(r) => r,
-        Err(e) => return Some(serde_json::to_string(&rpc::Response::err(None, -32700, format!("parse error: {e}"))).unwrap()),
+        Err(e) => {
+            return Some(
+                serde_json::to_string(&rpc::Response::err(
+                    None,
+                    -32700,
+                    format!("parse error: {e}"),
+                ))
+                .unwrap(),
+            )
+        }
     };
     // Notifications (no id) get no response.
     let is_notification = req.id.is_none();
@@ -26,8 +35,17 @@ pub async fn handle_message(app: &tauri::AppHandle, mcp: &McpShared, body: &str)
         "ping" => rpc::Response::ok(req.id, json!({})),
         "tools/list" => rpc::Response::ok(req.id, json!({ "tools": tools::tool_specs() })),
         "tools/call" => {
-            let name = req.params.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-            let args = req.params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            let name = req
+                .params
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let args = req
+                .params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
             let result = tools::call(&state, mcp, &name, args).await;
             rpc::Response::ok(req.id, result)
         }
@@ -41,7 +59,12 @@ pub async fn handle_message(app: &tauri::AppHandle, mcp: &McpShared, body: &str)
 }
 
 /// Bind and serve until `stop` fires. Returns the bound port.
-pub async fn serve(app: tauri::AppHandle, mcp: McpShared, port: u16, mut stop: tokio::sync::oneshot::Receiver<()>) -> anyhow::Result<u16> {
+pub async fn serve(
+    app: tauri::AppHandle,
+    mcp: McpShared,
+    port: u16,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+) -> anyhow::Result<u16> {
     let listener = TcpListener::bind(("127.0.0.1", port)).await?;
     let bound = listener.local_addr()?.port();
     *mcp.port.lock().await = Some(bound);
@@ -62,7 +85,11 @@ pub async fn serve(app: tauri::AppHandle, mcp: McpShared, port: u16, mut stop: t
 }
 
 /// One keep-alive connection: read requests, check the token, reply.
-async fn serve_conn(mut sock: TcpStream, app: tauri::AppHandle, mcp: McpShared) -> anyhow::Result<()> {
+async fn serve_conn(
+    mut sock: TcpStream,
+    app: tauri::AppHandle,
+    mcp: McpShared,
+) -> anyhow::Result<()> {
     let token = mcp.token.lock().await.clone();
     let mut buf = Vec::new();
     let mut tmp = [0u8; 8192];
@@ -80,7 +107,9 @@ async fn serve_conn(mut sock: TcpStream, app: tauri::AppHandle, mcp: McpShared) 
             buf.extend_from_slice(&tmp[..n]);
         };
         let _ = head_end;
-        let len: usize = header(&headers, "content-length").and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+        let len: usize = header(&headers, "content-length")
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
         while buf.len() < body_start + len {
             let n = sock.read(&mut tmp).await?;
             if n == 0 {
@@ -90,7 +119,10 @@ async fn serve_conn(mut sock: TcpStream, app: tauri::AppHandle, mcp: McpShared) 
         }
         let body = String::from_utf8_lossy(&buf[body_start..body_start + len]).to_string();
         let method_line = headers.lines().next().unwrap_or("");
-        let authed = header(&headers, "authorization").map(|a| a.trim() == format!("Bearer {token}")).unwrap_or(false);
+        let authed = header(&headers, "authorization")
+            .and_then(|a| a.trim().strip_prefix("Bearer "))
+            .map(|t| super::token_matches(t.trim(), &token))
+            .unwrap_or(false);
 
         let reply = if method_line.starts_with("OPTIONS") {
             http_response(204, "", "")
@@ -108,7 +140,10 @@ async fn serve_conn(mut sock: TcpStream, app: tauri::AppHandle, mcp: McpShared) 
 
         // Consume this request's bytes; keep any pipelined remainder.
         buf.drain(..body_start + len);
-        if header(&headers, "connection").map(|c| c.trim().eq_ignore_ascii_case("close")).unwrap_or(false) {
+        if header(&headers, "connection")
+            .map(|c| c.trim().eq_ignore_ascii_case("close"))
+            .unwrap_or(false)
+        {
             break;
         }
     }

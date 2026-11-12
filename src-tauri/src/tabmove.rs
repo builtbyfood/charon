@@ -99,18 +99,35 @@ impl Stash {
 
 /// A window's outer rectangle in physical pixels.
 #[derive(Debug, Clone, Copy)]
-pub struct Rect { pub x: i32, pub y: i32, pub w: u32, pub h: u32 }
+pub struct Rect {
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
+}
 
 impl Rect {
     pub fn contains(&self, px: f64, py: f64) -> bool {
-        px >= self.x as f64 && py >= self.y as f64 && px < self.x as f64 + self.w as f64 && py < self.y as f64 + self.h as f64
+        px >= self.x as f64
+            && py >= self.y as f64
+            && px < self.x as f64 + self.w as f64
+            && py < self.y as f64 + self.h as f64
     }
 }
 
 /// The window under the cursor, skipping `exclude` (the window the drag started in).
 /// The main window wins when windows overlap: it is where tabs usually go back to.
-pub fn window_at<'a>(wins: &'a [(String, Rect)], exclude: &str, px: f64, py: f64) -> Option<&'a str> {
-    let mut hit: Vec<&str> = wins.iter().filter(|(l, r)| l != exclude && r.contains(px, py)).map(|(l, _)| l.as_str()).collect();
+pub fn window_at<'a>(
+    wins: &'a [(String, Rect)],
+    exclude: &str,
+    px: f64,
+    py: f64,
+) -> Option<&'a str> {
+    let mut hit: Vec<&str> = wins
+        .iter()
+        .filter(|(l, r)| l != exclude && r.contains(px, py))
+        .map(|(l, _)| l.as_str())
+        .collect();
     hit.sort_by_key(|l| *l != "main");
     hit.first().copied()
 }
@@ -146,7 +163,11 @@ mod tests {
         h.hold("s", || {});
         h.data("s", b"bye", |_| {});
         h.closed("s", "exit 0", |_| panic!("must wait"));
-        h.release("s", |b| log.borrow_mut().push(String::from_utf8_lossy(b).into()), |r| log.borrow_mut().push(r.into()));
+        h.release(
+            "s",
+            |b| log.borrow_mut().push(String::from_utf8_lossy(b).into()),
+            |r| log.borrow_mut().push(r.into()),
+        );
         assert_eq!(*log.borrow(), ["bye", "exit 0"]);
     }
 
@@ -173,9 +194,33 @@ mod tests {
     #[test]
     fn window_under_the_cursor_skips_the_source_and_prefers_main() {
         let wins = vec![
-            ("tab-a".to_string(), Rect { x: 0, y: 0, w: 800, h: 600 }),
-            ("main".to_string(), Rect { x: 100, y: 100, w: 800, h: 600 }),
-            ("tab-b".to_string(), Rect { x: 2000, y: 0, w: 800, h: 600 }),
+            (
+                "tab-a".to_string(),
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 800,
+                    h: 600,
+                },
+            ),
+            (
+                "main".to_string(),
+                Rect {
+                    x: 100,
+                    y: 100,
+                    w: 800,
+                    h: 600,
+                },
+            ),
+            (
+                "tab-b".to_string(),
+                Rect {
+                    x: 2000,
+                    y: 0,
+                    w: 800,
+                    h: 600,
+                },
+            ),
         ];
         assert_eq!(window_at(&wins, "tab-b", 150.0, 150.0), Some("main"));
         assert_eq!(window_at(&wins, "main", 150.0, 150.0), Some("tab-a"));

@@ -317,6 +317,8 @@ import bashHook from "../../shell-integration/bash.sh?raw";
 import zshHook from "../../shell-integration/zsh.zsh?raw";
 import fishHook from "../../shell-integration/fish.fish?raw";
 import pwshHook from "../../shell-integration/pwsh.ps1?raw";
+import { posixInjection, stripHook } from "./inject";
+export { INJECT_END, INJECT_SKIP, InjectionSwallower, type InjectResult } from "./inject";
 
 /** The hook script as shipped, for "Copy hook text" (source it from an rc file). */
 export function hookTextFor(shell: Shell): string {
@@ -329,75 +331,23 @@ export function hookTextFor(shell: Shell): string {
 }
 
 /**
- * Private OSC the injected block prints last. The terminal swallows everything
- * from the moment it starts typing the block (the tty echo precedes any output
- * the remote could emit, so the start of the pair is client-side) until this
- * arrives, so the user only sees the prompt come back.
- */
-export const INJECT_END = "\x1b]7770;end\x07";
-const INJECT_END_BYTES = Array.from(INJECT_END, (c) => c.charCodeAt(0));
-
-/**
- * Keystrokes that install the hook without touching remote rc files. POSIX
- * shells get one `eval "$(cat <<'EOF' … EOF)"` command; fish and PowerShell take
- * the script line by line. A leading space keeps it out of history where
- * HISTCONTROL=ignorespace is set. Each ends by printing INJECT_END.
+ * Keystrokes that install the hook without touching remote rc files. Bash and
+ * zsh get one guarded `eval "$(cat <<'EOF' … EOF)"` (`posixInjection`); fish
+ * takes the script line by line and PowerShell as one base64 line. Each ends by
+ * printing a marker (`INJECT_END`, or `INJECT_SKIP` from the POSIX guard).
  */
 export function injectionFor(shell: Shell): string {
-  const strip = (s: string) => s.split("\n").filter((l) => l.trim() && !l.trim().startsWith("#")).join("\n");
   const end = String.raw` printf '\033]7770;end\a'`;
   switch (shell) {
-    case "bash": return ` eval "$(cat <<'CHARON_EOF'\n${strip(bashHook)}\nCHARON_EOF\n)";${end}\n`;
-    case "zsh": return ` eval "$(cat <<'CHARON_EOF'\n${strip(zshHook)}\nCHARON_EOF\n)";${end}\n`;
-    case "fish": return strip(fishHook).split("\n").map((l) => ` ${l}\n`).join("") + `${end}\n`;
+    case "bash": return posixInjection("bash", bashHook);
+    case "zsh": return posixInjection("zsh", zshHook);
+    case "fish": return stripHook(fishHook).split("\n").map((l) => ` ${l}\n`).join("") + `${end}\n`;
     // pwsh: a multi-line function typed line-by-line drops into `>>` continuation
     // and never cleanly completes, so send it as one base64 line via Invoke-Expression;
     // it then runs at once and the end sentinel fires so the whole thing is swallowed.
     case "pwsh": {
-      const b64 = btoa(unescape(encodeURIComponent(strip(pwshHook))));
+      const b64 = btoa(unescape(encodeURIComponent(stripHook(pwshHook))));
       return ` Invoke-Expression ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64}'))); [Console]::Write("$([char]27)]7770;end$([char]7)")\n`;
     }
   }
-}
-
-/**
- * Drops session output while an injection is being echoed, until INJECT_END
- * (which may straddle chunks) or a safety timeout. Bytes after the sentinel pass
- * through, preceded by CR + erase-line (`\r\x1b[2K`) so the freshly-hooked prompt
- * overwrites the original prompt still on screen — otherwise the injection leaves
- * two prompts stacked (the "double bash" on first connect), since the echo of the
- * typed hook is swallowed and never advanced xterm's cursor off that first line.
- */
-export class InjectionSwallower {
-  private active = false;
-  private until = 0;
-  private tail: number[] = [];
-
-  start(timeoutMs = 5000): void { this.active = true; this.until = Date.now() + timeoutMs; this.tail = []; }
-  get swallowing(): boolean { return this.active; }
-
-  /** Bytes to display; empty while swallowing. */
-  filter(b: Uint8Array): Uint8Array {
-    if (!this.active) return b;
-    if (Date.now() > this.until) { this.active = false; return b; }
-    const buf = this.tail.concat(Array.from(b));
-    const at = indexOf(buf, INJECT_END_BYTES);
-    if (at < 0) {
-      // Keep enough to recognise a sentinel split across chunks.
-      this.tail = buf.slice(Math.max(0, buf.length - INJECT_END_BYTES.length + 1));
-      return new Uint8Array(0);
-    }
-    this.active = false; this.tail = [];
-    // \r \x1b [ 2 K : return to column 0 and clear the line the stale prompt is on,
-    // so the new hooked prompt replaces it instead of appearing beneath it.
-    return new Uint8Array([0x0d, 0x1b, 0x5b, 0x32, 0x4b, ...buf.slice(at + INJECT_END_BYTES.length)]);
-  }
-}
-
-function indexOf(hay: number[], needle: number[]): number {
-  outer: for (let i = 0; i + needle.length <= hay.length; i++) {
-    for (let j = 0; j < needle.length; j++) if (hay[i + j] !== needle[j]) continue outer;
-    return i;
-  }
-  return -1;
 }

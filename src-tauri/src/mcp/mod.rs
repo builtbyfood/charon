@@ -149,7 +149,10 @@ impl McpState {
             return None;
         }
         b.insert(session.to_string());
-        Some(BusyGuard { state: self.clone(), session: session.to_string() })
+        Some(BusyGuard {
+            state: self.clone(),
+            session: session.to_string(),
+        })
     }
 }
 
@@ -166,7 +169,12 @@ impl Drop for BusyGuard {
 
 /// 32 hex chars from the OS RNG (via uuid, which we already depend on).
 pub fn gen_token() -> String {
-    format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple())[..48].to_string()
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )[..48]
+        .to_string()
 }
 
 /// A line for `data/mcp.log`. Deliberately carries NO command text, arguments,
@@ -205,13 +213,40 @@ fn clip(s: &str) -> &str {
 /// what was asked for (see `tools::subject`), so an agent's command can be traced
 /// back to the session it ran in.
 #[allow(clippy::too_many_arguments)]
-pub async fn log_call(state: &AppState, tool: &str, session: Option<&str>, tier: Tier, decision: &str, ok: bool, exit_code: Option<i32>, duration_ms: u128, subject: Option<&str>, error: Option<&str>) {
-    let line = LogLine { ts: now_iso(), tool, session, tier: tier.as_str(), decision, ok, exit_code, duration_ms, subject: subject.map(clip), error: error.map(clip) };
+pub async fn log_call(
+    state: &AppState,
+    tool: &str,
+    session: Option<&str>,
+    tier: Tier,
+    decision: &str,
+    ok: bool,
+    exit_code: Option<i32>,
+    duration_ms: u128,
+    subject: Option<&str>,
+    error: Option<&str>,
+) {
+    let line = LogLine {
+        ts: now_iso(),
+        tool,
+        session,
+        tier: tier.as_str(),
+        decision,
+        ok,
+        exit_code,
+        duration_ms,
+        subject: subject.map(clip),
+        error: error.map(clip),
+    };
     if let Ok(mut s) = serde_json::to_string(&line) {
         s.push('\n');
         let path = state.paths.data_dir.join("mcp.log");
         use tokio::io::AsyncWriteExt;
-        if let Ok(mut f) = tokio::fs::OpenOptions::new().create(true).append(true).open(&path).await {
+        if let Ok(mut f) = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await
+        {
             let _ = f.write_all(s.as_bytes()).await;
         }
     }
@@ -219,7 +254,10 @@ pub async fn log_call(state: &AppState, tool: &str, session: Option<&str>, tier:
 
 fn now_iso() -> String {
     // Cheap UTC timestamp without pulling chrono: seconds since epoch is enough for a log.
-    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     format!("{secs}")
 }
 
@@ -244,8 +282,10 @@ pub async fn start(app: &tauri::AppHandle, state: &AppState, port: u16) -> anyho
     let token = state.mcp.token.lock().await.clone();
     let ep = serde_json::json!({ "port": bound, "token": token });
     let ep_path = endpoint_path(state);
-    let _ = tokio::fs::write(&ep_path, serde_json::to_vec(&ep).unwrap_or_default()).await;
-    restrict_to_user(&ep_path).await; // the token is a secret: user-only on Linux
+    // The token is a secret: the file is the user's alone before the token goes in.
+    if let Err(e) = write_private(&ep_path, &serde_json::to_vec(&ep).unwrap_or_default()) {
+        tracing::warn!("mcp endpoint file: {e:#}");
+    }
     tracing::info!(port = bound, "mcp server started");
     Ok(bound)
 }
@@ -261,25 +301,81 @@ pub async fn stop(state: &AppState) {
     tracing::info!("mcp server stopped");
 }
 
-/// chmod 600 on Unix so the bearer token is not world-readable; a no-op on Windows
-/// (ACLs inherit from the user's data dir).
-async fn restrict_to_user(path: &std::path::Path) {
+/// Write `bytes` to a file only the current user can read, restricting it before
+/// anything is written: mode 0600 on Unix (also on a file left from an earlier
+/// run); on Windows the inherited ACL is replaced by one granting the user alone
+/// (a portable data dir beside the exe may be readable by others).
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        f.write_all(bytes)?;
     }
-    #[cfg(not(unix))]
-    let _ = path;
+    #[cfg(windows)]
+    {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)?;
+        restrict_acl(path)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(path)?
+            .write_all(bytes)?;
+    }
+    Ok(())
+}
+
+/// Windows: drop inherited ACEs and grant only the current user full control.
+#[cfg(windows)]
+fn restrict_acl(path: &std::path::Path) -> anyhow::Result<()> {
+    use std::os::windows::process::CommandExt;
+    let user = match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
+        (Ok(d), Ok(u)) if !d.is_empty() => format!(r"{d}\{u}"),
+        (_, Ok(u)) => u,
+        _ => anyhow::bail!("no USERNAME to grant"),
+    };
+    let out = std::process::Command::new("icacls")
+        .arg(path)
+        .args(["/inheritance:r", "/grant:r", &format!("{user}:F")])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .output()?;
+    anyhow::ensure!(
+        out.status.success(),
+        "icacls failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    Ok(())
+}
+
+/// Compare a presented token with the real one in time independent of where they differ.
+pub fn token_matches(presented: &str, token: &str) -> bool {
+    let (a, b) = (presented.as_bytes(), token.as_bytes());
+    if a.len() != b.len() || b.is_empty() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// The endpoint the stdio shim connects to (written by `start`).
 pub fn read_endpoint(data_dir: &std::path::Path) -> Option<(u16, String)> {
     let text = std::fs::read_to_string(data_dir.join("mcp-endpoint.json")).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    Some((v.get("port")?.as_u64()? as u16, v.get("token")?.as_str()?.to_string()))
+    Some((
+        v.get("port")?.as_u64()? as u16,
+        v.get("token")?.as_str()?.to_string(),
+    ))
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -294,7 +390,10 @@ mod tests {
         // exec-approve: reads + files free, exec prompts.
         assert_eq!(gate(ToolKind::Read, Tier::ExecApprove), Decision::Allow);
         assert_eq!(gate(ToolKind::File, Tier::ExecApprove), Decision::Allow);
-        assert_eq!(gate(ToolKind::Exec, Tier::ExecApprove), Decision::NeedApproval);
+        assert_eq!(
+            gate(ToolKind::Exec, Tier::ExecApprove),
+            Decision::NeedApproval
+        );
         // trusted: everything, no prompt.
         assert_eq!(gate(ToolKind::Exec, Tier::Trusted), Decision::Allow);
     }
@@ -313,9 +412,51 @@ mod tests {
         let g1 = mcp.try_busy("s1");
         assert!(g1.is_some());
         assert!(mcp.try_busy("s1").is_none(), "second lock on s1 is refused");
-        assert!(mcp.try_busy("s2").is_some(), "a different session is independent");
+        assert!(
+            mcp.try_busy("s2").is_some(),
+            "a different session is independent"
+        );
         drop(g1);
         assert!(mcp.try_busy("s1").is_some(), "lock frees on drop");
+    }
+
+    #[test]
+    fn token_compare() {
+        let t = gen_token();
+        assert!(token_matches(&t, &t));
+        assert!(!token_matches(&t[..47], &t));
+        assert!(!token_matches(&format!("{}x", &t[..47]), &t));
+        assert!(!token_matches("", ""), "an empty token never matches");
+    }
+
+    #[test]
+    fn endpoint_file_is_private_and_holds_the_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("mcp-endpoint.json");
+        std::fs::write(&p, b"old, longer contents than the new ones").unwrap();
+        write_private(&p, b"{\"port\":1}").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"{\"port\":1}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        #[cfg(windows)]
+        {
+            let out = std::process::Command::new("icacls")
+                .arg(&p)
+                .output()
+                .unwrap();
+            let acl = String::from_utf8_lossy(&out.stdout).to_string();
+            assert!(!acl.contains("(I)"), "no inherited entries: {acl}");
+            assert!(
+                !acl.contains("Everyone") && !acl.contains(r"BUILTIN\Users"),
+                "{acl}"
+            );
+        }
     }
 
     #[test]

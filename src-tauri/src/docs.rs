@@ -15,6 +15,8 @@ const TLDR_ZIP: &str = "https://github.com/tldr-pages/tldr/releases/latest/downl
 /// webview CSP blocks a plain fetch of a static asset).
 const BUNDLED: &[u8] = include_bytes!("../../public/tldr.json.gz");
 const PLATFORMS: [&str; 3] = ["common", "linux", "windows"];
+/// Largest tldr page read from the archive (they are a few KB).
+const PAGE_MAX: u64 = 256 * 1024;
 
 pub fn bundle_path(data_dir: &Path) -> std::path::PathBuf {
     data_dir.join("tldr.json.gz")
@@ -29,7 +31,12 @@ pub fn bundle_bytes(data_dir: &Path) -> Vec<u8> {
 /// Download + extract English common/linux/windows pages, write data/tldr.json.gz.
 /// Returns the number of pages written.
 pub async fn update(data_dir: &Path) -> Result<usize> {
-    let bytes = reqwest::get(TLDR_ZIP).await.context("download tldr.zip")?.bytes().await.context("read tldr.zip")?;
+    let bytes = reqwest::get(TLDR_ZIP)
+        .await
+        .context("download tldr.zip")?
+        .bytes()
+        .await
+        .context("read tldr.zip")?;
     // zip is sync; do the CPU work off the async runtime.
     let data_dir = data_dir.to_path_buf();
     tokio::task::spawn_blocking(move || build(&bytes, &data_dir)).await?
@@ -44,9 +51,13 @@ fn build(zip_bytes: &[u8], data_dir: &Path) -> Result<usize> {
         let mut f = zip.by_index(i)?;
         let name = f.name().to_string();
         // Expect `pages/<platform>/<cmd>.md`.
-        let Some(rest) = name.strip_prefix("pages/") else { continue };
+        let Some(rest) = name.strip_prefix("pages/") else {
+            continue;
+        };
         let mut parts = rest.splitn(2, '/');
-        let (Some(platform), Some(file)) = (parts.next(), parts.next()) else { continue };
+        let (Some(platform), Some(file)) = (parts.next(), parts.next()) else {
+            continue;
+        };
         if !PLATFORMS.contains(&platform) || !file.ends_with(".md") {
             continue;
         }
@@ -54,8 +65,9 @@ fn build(zip_bytes: &[u8], data_dir: &Path) -> Result<usize> {
         if platform == "common" && pages.contains_key(&cmd) {
             continue; // don't override a platform-specific page with common
         }
+        // A page is a few KB; the archive is downloaded, so cap what one entry may expand to.
         let mut md = String::new();
-        f.read_to_string(&mut md)?;
+        f.by_ref().take(PAGE_MAX).read_to_string(&mut md)?;
         pages.insert(cmd, md);
     }
     if pages.is_empty() {

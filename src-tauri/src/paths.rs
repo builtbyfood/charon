@@ -48,9 +48,21 @@ mod tests {
 
     #[test]
     fn portable_keeps_the_webview_profile_beside_the_data() {
-        let p = AppPaths { portable: true, data_dir: PathBuf::from("X:/charon/data") };
-        assert_eq!(p.webview_data_dir(), Some(PathBuf::from("X:/charon/data").join("webview")));
-        let installed = AppPaths { portable: false, data_dir: PathBuf::from("X:/cfg/charon") };
-        assert_eq!(installed.webview_data_dir().is_some(), cfg!(debug_assertions));
+        let p = AppPaths {
+            portable: true,
+            data_dir: PathBuf::from("X:/charon/data"),
+        };
+        assert_eq!(
+            p.webview_data_dir(),
+            Some(PathBuf::from("X:/charon/data").join("webview"))
+        );
+        let installed = AppPaths {
+            portable: false,
+            data_dir: PathBuf::from("X:/cfg/charon"),
+        };
+        assert_eq!(
+            installed.webview_data_dir().is_some(),
+            cfg!(debug_assertions)
+        );
     }
 }

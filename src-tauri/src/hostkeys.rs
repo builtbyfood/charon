@@ -6,7 +6,7 @@
 //! is a hard failure — never silently accepted.
 
 use anyhow::{Context, Result};
-use russh_keys::key::PublicKey;
+use russh::keys::PublicKey;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -14,7 +14,10 @@ pub enum Verdict {
     Known,
     Unknown,
     /// A key for this host is on file but it is not this key.
-    Changed { file: PathBuf, line: usize },
+    Changed {
+        file: PathBuf,
+        line: usize,
+    },
 }
 
 pub struct HostKeys {
@@ -24,7 +27,10 @@ pub struct HostKeys {
 
 impl HostKeys {
     pub fn new(data_dir: &Path) -> Self {
-        Self { own: data_dir.join("known_hosts"), user: dirs::home_dir().map(|h| h.join(".ssh").join("known_hosts")) }
+        Self {
+            own: data_dir.join("known_hosts"),
+            user: dirs::home_dir().map(|h| h.join(".ssh").join("known_hosts")),
+        }
     }
 
     /// For tests and unusual layouts: explicit file paths.
@@ -40,18 +46,25 @@ impl HostKeys {
         let sources = std::iter::once(&self.own).chain(self.user.iter());
         let mut known = false;
         for file in sources {
-            match russh_keys::check_known_hosts_path(host, port, key, file) {
+            match russh::keys::check_known_hosts_path(host, port, key, file) {
                 Ok(true) => known = true,
                 Ok(false) => {}
-                Err(russh_keys::Error::KeyChanged { line }) => {
-                    return Verdict::Changed { file: file.clone(), line: real_line(file, line) };
+                Err(russh::keys::Error::KeyChanged { line }) => {
+                    return Verdict::Changed {
+                        file: file.clone(),
+                        line: real_line(file, line),
+                    };
                 }
                 // Unparseable entry (e.g. a key type russh doesn't know) → treat the
                 // file as silent on this host rather than blocking the connection.
                 Err(e) => tracing::warn!(file = %file.display(), "known_hosts unreadable: {e}"),
             }
         }
-        if known { Verdict::Known } else { Verdict::Unknown }
+        if known {
+            Verdict::Known
+        } else {
+            Verdict::Unknown
+        }
     }
 
     /// Is this Charon's own (writable) file, as opposed to the user's?
@@ -75,7 +88,10 @@ impl HostKeys {
             .filter(|line| !line.trim().is_empty()) // russh's append leaves blank lines; tidy them
             .filter(|line| {
                 let matches = !line.starts_with('#')
-                    && line.split_whitespace().next().is_some_and(|pat| pat.split(',').any(|p| p == target));
+                    && line
+                        .split_whitespace()
+                        .next()
+                        .is_some_and(|pat| pat.split(',').any(|p| p == target));
                 if matches {
                     removed += 1;
                 }
@@ -85,7 +101,8 @@ impl HostKeys {
         if removed > 0 {
             let mut out = kept.join("\n");
             out.push('\n');
-            std::fs::write(&self.own, out).with_context(|| format!("rewrite {}", self.own.display()))?;
+            std::fs::write(&self.own, out)
+                .with_context(|| format!("rewrite {}", self.own.display()))?;
         }
         Ok(removed)
     }
@@ -94,27 +111,39 @@ impl HostKeys {
     pub fn learn(&self, host: &str, port: u16, key: &PublicKey) -> Result<()> {
         // russh writes a leading newline into an empty file; seed a header instead
         // so line numbers in "changed" messages point at real entries.
-        if std::fs::metadata(&self.own).map(|m| m.len() == 0).unwrap_or(true) {
+        if std::fs::metadata(&self.own)
+            .map(|m| m.len() == 0)
+            .unwrap_or(true)
+        {
             if let Some(parent) = self.own.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(&self.own, "# Charon known_hosts: SSH host keys accepted in the app\n")
-                .with_context(|| format!("create {}", self.own.display()))?;
+            std::fs::write(
+                &self.own,
+                "# Charon known_hosts: SSH host keys accepted in the app\n",
+            )
+            .with_context(|| format!("create {}", self.own.display()))?;
         }
-        russh_keys::learn_known_hosts_path(host, port, key, &self.own)
+        russh::keys::known_hosts::learn_known_hosts_path(host, port, key, &self.own)
             .with_context(|| format!("append to {}", self.own.display()))
     }
 }
 
 /// OpenSSH's host field: bare host on port 22, `[host]:port` otherwise.
 pub fn host_pattern(host: &str, port: u16) -> String {
-    if port == 22 { host.to_string() } else { format!("[{host}]:{port}") }
+    if port == 22 {
+        host.to_string()
+    } else {
+        format!("[{host}]:{port}")
+    }
 }
 
 /// russh 0.45 numbers only non-comment lines in `KeyChanged`; map that back to
 /// the actual line in the file so the user can find and remove it.
 fn real_line(file: &Path, nth_non_comment: usize) -> usize {
-    let Ok(text) = std::fs::read_to_string(file) else { return nth_non_comment };
+    let Ok(text) = std::fs::read_to_string(file) else {
+        return nth_non_comment;
+    };
     text.lines()
         .enumerate()
         .filter(|(_, l)| !l.starts_with('#'))
@@ -125,16 +154,20 @@ fn real_line(file: &Path, nth_non_comment: usize) -> usize {
 
 /// "SHA256:…" as ssh-keygen prints it.
 pub fn fingerprint(key: &PublicKey) -> String {
-    format!("SHA256:{}", key.fingerprint())
+    key.fingerprint(russh::keys::HashAlg::Sha256).to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use russh_keys::key::KeyPair;
+    use russh::keys::ssh_key::public::{Ed25519PublicKey, KeyData};
 
+    /// A fresh ed25519 public key per call (32 random bytes; it is never verified).
     fn key() -> PublicKey {
-        KeyPair::generate_ed25519().unwrap().clone_public_key().unwrap()
+        let mut b = [0u8; 32];
+        b[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        b[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        PublicKey::new(KeyData::Ed25519(Ed25519PublicKey(b)), "")
     }
 
     #[test]
@@ -161,7 +194,13 @@ mod tests {
         match hk.check("h", 22, &key()) {
             Verdict::Changed { file, line } => {
                 let text = std::fs::read_to_string(file).unwrap();
-                assert!(text.lines().nth(line - 1).unwrap().starts_with("h ssh-ed25519 "), "line points at the entry");
+                assert!(
+                    text.lines()
+                        .nth(line - 1)
+                        .unwrap()
+                        .starts_with("h ssh-ed25519 "),
+                    "line points at the entry"
+                );
             }
             v => panic!("expected Changed, got {v:?}"),
         }
@@ -190,9 +229,12 @@ mod tests {
         let user = dir.path().join("user_known_hosts");
         let hk = HostKeys::with_paths(dir.path().join("known_hosts"), Some(user.clone()));
         let k = key();
-        russh_keys::learn_known_hosts_path("h", 22, &k, &user).unwrap();
+        russh::keys::known_hosts::learn_known_hosts_path("h", 22, &k, &user).unwrap();
         assert_eq!(hk.check("h", 22, &k), Verdict::Known);
-        assert!(!dir.path().join("known_hosts").exists(), "own file untouched by a check");
+        assert!(
+            !dir.path().join("known_hosts").exists(),
+            "own file untouched by a check"
+        );
 
         // A mismatch against the user's file is a hard failure too.
         assert!(matches!(hk.check("h", 22, &key()), Verdict::Changed { .. }));

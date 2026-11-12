@@ -2,23 +2,24 @@
 //! so it can be unit-tested and later reused by the MCP server without the UI.
 
 pub mod bisect;
+pub mod broadcast;
 pub mod clipboard;
-pub mod fonts;
 pub mod commands;
 pub mod connections;
 pub mod docs;
+pub mod fonts;
 pub mod hidden;
 pub mod hostkeys;
+pub mod import;
+pub mod local;
 pub mod mcp;
 pub mod opentabs;
 pub mod outbox;
-pub mod import;
-pub mod local;
-pub mod serial;
 pub mod paths;
 pub mod ppk;
 pub mod profile;
 pub mod repaint;
+pub mod serial;
 pub mod session;
 pub mod sftp;
 pub mod ssh;
@@ -46,6 +47,25 @@ pub struct AppState {
     pub tab_stash: tabmove::Stash,
     /// What reopens at the next start (`opentabs.rs`).
     pub open_tabs: opentabs::OpenTabs,
+    /// MultiExec roles per window, for MCP list_sessions (`broadcast.rs`).
+    pub broadcast: broadcast::Roles,
+}
+
+/// The main window (label "main"), as tauri.conf.json used to declare it.
+fn main_window(
+    app: &tauri::AppHandle,
+    webview_dir: Option<std::path::PathBuf>,
+) -> tauri::Result<()> {
+    let mut w =
+        tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("index.html".into()))
+            .title("Charon")
+            .inner_size(1280.0, 800.0)
+            .min_inner_size(800.0, 500.0);
+    if let Some(dir) = webview_dir {
+        w = w.data_directory(dir);
+    }
+    w.build()?;
+    Ok(())
 }
 
 pub fn run() {
@@ -73,10 +93,21 @@ pub fn run() {
         }
         tracing::info!(
             "[charon] webkit: dmabuf={} (vm={} render_node={}{})",
-            if off || (user_set && std::env::var("WEBKIT_DISABLE_DMABUF_RENDERER").is_ok_and(|v| v != "0")) { "off" } else { "on" },
+            if off
+                || (user_set
+                    && std::env::var("WEBKIT_DISABLE_DMABUF_RENDERER").is_ok_and(|v| v != "0"))
+            {
+                "off"
+            } else {
+                "on"
+            },
             gfx.vm,
             gfx.render_node,
-            if user_set { ", WEBKIT_DISABLE_DMABUF_RENDERER set" } else { "" }
+            if user_set {
+                ", WEBKIT_DISABLE_DMABUF_RENDERER set"
+            } else {
+                ""
+            }
         );
     }
 
@@ -108,7 +139,11 @@ pub fn run() {
             .plugin(tauri_plugin_clipboard_manager::init());
     }
     if bisect::active() {
-        builder = builder.plugin(tauri::plugin::Builder::<tauri::Wry>::new("charon-bisect").js_init_script(bisect::init_script()).build());
+        builder = builder.plugin(
+            tauri::plugin::Builder::<tauri::Wry>::new("charon-bisect")
+                .js_init_script(bisect::init_script())
+                .build(),
+        );
     }
     builder
         // WebView2 quirk: the window is shown (and takes Win32 focus) before the
@@ -116,7 +151,8 @@ pub fn run() {
         // keystrokes until the user clicks in the page. Hand the controller keyboard
         // focus once the page is up. Harmless elsewhere.
         .on_page_load(|webview, payload| {
-            if payload.event() == tauri::webview::PageLoadEvent::Finished && !bisect::has("nofocus") {
+            if payload.event() == tauri::webview::PageLoadEvent::Finished && !bisect::has("nofocus")
+            {
                 if let Err(e) = webview.set_focus() {
                     tracing::warn!("webview focus: {e}");
                 }
@@ -142,6 +178,7 @@ pub fn run() {
                 }
                 (false, tauri::WindowEvent::Destroyed) => {
                     if let Some(s) = state {
+                        s.broadcast.forget(w.label());
                         if let Err(e) = s.open_tabs.closed(w.label()) {
                             tracing::warn!("open tabs: {e:#}");
                         }
@@ -151,10 +188,14 @@ pub fn run() {
             }
         })
         .setup(move |app| {
+            let webview_dir = paths.webview_data_dir();
             let store = connections::Store::open(&paths.data_dir.join("charon.db"))?;
-            let vault: Arc<dyn vault::Vault> = Arc::from(vault::open(&paths.data_dir, paths.portable)?);
+            let vault: Arc<dyn vault::Vault> =
+                Arc::from(vault::open(&paths.data_dir, paths.portable)?);
             let hostkeys = Arc::new(hostkeys::HostKeys::new(&paths.data_dir));
-            let profile = Arc::new(std::sync::RwLock::new(profile::load_default(&paths.data_dir)));
+            let profile = Arc::new(std::sync::RwLock::new(profile::load_default(
+                &paths.data_dir,
+            )));
             let open_tabs = opentabs::OpenTabs::new(&paths.data_dir);
             repaint::configure(&profile.read().unwrap().terminal.linux_repaint);
             #[cfg(target_os = "linux")]
@@ -163,6 +204,7 @@ pub fn run() {
             }
             app.manage(AppState {
                 open_tabs,
+                broadcast: broadcast::Roles::default(),
                 hostkeys,
                 profile,
                 paths,
@@ -174,12 +216,20 @@ pub fn run() {
                 mcp: Arc::new(mcp::McpState::default()),
                 tab_stash: tabmove::Stash::default(),
             });
+            // The main window is built here, not in tauri.conf.json, so it can be given
+            // the webview profile dir (portable: data/webview) on every platform that
+            // supports one (WebView2, WebKitGTK; macOS's WKWebView has no such option).
+            // After `manage`: the page's first commands need AppState.
+            main_window(app.handle(), webview_dir)?;
             // Start the MCP server if the profile has it enabled.
             {
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     let state = handle.state::<AppState>();
-                    let (enabled, port) = { let p = state.profile.read().unwrap(); (p.mcp.enabled, p.mcp.port) };
+                    let (enabled, port) = {
+                        let p = state.profile.read().unwrap();
+                        (p.mcp.enabled, p.mcp.port)
+                    };
                     if enabled && !crate::bisect::has("nomcp") {
                         if let Err(e) = mcp::start(&handle, &state, port).await {
                             tracing::warn!("mcp autostart failed: {e:#}");
@@ -259,6 +309,7 @@ pub fn run() {
             commands::tab_send,
             commands::tabs_saved,
             commands::tabs_save,
+            commands::broadcast_roles,
             commands::window_close_self,
             commands::clipboard_read,
             commands::session_attach,

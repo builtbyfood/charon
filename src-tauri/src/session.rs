@@ -11,15 +11,22 @@ use tauri::AppHandle;
 use tokio::sync::{oneshot, Mutex};
 
 /// Output parked for sessions whose tab is moving between windows.
-static HOLDS: std::sync::LazyLock<crate::tabmove::Holds> = std::sync::LazyLock::new(Default::default);
+static HOLDS: std::sync::LazyLock<crate::tabmove::Holds> =
+    std::sync::LazyLock::new(Default::default);
 
 /// One message on a session's output channel (`session_attach`).
 #[derive(Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum OutMsg {
     /// `seq` and `t` (ms since the epoch, at emit) let the UI log delivery lag.
-    Data { seq: u64, t: f64, b64: String },
-    Closed { reason: String },
+    Data {
+        seq: u64,
+        t: f64,
+        b64: String,
+    },
+    Closed {
+        reason: String,
+    },
 }
 
 /// The channel each session's output goes to: the Terminal that owns the tab
@@ -29,12 +36,18 @@ pub enum OutMsg {
 static OUT: std::sync::LazyLock<crate::outbox::Outbox> = std::sync::LazyLock::new(Default::default);
 static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Log every output emit with a timestamp (`trace_output`, or CHARON_TRACE_OUTPUT=1).
-pub static TRACE: std::sync::LazyLock<std::sync::atomic::AtomicBool> = std::sync::LazyLock::new(|| {
-    std::sync::atomic::AtomicBool::new(std::env::var("CHARON_TRACE_OUTPUT").is_ok_and(|v| v == "1"))
-});
+pub static TRACE: std::sync::LazyLock<std::sync::atomic::AtomicBool> =
+    std::sync::LazyLock::new(|| {
+        std::sync::atomic::AtomicBool::new(
+            std::env::var("CHARON_TRACE_OUTPUT").is_ok_and(|v| v == "1"),
+        )
+    });
 
 fn now_ms() -> f64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .unwrap_or(0.0)
 }
 
 /// After sending to the UI from a background thread: on Linux, poke GTK's main
@@ -61,11 +74,15 @@ pub trait Session: Send + Sync {
     async fn exec_hidden(&self, _cmd: &str) -> Result<(Vec<u8>, i32)> {
         Err(anyhow!("this session cannot run hidden commands"))
     }
-    /// Like `exec_hidden`, but `allow_sudo` permits auto-answering a
-    /// `[sudo] password for <login-user>:` prompt with the session's password
-    /// (MCP run_command, tier-gated). Default ignores the flag.
-    async fn exec_hidden_sudo(&self, cmd: &str, _allow_sudo: bool) -> Result<(Vec<u8>, i32)> {
-        self.exec_hidden(cmd).await
+    /// Run `script` as root, outside the interactive shell (MCP `run_command` of a
+    /// `sudo …` command): sudo with no terminal, `password` written to sudo's stdin
+    /// and nowhere else, and only when sudo needs one (`hidden::ROOT_PROBE`); the
+    /// script's own stdin is /dev/null. Nothing watches the output for prompts.
+    /// Returns stdout + stderr and the exit code.
+    async fn exec_root(&self, _script: &str, _password: Option<&str>) -> Result<(Vec<u8>, i32)> {
+        Err(anyhow::anyhow!(
+            "running a command as root isn't supported in this kind of session"
+        ))
     }
     /// Run a non-interactive command on its own exec channel over the same
     /// connection: no pty, never touches the interactive shell, so it works while
@@ -117,14 +134,28 @@ pub struct SessionInfo {
 
 impl SessionInfo {
     pub fn new(id: String, title: String, kind: &str) -> Self {
-        Self { id, title, kind: kind.into(), shell_integration: false, shell: None, cwd: None, node_id: None, host: None, remote_shell: None, admin: false }
+        Self {
+            id,
+            title,
+            kind: kind.into(),
+            shell_integration: false,
+            shell: None,
+            cwd: None,
+            node_id: None,
+            host: None,
+            remote_shell: None,
+            admin: false,
+        }
     }
 }
+
+/// Open sessions by id.
+type SessionMap = HashMap<String, (SessionInfo, Arc<dyn Session>)>;
 
 #[derive(Clone)]
 pub struct SessionManager {
     app: AppHandle,
-    inner: Arc<Mutex<HashMap<String, (SessionInfo, Arc<dyn Session>)>>>,
+    inner: Arc<Mutex<SessionMap>>,
     /// Last time the user typed into a session (for the MCP run_command guard).
     last_write: Arc<Mutex<HashMap<String, std::time::Instant>>>,
     /// Sessions mid-connect waiting for the user to accept/reject a host key.
@@ -158,7 +189,8 @@ impl SessionManager {
         };
         drop(pending);
         tracing::info!(session = %id, accept, "host key answer received");
-        tx.send(accept).map_err(|_| anyhow!("session {id} gave up waiting"))
+        tx.send(accept)
+            .map_err(|_| anyhow!("session {id} gave up waiting"))
     }
 
     pub async fn cancel_hostkey_prompt(&self, id: &str) {
@@ -188,7 +220,9 @@ impl SessionManager {
 
     pub async fn set_shell(&self, id: &str, shell: Option<String>) -> Result<()> {
         let mut inner = self.inner.lock().await;
-        let (info, sess) = inner.get_mut(id).ok_or_else(|| anyhow!("no session {id}"))?;
+        let (info, sess) = inner
+            .get_mut(id)
+            .ok_or_else(|| anyhow!("no session {id}"))?;
         sess.shell_changed(shell.as_deref());
         info.shell = shell;
         Ok(())
@@ -196,7 +230,9 @@ impl SessionManager {
 
     pub async fn set_cwd(&self, id: &str, cwd: Option<String>) -> Result<()> {
         let mut inner = self.inner.lock().await;
-        let (info, _) = inner.get_mut(id).ok_or_else(|| anyhow!("no session {id}"))?;
+        let (info, _) = inner
+            .get_mut(id)
+            .ok_or_else(|| anyhow!("no session {id}"))?;
         info.cwd = cwd;
         Ok(())
     }
@@ -207,17 +243,30 @@ impl SessionManager {
 
     /// Record that the user just typed into `id` (called from `session_write`).
     pub async fn mark_user_write(&self, id: &str) {
-        self.last_write.lock().await.insert(id.to_string(), std::time::Instant::now());
+        self.last_write
+            .lock()
+            .await
+            .insert(id.to_string(), std::time::Instant::now());
     }
 
     /// True if the user typed into `id` within `within` (so an injected hidden
     /// command would clobber what they're typing).
     pub async fn typed_recently(&self, id: &str, within: std::time::Duration) -> bool {
-        self.last_write.lock().await.get(id).map(|t| t.elapsed() < within).unwrap_or(false)
+        self.last_write
+            .lock()
+            .await
+            .get(id)
+            .map(|t| t.elapsed() < within)
+            .unwrap_or(false)
     }
 
     pub async fn list(&self) -> Vec<SessionInfo> {
-        self.inner.lock().await.values().map(|(i, _)| i.clone()).collect()
+        self.inner
+            .lock()
+            .await
+            .values()
+            .map(|(i, _)| i.clone())
+            .collect()
     }
 
     /// Push output bytes to the UI. Base64 so binary-safe through JSON.
@@ -231,7 +280,14 @@ impl SessionManager {
         use crate::outbox::{Msg, Route};
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let t = now_ms();
-        let via = match OUT.send(id, Msg::Data { seq, t, bytes: data.to_vec() }) {
+        let via = match OUT.send(
+            id,
+            Msg::Data {
+                seq,
+                t,
+                bytes: data.to_vec(),
+            },
+        ) {
             Route::Sent => "channel",
             Route::Buffered => "pending",
             Route::BufferedDropping => "pending-full",
@@ -241,12 +297,20 @@ impl SessionManager {
             crate::repaint::poke("output");
         }
         if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
-            tracing::info!("[charon] out: emit session={id} seq={seq} bytes={} via={via} t={t:.1}", data.len());
+            tracing::info!(
+                "[charon] out: emit session={id} seq={seq} bytes={} via={via} t={t:.1}",
+                data.len()
+            );
         }
     }
 
     fn closed_now(_app: &AppHandle, id: &str, reason: &str) {
-        OUT.send(id, crate::outbox::Msg::Closed { reason: reason.to_string() });
+        OUT.send(
+            id,
+            crate::outbox::Msg::Closed {
+                reason: reason.to_string(),
+            },
+        );
         wake_ui();
         crate::repaint::poke("output");
     }
@@ -257,7 +321,11 @@ impl SessionManager {
         use crate::outbox::Msg;
         let sink = Box::new(move |m: Msg| {
             let _ = ch.send(match m {
-                Msg::Data { seq, t, bytes } => OutMsg::Data { seq, t, b64: base64::engine::general_purpose::STANDARD.encode(bytes) },
+                Msg::Data { seq, t, bytes } => OutMsg::Data {
+                    seq,
+                    t,
+                    b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                },
                 Msg::Closed { reason } => OutMsg::Closed { reason },
             });
         });
@@ -265,7 +333,9 @@ impl SessionManager {
         if flushed > 0 {
             wake_ui();
             crate::repaint::poke("output");
-            tracing::info!("[charon] out: attach session={id} flushed={flushed} dropped_bytes={dropped}");
+            tracing::info!(
+                "[charon] out: attach session={id} flushed={flushed} dropped_bytes={dropped}"
+            );
         }
     }
 
@@ -289,6 +359,9 @@ impl SessionManager {
     }
 }
 
+/// Where a `Coalescer` sends each flushed chunk.
+type EmitFn = Box<dyn FnMut(&[u8]) + Send>;
+
 /// Batches a session's output so the UI gets at most one event per window (16 ms)
 /// instead of one per SSH packet / PTY read. The first byte of a burst is emitted
 /// immediately (low latency); bytes within the window accumulate and flush
@@ -302,7 +375,7 @@ impl SessionManager {
 /// Windows with STATUS_ENTRYPOINT_NOT_FOUND.
 pub struct Coalescer {
     id: String,
-    emit: Box<dyn FnMut(&[u8]) + Send>,
+    emit: EmitFn,
     buf: Vec<u8>,
     /// How many pushes are held in `buf` (for the log line).
     chunks: u32,
@@ -316,7 +389,11 @@ impl Coalescer {
         Self::with_window(id, emit, std::time::Duration::from_millis(16))
     }
 
-    pub fn with_window(id: String, emit: impl FnMut(&[u8]) + Send + 'static, window: std::time::Duration) -> Self {
+    pub fn with_window(
+        id: String,
+        emit: impl FnMut(&[u8]) + Send + 'static,
+        window: std::time::Duration,
+    ) -> Self {
         Self {
             id,
             emit: Box::new(emit),
@@ -365,7 +442,13 @@ impl Coalescer {
         if self.buf.is_empty() {
             return;
         }
-        tracing::debug!("[charon] coalesce: held={} flushed={} reason={} session={}", self.chunks, self.buf.len(), reason, self.id);
+        tracing::debug!(
+            "[charon] coalesce: held={} flushed={} reason={} session={}",
+            self.chunks,
+            self.buf.len(),
+            reason,
+            self.id
+        );
         (self.emit)(&self.buf);
         self.buf.clear();
         self.chunks = 0;
@@ -379,10 +462,13 @@ mod coalescer_tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    fn collector() -> (Arc<Mutex<Vec<Vec<u8>>>>, impl FnMut(&[u8]) + Send + 'static) {
+    type Events = Arc<Mutex<Vec<Vec<u8>>>>;
+    fn collector() -> (Events, impl FnMut(&[u8]) + Send + 'static) {
         let events = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
         let sink = events.clone();
-        (events, move |b: &[u8]| sink.lock().unwrap().push(b.to_vec()))
+        (events, move |b: &[u8]| {
+            sink.lock().unwrap().push(b.to_vec())
+        })
     }
 
     #[test]
@@ -405,10 +491,17 @@ mod coalescer_tests {
         assert_eq!(events.lock().unwrap().len(), 1);
         // The paste echo arrives within the window → held, not emitted yet.
         c.push(b"the-pasted-command");
-        assert_eq!(events.lock().unwrap().len(), 1, "tail is held, not emitted per-event");
+        assert_eq!(
+            events.lock().unwrap().len(),
+            1,
+            "tail is held, not emitted per-event"
+        );
         // A flush is pending and never waits longer than the window.
         let due = c.due_in().expect("a flush is pending");
-        assert!(due <= Duration::from_millis(16), "flush is due within the window");
+        assert!(
+            due <= Duration::from_millis(16),
+            "flush is due within the window"
+        );
         // The driver fires the timer with no further traffic: exactly one more event,
         // carrying the whole tail.
         c.flush_timer();

@@ -10,14 +10,14 @@
     theme: ThemePref;
     font: string;
     fontSize: number;
-    renderer: "webgl" | "canvas" | "dom";
+    renderer: "auto" | "webgl" | "canvas" | "dom";
     trace: boolean;
     restoreTabs: boolean;
     os?: string;
     linuxRepaint: LinuxRepaint;
     ontheme: (t: ThemePref) => void;
     onfont: (family: string, size: number | undefined) => void;
-    onrenderer: (r: "webgl" | "canvas" | "dom") => void;
+    onrenderer: (r: "auto" | "webgl" | "canvas" | "dom") => void;
     ontrace: (on: boolean) => void;
     onrestoretabs: (on: boolean) => void;
     onlinuxrepaint: (m: LinuxRepaint) => void;
@@ -73,7 +73,8 @@
     <h3>Terminal</h3>
     <label class="field row">
       <span>Renderer</span>
-      <select value={renderer} onchange={(e) => onrenderer((e.currentTarget as HTMLSelectElement).value as "webgl" | "canvas" | "dom")}>
+      <select value={renderer} onchange={(e) => onrenderer((e.currentTarget as HTMLSelectElement).value as "auto" | "webgl" | "canvas" | "dom")}>
+        <option value="auto">Automatic (DOM on Linux, WebGL elsewhere)</option>
         <option value="webgl">WebGL (fastest)</option>
         <option value="canvas">Canvas</option>
         <option value="dom">DOM (no GPU)</option>

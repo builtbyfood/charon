@@ -25,12 +25,36 @@ pub enum SecretKind {
 
 /// A stored secret. For `Key`, `value` is either a path to a private key file or
 /// the PEM text itself; `key_passphrase` unlocks it if encrypted.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The values are wiped from memory when it is dropped, and `Debug` never prints them.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Secret {
     pub kind: SecretKind,
     pub value: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_passphrase: Option<String>,
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.value.zeroize();
+        if let Some(p) = self.key_passphrase.as_mut() {
+            p.zeroize();
+        }
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Secret")
+            .field("kind", &self.kind)
+            .field("value", &"<redacted>")
+            .field(
+                "key_passphrase",
+                &self.key_passphrase.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// What the UI is allowed to see about a secret.
@@ -66,7 +90,9 @@ pub trait Vault: Send + Sync {
         if from == to {
             return Ok(());
         }
-        let secret = self.get(from)?.ok_or_else(|| anyhow::anyhow!("no credential named {from:?}"))?;
+        let secret = self
+            .get(from)?
+            .ok_or_else(|| anyhow::anyhow!("no credential named {from:?}"))?;
         if self.get(to)?.is_some() {
             bail!("a credential named {to:?} already exists");
         }
@@ -94,17 +120,31 @@ pub fn apply_edit(old: &Secret, e: &SecretEdit) -> Result<Secret> {
     let value = match e.value.as_deref().filter(|v| !v.is_empty()) {
         Some(v) => v.to_string(),
         None if kind == old.kind => old.value.clone(),
-        None => bail!("changing the kind needs a new {}", if kind == SecretKind::Key { "key path" } else { "password" }),
+        None => bail!(
+            "changing the kind needs a new {}",
+            if kind == SecretKind::Key {
+                "key path"
+            } else {
+                "password"
+            }
+        ),
     };
     let key_passphrase = match kind {
         SecretKind::Password => None,
         SecretKind::Key => match e.key_passphrase.as_deref().filter(|p| !p.is_empty()) {
             Some(p) => Some(p.to_string()),
             None if e.clear_passphrase => None,
-            None => old.key_passphrase.clone().filter(|_| old.kind == SecretKind::Key),
+            None => old
+                .key_passphrase
+                .clone()
+                .filter(|_| old.kind == SecretKind::Key),
         },
     };
-    Ok(Secret { kind, value, key_passphrase })
+    Ok(Secret {
+        kind,
+        value,
+        key_passphrase,
+    })
 }
 
 fn check_name(name: &str) -> Result<()> {
@@ -118,7 +158,8 @@ fn check_name(name: &str) -> Result<()> {
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension("tmp");
     {
-        let mut f = std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        let mut f =
+            std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
         f.write_all(bytes)?;
         f.sync_all()?;
     }
@@ -142,7 +183,11 @@ impl KeyringVault {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
             Err(e) => return Err(e).context("read vault-index.json"),
         };
-        Ok(Self { service: "charon".into(), index_path, index: Mutex::new(index) })
+        Ok(Self {
+            service: "charon".into(),
+            index_path,
+            index: Mutex::new(index),
+        })
     }
 
     fn entry(&self, name: &str) -> Result<keyring::Entry> {
@@ -158,7 +203,9 @@ impl Vault for KeyringVault {
     fn get(&self, name: &str) -> Result<Option<Secret>> {
         check_name(name)?;
         match self.entry(name)?.get_password() {
-            Ok(json) => Ok(Some(serde_json::from_str(&json).context("parse keyring entry")?)),
+            Ok(json) => Ok(Some(
+                serde_json::from_str(&json).context("parse keyring entry")?,
+            )),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -166,7 +213,8 @@ impl Vault for KeyringVault {
 
     fn set(&self, name: &str, secret: &Secret) -> Result<()> {
         check_name(name)?;
-        self.entry(name)?.set_password(&serde_json::to_string(secret)?)?;
+        self.entry(name)?
+            .set_password(&serde_json::to_string(secret)?)?;
         let mut index = self.index.lock().unwrap();
         index.insert(name.to_string(), secret.kind);
         self.save_index(&index)
@@ -189,12 +237,19 @@ impl Vault for KeyringVault {
             .lock()
             .unwrap()
             .iter()
-            .map(|(name, kind)| SecretMeta { name: name.clone(), kind: *kind })
+            .map(|(name, kind)| SecretMeta {
+                name: name.clone(),
+                kind: *kind,
+            })
             .collect())
     }
 
     fn status(&self) -> VaultStatus {
-        VaultStatus { backend: "keyring", initialised: true, locked: false }
+        VaultStatus {
+            backend: "keyring",
+            initialised: true,
+            locked: false,
+        }
     }
 }
 
@@ -212,10 +267,16 @@ pub struct FileVault {
 
 impl FileVault {
     pub fn open(data_dir: &Path) -> Self {
-        Self { path: data_dir.join("vault.age"), state: Mutex::new(None) }
+        Self {
+            path: data_dir.join("vault.age"),
+            state: Mutex::new(None),
+        }
     }
 
-    fn encrypt(master: &age::secrecy::SecretString, secrets: &BTreeMap<String, Secret>) -> Result<Vec<u8>> {
+    fn encrypt(
+        master: &age::secrecy::SecretString,
+        secrets: &BTreeMap<String, Secret>,
+    ) -> Result<Vec<u8>> {
         let plain = serde_json::to_vec(secrets)?;
         let mut out = Vec::new();
         let mut w = age::Encryptor::with_user_passphrase(master.clone()).wrap_output(&mut out)?;
@@ -224,13 +285,17 @@ impl FileVault {
         Ok(out)
     }
 
-    fn decrypt(master: &age::secrecy::SecretString, bytes: &[u8]) -> Result<BTreeMap<String, Secret>> {
-        let plain = age::decrypt(&age::scrypt::Identity::new(master.clone()), bytes)
-            .map_err(|e| match e {
+    fn decrypt(
+        master: &age::secrecy::SecretString,
+        bytes: &[u8],
+    ) -> Result<BTreeMap<String, Secret>> {
+        let plain = age::decrypt(&age::scrypt::Identity::new(master.clone()), bytes).map_err(
+            |e| match e {
                 age::DecryptError::DecryptionFailed => anyhow!("wrong master password"),
                 other => anyhow!("decrypt vault.age: {other}"),
-            })?;
-        Ok(serde_json::from_slice(&plain).context("parse decrypted vault")?)
+            },
+        )?;
+        serde_json::from_slice(&plain).context("parse decrypted vault")
     }
 
     fn with_unlocked<T>(&self, f: impl FnOnce(&mut Unlocked) -> Result<T>) -> Result<T> {
@@ -268,7 +333,13 @@ impl Vault for FileVault {
 
     fn list(&self) -> Result<Vec<SecretMeta>> {
         self.with_unlocked(|u| {
-            Ok(u.secrets.iter().map(|(n, s)| SecretMeta { name: n.clone(), kind: s.kind }).collect())
+            Ok(u.secrets
+                .iter()
+                .map(|(n, s)| SecretMeta {
+                    name: n.clone(),
+                    kind: s.kind,
+                })
+                .collect())
         })
     }
 
@@ -314,7 +385,11 @@ mod tests {
     use super::*;
 
     fn pw(v: &str) -> Secret {
-        Secret { kind: SecretKind::Password, value: v.into(), key_passphrase: None }
+        Secret {
+            kind: SecretKind::Password,
+            value: v.into(),
+            key_passphrase: None,
+        }
     }
 
     #[test]
@@ -337,7 +412,11 @@ mod tests {
             v.set("prod-root", &pw("s3cret")).unwrap();
             v.set(
                 "lab-key",
-                &Secret { kind: SecretKind::Key, value: "/home/t/.ssh/id_ed25519".into(), key_passphrase: Some("kp".into()) },
+                &Secret {
+                    kind: SecretKind::Key,
+                    value: "/home/t/.ssh/id_ed25519".into(),
+                    key_passphrase: Some("kp".into()),
+                },
             )
             .unwrap();
         }
@@ -351,7 +430,10 @@ mod tests {
         let v = FileVault::open(dir.path());
         v.unlock("hunter2").unwrap();
         assert_eq!(v.get("prod-root").unwrap(), Some(pw("s3cret")));
-        assert_eq!(v.get("lab-key").unwrap().unwrap().key_passphrase.as_deref(), Some("kp"));
+        assert_eq!(
+            v.get("lab-key").unwrap().unwrap().key_passphrase.as_deref(),
+            Some("kp")
+        );
         assert_eq!(v.get("nope").unwrap(), None);
         let mut names: Vec<_> = v.list().unwrap().into_iter().map(|m| m.name).collect();
         names.sort();
@@ -379,6 +461,17 @@ mod tests {
     }
 
     #[test]
+    fn secret_debug_never_shows_values() {
+        let s = Secret {
+            kind: SecretKind::Password,
+            value: "hunter2".into(),
+            key_passphrase: Some("pp".into()),
+        };
+        let d = format!("{s:?}");
+        assert!(!d.contains("hunter2") && !d.contains("pp\""), "{d}");
+    }
+
+    #[test]
     fn file_vault_rejects_wrong_master() {
         let dir = tempfile::tempdir().unwrap();
         FileVault::open(dir.path()).unlock("right").unwrap();
@@ -403,32 +496,76 @@ mod tests {
         // The index is plain JSON of name → kind; make sure it never carries values.
         let dir = tempfile::tempdir().unwrap();
         let idx: BTreeMap<String, SecretKind> = [("a".to_string(), SecretKind::Key)].into();
-        std::fs::write(dir.path().join("vault-index.json"), serde_json::to_vec(&idx).unwrap()).unwrap();
+        std::fs::write(
+            dir.path().join("vault-index.json"),
+            serde_json::to_vec(&idx).unwrap(),
+        )
+        .unwrap();
         let v = KeyringVault::open(dir.path()).unwrap();
-        assert_eq!(v.list().unwrap(), vec![SecretMeta { name: "a".into(), kind: SecretKind::Key }]);
+        assert_eq!(
+            v.list().unwrap(),
+            vec![SecretMeta {
+                name: "a".into(),
+                kind: SecretKind::Key
+            }]
+        );
         assert!(!v.status().locked);
     }
 
     #[test]
     fn edits_keep_what_is_left_blank() {
-        let key = Secret { kind: SecretKind::Key, value: "/k/id".into(), key_passphrase: Some("pp".into()) };
+        let key = Secret {
+            kind: SecretKind::Key,
+            value: "/k/id".into(),
+            key_passphrase: Some("pp".into()),
+        };
         // nothing given: unchanged
         assert_eq!(apply_edit(&key, &SecretEdit::default()).unwrap(), key);
         // new path, passphrase kept
-        let e = SecretEdit { value: Some("/k/other".into()), ..Default::default() };
-        assert_eq!(apply_edit(&key, &e).unwrap(), Secret { value: "/k/other".into(), ..key.clone() });
+        let e = SecretEdit {
+            value: Some("/k/other".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            apply_edit(&key, &e).unwrap(),
+            Secret {
+                kind: SecretKind::Key,
+                value: "/k/other".into(),
+                key_passphrase: Some("pp".into())
+            }
+        );
         // new passphrase / cleared passphrase
-        let e = SecretEdit { key_passphrase: Some("new".into()), ..Default::default() };
-        assert_eq!(apply_edit(&key, &e).unwrap().key_passphrase.as_deref(), Some("new"));
-        let e = SecretEdit { clear_passphrase: true, ..Default::default() };
+        let e = SecretEdit {
+            key_passphrase: Some("new".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            apply_edit(&key, &e).unwrap().key_passphrase.as_deref(),
+            Some("new")
+        );
+        let e = SecretEdit {
+            clear_passphrase: true,
+            ..Default::default()
+        };
         assert_eq!(apply_edit(&key, &e).unwrap().key_passphrase, None);
         // switching kind needs a value, and a password drops the passphrase
-        let e = SecretEdit { kind: Some(SecretKind::Password), ..Default::default() };
+        let e = SecretEdit {
+            kind: Some(SecretKind::Password),
+            ..Default::default()
+        };
         assert!(apply_edit(&key, &e).is_err());
-        let e = SecretEdit { kind: Some(SecretKind::Password), value: Some("hunter2".into()), ..Default::default() };
+        let e = SecretEdit {
+            kind: Some(SecretKind::Password),
+            value: Some("hunter2".into()),
+            ..Default::default()
+        };
         assert_eq!(apply_edit(&key, &e).unwrap(), pw("hunter2"));
         // password → key does not invent a passphrase
-        let e = SecretEdit { kind: Some(SecretKind::Key), value: Some("/k/id".into()), ..Default::default() };
+        let e = SecretEdit {
+            kind: Some(SecretKind::Key),
+            value: Some("/k/id".into()),
+            ..Default::default()
+        };
         assert_eq!(apply_edit(&pw("x"), &e).unwrap().key_passphrase, None);
     }
 }

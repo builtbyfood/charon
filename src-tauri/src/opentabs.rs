@@ -27,13 +27,18 @@ impl OpenTabs {
     /// Starts empty: the previous run's file is only read by `saved`, and the
     /// first `set` replaces it.
     pub fn new(data_dir: &Path) -> Self {
-        OpenTabs { path: data_dir.join("open-tabs.json"), inner: Mutex::default() }
+        OpenTabs {
+            path: data_dir.join("open-tabs.json"),
+            inner: Mutex::default(),
+        }
     }
 
     /// What the previous run left open, window label → that window's tabs.
     /// Missing or unreadable file = nothing.
     pub fn saved(&self) -> BTreeMap<String, Value> {
-        let Ok(text) = std::fs::read_to_string(&self.path) else { return BTreeMap::new() };
+        let Ok(text) = std::fs::read_to_string(&self.path) else {
+            return BTreeMap::new();
+        };
         match serde_json::from_str::<Value>(&text) {
             Ok(Value::Object(mut o)) => match o.remove("windows") {
                 Some(Value::Object(w)) => w.into_iter().collect(),
@@ -73,7 +78,8 @@ impl OpenTabs {
         let body = serde_json::to_string_pretty(&serde_json::json!({ "windows": g.windows }))?;
         let tmp = self.path.with_extension("json.tmp");
         std::fs::write(&tmp, body).with_context(|| format!("write {}", tmp.display()))?;
-        std::fs::rename(&tmp, &self.path).with_context(|| format!("replace {}", self.path.display()))
+        std::fs::rename(&tmp, &self.path)
+            .with_context(|| format!("replace {}", self.path.display()))
     }
 }
 

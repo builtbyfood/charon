@@ -2,6 +2,7 @@
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { listen, emit, emitTo, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { OrderedWriter } from "./writeq";
 
 export type Kind = "folder" | "ssh" | "serial" | "local" | "rdp";
 
@@ -48,6 +49,7 @@ export interface Profile {
   terminal: { timestamps?: boolean; trace_output?: boolean; copy_on_select: boolean; ctrl_c_copies_when_selected: boolean; middle_click_paste: boolean; right_click?: "moba" | "menu" | string; bracketed_paste: boolean; paste_guard_lines: number; paste_run?: "auto" | "wait" | string; linux_repaint?: LinuxRepaint; [k: string]: unknown };
   files?: { auto_open?: boolean; parallel_transfers?: number; pane_width?: number; hidden_columns?: string[]; column_widths?: Record<string, number>; [k: string]: unknown };
   sudo?: { auto_send?: boolean; [k: string]: unknown };
+  broadcast?: { idle_off_minutes?: number; confirm?: boolean; confirm_prefixes?: string[]; [k: string]: unknown };
   local?: { credential?: string; mcp_tier?: "read" | "exec-approve" | "trusted" | string; [k: string]: unknown };
   clipboard: { strip_zero_width: boolean; nbsp_to_space: boolean; smart_quotes_to_ascii: boolean; trim_trailing_whitespace: boolean; crlf_to_lf: boolean; [k: string]: unknown };
   commands: { mark_gutter: boolean; tint_failed_commands: boolean; jump_keys: string[]; [k: string]: unknown };
@@ -156,8 +158,10 @@ const b64 = (bytes: Uint8Array): string => {
 };
 const unb64 = (s: string) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
 
-export const sessionWrite = (id: string, text: string) =>
-  invoke<void>("session_write", { id, dataB64: b64(enc.encode(text)) });
+// One write per session at a time, in order (see writeq.ts): keystrokes and
+// broadcast fan-out must reach the shell exactly as typed.
+const writer = new OrderedWriter((id, text) => invoke<void>("session_write", { id, dataB64: b64(enc.encode(text)) }));
+export const sessionWrite = (id: string, text: string) => writer.send(id, text);
 export const sessionResize = (id: string, cols: number, rows: number) =>
   invoke<void>("session_resize", { id, cols, rows });
 export const sessionClose = (id: string) => invoke<void>("session_close", { id });
@@ -230,6 +234,27 @@ export interface EditorOpenReq { path: string; fs: string | null; origin: string
 export const editorOpenInMain = (r: EditorOpenReq) => emitTo("main", "editor:open", r);
 export function onEditorOpenReq(cb: (r: EditorOpenReq) => void): Promise<UnlistenFn> {
   return getCurrentWebviewWindow().listen<EditorOpenReq>("editor:open", (e) => cb(e.payload));
+}
+
+// MultiExec across windows. Every window keeps a copy of the broadcast state and
+// publishes its changes (newest `rev` wins); the source's input goes out on
+// `bc:input` and each window repeats it on its own ticked tabs.
+export interface BcState { on: boolean; selected: string[]; source: string | null; rev: number; from: string }
+export type BcInput = { from: string; window: string } & ({ kind: "data"; data: string } | { kind: "paste"; text: string } | { kind: "sudo" });
+export const bcPublish = (s: BcState) => emit("bc:state", s);
+export const onBcState = (cb: (s: BcState) => void) => listen<BcState>("bc:state", (e) => cb(e.payload));
+/** A new window asks for the current state; the main window answers with `bc:state`. */
+export const bcHello = () => emit("bc:hello", {});
+export const onBcHello = (cb: () => void) => listen("bc:hello", () => cb());
+export const bcInput = (e: BcInput) => emit("bc:input", e);
+/** This window's broadcast role per session (MCP list_sessions shows it). */
+export const broadcastRoles = (roles: Record<string, "source" | "target">) => invoke<void>("broadcast_roles", { roles });
+export const onBcInput = (cb: (e: BcInput) => void) => listen<BcInput>("bc:input", (e) => cb(e.payload));
+/** Bring another Charon window (by label) to the front. */
+export async function focusWindow(label: string): Promise<void> {
+  const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow");
+  const w = await WebviewWindow.getByLabel(label);
+  await w?.setFocus();
 }
 
 // Files: the SFTP pane and the editor. `session` undefined/null = the local disk;
@@ -328,7 +353,9 @@ export const mcpAnswer = (reqId: string, value: unknown) => invoke<void>("mcp_an
 export const openUrl = (url: string) => invoke<void>("plugin:shell|open", { path: url });
 export const mcpLog = (lines?: number) => invoke<McpLogLine[]>("mcp_log", { lines });
 export interface McpLogLine { ts: string; tool: string; session: string | null; tier: string; decision: string; ok: boolean; exit_code?: number; duration_ms: number; subject?: string; error?: string }
-export interface McpApprove { req_id: string; tool: string; session: string; command: string }
+/** One session of a multi-session run_command, as its own tier gates it ("approve" = this dialog decides). */
+export interface McpTarget { session: string; title: string | null; host: string | null; tier: string; decision: "approve" | "allow" | "deny" }
+export interface McpApprove { req_id: string; tool: string; session: string; command: string; targets?: McpTarget[] }
 export interface McpScrollback { req_id: string; session: string; last_n_commands: number | null; last_n_lines: number | null }
 export interface McpOpenEditor { req_id: string; path: string | null; session: string | null; remote_path: string | null; as_root?: boolean }
 export const onMcpApprove = (cb: (p: McpApprove) => void) => listen<McpApprove>("mcp:approve", (e) => cb(e.payload));

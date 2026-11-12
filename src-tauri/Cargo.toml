@@ -1,6 +1,6 @@
 [package]
 name = "charon"
-version = "0.3.9"
+version = "0.4.0"
 description = "Connection manager, terminal, editor and MCP bridge for engineers"
 authors = ["Travis DeLuca"]
 license = "Apache-2.0"
@@ -32,16 +32,18 @@ dirs = "5"
 async-trait = "0.1"
 
 # sessions
-russh = "0.45"
-russh-keys = "0.45"
+# 0.65: fixes RUSTSEC-2026-0153/0154/0492-0496. ring, not the default aws-lc-rs
+# (that needs CMake + NASM on Windows); rsa for RSA keys and host keys.
+russh = { version = "0.65", default-features = false, features = ["flate2", "ring", "rsa"] }
 russh-sftp = "2"
 portable-pty = "0.8"
 serialport = "4"
 
 # store / secrets
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 age = "0.11"
+zeroize = "1.9"     # wipe decrypted secrets on drop (vault.rs); already in the tree via age
 
 # PuTTY .ppk private keys (ppk.rs): AES-256-CBC, SHA-1/HMAC (v2), Argon2 (v3).
 # Versions match what russh/age already pull in.
@@ -78,4 +80,5 @@ panic = "abort"
 strip = true
 
 [dev-dependencies]
+bytes = "1"           # russh channel data (tests build ChannelMsg::Data)
 tempfile = "3"

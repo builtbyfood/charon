@@ -33,8 +33,8 @@ test("an OSC 7 sequence updates session cwd and triggers the follow target", asy
   assert.equal(followTarget(cwd, "/tmp", false, osc7ToLocal), null);
 
   // ESC \ terminator and a Windows (pwsh) path on a local tab.
-  await write(term, "\x1b]7;file://WIN/C:/Users/travis\x1b\\");
-  assert.equal(cwd, "/C:/Users/travis");
-  assert.equal(followTarget(cwd, "/tmp", true, osc7ToLocal), "C:\\Users\\travis");
+  await write(term, "\x1b]7;file://WIN/C:/Users/alice\x1b\\");
+  assert.equal(cwd, "/C:/Users/alice");
+  assert.equal(followTarget(cwd, "/tmp", true, osc7ToLocal), "C:\\Users\\alice");
   term.dispose();
 });

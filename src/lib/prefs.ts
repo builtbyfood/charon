@@ -3,13 +3,18 @@
 // before the profile has loaded.
 import type { Profile } from "./api";
 import { PANE_DEFAULT, PANE_MIN, DEFAULT_COLS, colsFromProfile, type ColLayout } from "./filecols";
+import { rendererSetting, resolveRenderer, type RendererSetting } from "./renderer";
+import { DANGEROUS_DEFAULT } from "./broadcast";
+export type { RendererSetting } from "./renderer";
 
 export interface Prefs {
   fontFamily: string;
   fontSize: number;
   scrollback: number;
-  /** "webgl" (default), "canvas", or "dom" if the GPU renderers misbehave. */
+  /** The renderer in use: the setting, with "auto" resolved for this platform. */
   renderer: "webgl" | "canvas" | "dom";
+  /** What Settings → Terminal says: "auto" (default) or one of the renderers. */
+  rendererSetting: RendererSetting;
   copyOnSelect: boolean;
   ctrlCCopiesWhenSelected: boolean;
   middleClickPaste: boolean;
@@ -25,6 +30,10 @@ export interface Prefs {
   filesAutoOpen: boolean;
   /** Auto-send the saved password at a sudo/su prompt (debounced). */
   sudoAutoSend: boolean;
+  /** Broadcast switches off after this many idle minutes; 0 = never. */
+  broadcastIdleMin: number;
+  /** While broadcasting, Enter on a command with one of these prefixes asks first; [] = never. */
+  broadcastConfirm: string[];
   /** Max files transferring at once during a recursive / multi-item transfer. */
   filesParallel: number;
   /** Gutter with the time each line was printed. */
@@ -51,7 +60,8 @@ export const DEFAULTS: Prefs = {
   fontFamily: `"JetBrains Mono", ${FALLBACK_FONTS}`,
   fontSize: 13,
   scrollback: 50000,
-  renderer: "webgl",
+  renderer: resolveRenderer("auto"),
+  rendererSetting: "auto",
   copyOnSelect: false,
   ctrlCCopiesWhenSelected: true,
   middleClickPaste: true,
@@ -63,6 +73,8 @@ export const DEFAULTS: Prefs = {
   filesAutoOpen: true,
   filesParallel: 4,
   sudoAutoSend: false,
+  broadcastIdleMin: 10,
+  broadcastConfirm: [...DANGEROUS_DEFAULT],
   timestamps: false,
   filesWidth: PANE_DEFAULT,
   filesColumns: DEFAULT_COLS,
@@ -73,7 +85,8 @@ export function prefsFromProfile(p: Profile): Prefs {
     fontFamily: fontStack(p.appearance.font ?? ""),
     fontSize: clamp(p.appearance.font_size, 6, 40, DEFAULTS.fontSize),
     scrollback: clamp(p.appearance.scrollback, 0, 1_000_000, DEFAULTS.scrollback),
-    renderer: p.appearance.renderer === "dom" || p.appearance.renderer === "canvas" ? p.appearance.renderer : "webgl",
+    renderer: resolveRenderer(rendererSetting(p.appearance.renderer)),
+    rendererSetting: rendererSetting(p.appearance.renderer),
     copyOnSelect: !!p.terminal.copy_on_select,
     ctrlCCopiesWhenSelected: p.terminal.ctrl_c_copies_when_selected !== false,
     middleClickPaste: p.terminal.middle_click_paste !== false,
@@ -85,6 +98,8 @@ export function prefsFromProfile(p: Profile): Prefs {
     filesAutoOpen: p.files?.auto_open !== false,
     filesParallel: clamp(p.files?.parallel_transfers ?? 4, 1, 64, DEFAULTS.filesParallel),
     sudoAutoSend: p.sudo?.auto_send === true,
+    broadcastIdleMin: clamp(p.broadcast?.idle_off_minutes, 0, 24 * 60, DEFAULTS.broadcastIdleMin),
+    broadcastConfirm: p.broadcast?.confirm === false ? [] : Array.isArray(p.broadcast?.confirm_prefixes) ? p.broadcast!.confirm_prefixes!.map(String) : [...DANGEROUS_DEFAULT],
     timestamps: p.terminal.timestamps === true,
     filesWidth: clamp(p.files?.pane_width, PANE_MIN, 10_000, DEFAULTS.filesWidth),
     filesColumns: colsFromProfile(p.files?.column_widths, p.files?.hidden_columns),

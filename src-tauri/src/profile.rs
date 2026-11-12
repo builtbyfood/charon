@@ -31,8 +31,8 @@ section!(Appearance {
     font_size: u16 = 13,
     theme: String = "charon-dark".into(),
     scrollback: u32 = 50_000,
-    /// "webgl", "canvas" or "dom" (Settings → Terminal).
-    renderer: String = "webgl".into(),
+    /// "auto" (DOM on Linux, WebGL elsewhere), "webgl", "canvas" or "dom" (Settings → Terminal).
+    renderer: String = "auto".into(),
 });
 
 section!(TerminalPrefs {
@@ -109,6 +109,14 @@ section!(Sudo {
     auto_send: bool = false,
 });
 
+section!(Broadcast {
+    /// Broadcast input switches itself off after this many minutes without input; 0 = never.
+    idle_off_minutes: u32 = 10,
+    /// While broadcasting, Enter on a command starting with one of these asks first.
+    confirm: bool = true,
+    confirm_prefixes: Vec<String> = ["rm", "dd", "mkfs", "shutdown", "reboot", "poweroff", "halt", "systemctl stop"].iter().map(|s| s.to_string()).collect(),
+});
+
 section!(Local {
     /// Vault entry name whose password the bare "Local" shell (no saved node)
     /// offers to a sudo/su prompt (Unix). Empty = none. Saved local nodes use
@@ -139,6 +147,8 @@ pub struct Profile {
     pub sudo: Sudo,
     #[serde(default)]
     pub local: Local,
+    #[serde(default)]
+    pub broadcast: Broadcast,
     /// Sections this build does not model yet (docs, …) pass through untouched.
     #[serde(flatten)]
     pub extra: toml::Table,
@@ -158,6 +168,7 @@ impl Default for Profile {
             files: Default::default(),
             sudo: Default::default(),
             local: Default::default(),
+            broadcast: Default::default(),
             extra: toml::Table::new(),
         }
     }
@@ -190,7 +201,10 @@ pub fn load_default(data_dir: &Path) -> Profile {
             tracing::warn!(path = %path.display(), "could not seed default profile: {e}");
         }
     }
-    match std::fs::read_to_string(&path).map_err(anyhow::Error::from).and_then(|t| Profile::parse(&t)) {
+    match std::fs::read_to_string(&path)
+        .map_err(anyhow::Error::from)
+        .and_then(|t| Profile::parse(&t))
+    {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(path = %path.display(), "profile unreadable, using defaults: {e:#}");
@@ -246,7 +260,9 @@ mod tests {
 
     #[test]
     fn missing_keys_default_and_unknown_keys_round_trip() {
-        let p = Profile::parse("name = \"work\"\n[appearance]\nfont_size = 15\ncustom_thing = true\n").unwrap();
+        let p =
+            Profile::parse("name = \"work\"\n[appearance]\nfont_size = 15\ncustom_thing = true\n")
+                .unwrap();
         assert_eq!(p.name, "work");
         assert_eq!(p.appearance.font_size, 15);
         assert_eq!(p.appearance.font, "JetBrains Mono");
@@ -260,14 +276,20 @@ mod tests {
     fn load_seeds_then_save_persists() {
         let dir = tempfile::tempdir().unwrap();
         let mut p = load_default(dir.path());
-        assert!(path_for(dir.path(), "default").exists(), "seeded from bundled copy");
+        assert!(
+            path_for(dir.path(), "default").exists(),
+            "seeded from bundled copy"
+        );
         p.appearance.font_size = 17;
         p.ui.sidebar_width = 333;
         save(dir.path(), &p).unwrap();
         let again = load_default(dir.path());
         assert_eq!(again.appearance.font_size, 17);
         assert_eq!(again.ui.sidebar_width, 333);
-        assert!(again.extra.contains_key("docs"), "unknown sections kept across save");
+        assert!(
+            again.extra.contains_key("docs"),
+            "unknown sections kept across save"
+        );
     }
 
     #[test]
@@ -278,6 +300,9 @@ mod tests {
         std::fs::write(&path, "this is not = [toml").unwrap();
         let p = load_default(dir.path());
         assert_eq!(p, Profile::default());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "this is not = [toml");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "this is not = [toml"
+        );
     }
 }
