@@ -84,14 +84,16 @@ test("swallower: inactivity ends it, a busy echo keeps it going up to the cap", 
   assert.equal(dec(s.filter(enc("$ "), 100 + SWALLOW_IDLE_MS)), "$ ");
 });
 
-test("giving up shows what isn't the echo, not the whole echo", (t) => {
-  const inj = posixInjection("bash", bashHook);
-  // What an interactive bash at 80 columns really echoes for it: `> ` continuation
+/** A recorded bash 5 echo of the bash hook injection (scripts/record-inject-echo.ts). */
+const recorded: { bash: string; injection: string; echo: string } = JSON.parse(
+  readFileSync(new URL("./fixtures/bash-inject-echo.json", import.meta.url), "utf8"),
+);
+
+test("giving up shows what isn't the echo, not the whole echo", () => {
+  // What an interactive bash 5 at 80 columns really echoes for it: `> ` continuation
   // prompts and readline's `\r` redraws (`<<'C\rCHARON_EOF'`, the "&&turturn" effect).
-  const r = spawnSync("bash", ["--norc", "--noprofile", "-i"], { input: inj, encoding: "utf8", env: { ...process.env, PS1: "$ " } });
-  if (r.error) return t.skip("no bash");
-  const all = r.stderr.split("\n").filter((l) => !/job control|terminal process group/.test(l)).join("\n");
-  const echo = all.slice(0, all.lastIndexOf("esac") + 4); // the echo only, not the hooked prompt after it
+  // Recorded, not live: the runner's bash may be 3.2 (macOS), which echoes it differently.
+  const { injection: inj, echo } = recorded;
   assert.match(echo, /\r/, "the echo has redraws");
   const s = new InjectionSwallower();
   s.start(inj, 0);
@@ -99,4 +101,12 @@ test("giving up shows what isn't the echo, not the whole echo", (t) => {
   const shown = dec(s.expire(1 + SWALLOW_IDLE_MS)!);
   assert.equal(shown, "\r\x1b[2Kash: eval: line 1: syntax error\r\nbox:~# ");
   assert.equal(dec(withoutEcho(enc("plain output\r\n"), inj)), "plain output\r\n");
+});
+
+test("the recorded echo is of the current bash injection", () => {
+  assert.equal(
+    recorded.injection,
+    posixInjection("bash", bashHook),
+    "shell-integration/bash.sh or posixInjection changed: re-run `node scripts/record-inject-echo.ts` with a bash >= 5",
+  );
 });
